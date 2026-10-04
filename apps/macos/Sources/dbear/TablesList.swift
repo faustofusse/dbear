@@ -200,6 +200,7 @@ struct TablesList: View {
                 }
                 .listStyle(.sidebar)
                 .scrollContentBackground(.hidden)
+                .preparesListRows(PreparedRowsToken(schemas: schemas, tablesOnly: tablesOnly))
                 .arrowKeySelection(
                     ids: singleDatabase(in: schemas).map { visibleTables(in: $0).map(\.id) }
                         ?? schemas.filter { !collapsed.contains($0.name) }.flatMap { visibleTables(in: $0).map(\.id) },
@@ -375,4 +376,10 @@ private struct PopUpMenuAnchor: NSViewRepresentable {
         override var isFlipped: Bool { true }
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
+}
+
+/// What the tables column's rows depend on: when it changes, the List's rows are prepared again.
+private struct PreparedRowsToken: Hashable {
+    let schemas: [Schema]
+    let tablesOnly: Bool
 }
