@@ -39,34 +39,24 @@ struct GridEditing {
 /// the row count grew instead of diffing every row.
 struct DataGrid: View {
     let result: QueryResult
-    let search: String
     /// Changes when the data is replaced (reload / re-run), not when pages are appended.
     var version: Int = 0
     var duration: Duration? = nil
     var paging: GridPaging? = nil
     var sorting: GridSorting? = nil
     var editing: GridEditing? = nil
-    /// New rows are loading (re-sort, filter, refresh) while these stay on screen.
+    /// New rows are loading (re-sort, refresh) while these stay on screen.
     var isReloading = false
-    /// Shown at the start of the status bar (e.g. the Data | Structure switch).
-    var statusLeading: AnyView? = nil
 
     var body: some View {
-        let query = search.trimmingCharacters(in: .whitespaces)
-        GridTable(result: result, search: query, version: version, paging: paging, sorting: sorting, editing: editing)
+        GridTable(result: result, version: version, paging: paging, sorting: sorting, editing: editing)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 StatusBar(
-                    shown: query.isEmpty ? result.rows.count : matchCount(query),
-                    loaded: result.rows.count, total: result.totalCount,
-                    truncated: result.truncated, isFiltered: !query.isEmpty,
+                    loaded: result.rows.count, total: result.totalCount, truncated: result.truncated,
                     columns: result.columns.count, duration: duration, paging: paging,
-                    isReloading: isReloading, leading: statusLeading
+                    isReloading: isReloading
                 )
             }
-    }
-
-    private func matchCount(_ query: String) -> Int {
-        result.rows.reduce(0) { $0 + (GridData.matches($1, query) ? 1 : 0) }
     }
 }
 
@@ -74,7 +64,6 @@ struct DataGrid: View {
 
 private struct GridTable: NSViewRepresentable {
     let result: QueryResult
-    let search: String
     let version: Int
     let paging: GridPaging?
     let sorting: GridSorting?
@@ -115,7 +104,7 @@ private struct GridTable: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.update(
-            result: result, search: search, version: version, paging: paging, sorting: sorting, editing: editing)
+            result: result, version: version, paging: paging, sorting: sorting, editing: editing)
     }
 
     static func dismantleNSView(_ scroll: NSScrollView, coordinator: GridData) {
@@ -123,8 +112,8 @@ private struct GridTable: NSViewRepresentable {
     }
 }
 
-/// Data source + delegate. Keeps the rows the table shows (new rows first, then the loaded ones
-/// filtered by the search text) and runs inline editing.
+/// Data source + delegate. Keeps the rows the table shows (new rows first, then the loaded ones)
+/// and runs inline editing.
 @MainActor
 final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSMenuDelegate {
     private weak var table: GridTableView?
@@ -137,7 +126,6 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     private var editor: CellEditor?
     /// Column (model index) of the last clicked cell: Return edits that one.
     private var lastColumn: Int?
-    private var search = ""
     private var version = Int.min
     private var paging: GridPaging?
     private var sorting: GridSorting?
@@ -170,7 +158,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     }
 
     func update(
-        result: QueryResult, search: String, version: Int, paging: GridPaging?, sorting: GridSorting?, editing: GridEditing?
+        result: QueryResult, version: Int, paging: GridPaging?, sorting: GridSorting?, editing: GridEditing?
     ) {
         self.paging = paging
         self.sorting = sorting
@@ -198,28 +186,21 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         if version != self.version || result.columns != columns {
             finishEditing(commit: false)
             self.version = version
-            self.search = search
             allRows = result.rows
             if result.columns != columns {
                 columns = result.columns
                 rebuildColumns(table)
             }
-            applyFilter()
-            table.reloadData()
-            table.scrollRowToVisible(0)
-        } else if search != self.search {
-            self.search = search
-            allRows = result.rows
-            applyFilter()
+            rebuildRows()
             table.reloadData()
             table.scrollRowToVisible(0)
         } else if result.rows.count != allRows.count {
-            let appended = result.rows.count > allRows.count && search.isEmpty && !editsChanged
+            let appended = result.rows.count > allRows.count && !editsChanged
             let selected = selectedIDs()
             allRows = result.rows
             if appended {
                 // A new page only extends the table: no reload, no diff, scroll position untouched.
-                applyFilter()
+                rebuildRows()
                 table.noteNumberOfRowsChanged()
             } else {
                 reload(table, keeping: selected)
@@ -232,10 +213,10 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         DispatchQueue.main.async { [weak self] in self?.prefetchIfNeeded() }
     }
 
-    private func applyFilter() {
-        // New rows stay on top whatever the search; their cells come from `edits`.
+    private func rebuildRows() {
+        // New rows stay on top; their cells come from `edits`.
         let inserted = edits.inserted.map { Row(id: $0.id, values: Array(repeating: .null, count: columns.count)) }
-        rows = inserted + (search.isEmpty ? allRows : allRows.filter { Self.matches($0, search) })
+        rows = inserted + allRows
     }
 
     private func selectedIDs() -> Set<Int> {
@@ -245,21 +226,15 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
 
     /// Rebuilds the shown rows and reloads; new rows shift the others, so selection follows row ids.
     private func reload(_ table: NSTableView, keeping selected: Set<Int>) {
-        applyFilter()
+        rebuildRows()
         table.reloadData()
         let indexes = IndexSet(rows.indices.filter { selected.contains(rows[$0].id) })
         table.selectRowIndexes(indexes, byExtendingSelection: false)
     }
 
-    nonisolated static func matches(_ row: Row, _ query: String) -> Bool {
-        row.values.contains { $0.displayString.localizedCaseInsensitiveContains(query) }
-    }
-
-    /// Loads the next page once the last visible row is near the end. Not while searching:
-    /// filtered rows keep the end in view and would pull in the whole table.
+    /// Loads the next page once the last visible row is near the end.
     private func prefetchIfNeeded() {
-        guard let table, let paging, paging.hasMore, !paging.isLoading, paging.error == nil,
-              !loadRequested, search.isEmpty
+        guard let table, let paging, paging.hasMore, !paging.isLoading, paging.error == nil, !loadRequested
         else { return }
         let visible = table.rows(in: table.visibleRect)
         guard NSMaxRange(visible) >= rows.count - prefetchDistance else { return }
@@ -764,22 +739,16 @@ extension ColumnInfo {
 // MARK: - Status bar
 
 private struct StatusBar: View {
-    let shown: Int
     let loaded: Int
     let total: Int?
     let truncated: Bool
-    let isFiltered: Bool
     let columns: Int
     let duration: Duration?
     let paging: GridPaging?
     var isReloading = false
-    var leading: AnyView?
 
     var body: some View {
         BottomBar {
-            if let leading {
-                leading
-            }
             Text(rowsText)
             if truncated {
                 Image(systemName: "info.circle")
@@ -806,9 +775,6 @@ private struct StatusBar: View {
     }
 
     private var rowsText: String {
-        if isFiltered {
-            return "\(shown.formatted()) matching of \(loaded.formatted()) loaded rows"
-        }
         if truncated, let total {
             return "First \(loaded.formatted()) of \(total.formatted()) rows"
         }

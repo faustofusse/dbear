@@ -82,9 +82,8 @@ final class TableTab: Identifiable {
     /// Bumped when a load's rows arrive: tells the grid its rows were replaced (not just appended to).
     /// Not `generation`: rows stay on screen while reloading, so that changes before the new rows exist.
     var dataVersion = 0
-    /// Reloading (new sort or filter, refresh) while the previous rows stay on screen.
+    /// Reloading (new sort, refresh) while the previous rows stay on screen.
     var isReloading = false
-    var search = ""
 
     /// Rows (`data`) or the table's definition (`structure`).
     var mode = TableTabMode.data
@@ -92,10 +91,6 @@ final class TableTab: Identifiable {
 
     /// Server-side sort, cycled by clicking column headers.
     var sort: [SortKey] = []
-    /// The `WHERE` condition typed in the toolbar search field (applied with Return).
-    var filterText = ""
-    /// The filter the rows were loaded with.
-    var appliedFilter: String?
 
     /// Unsaved cell edits, new and deleted rows.
     var edits = PendingEdits()
@@ -111,7 +106,7 @@ final class TableTab: Identifiable {
     var saveError: String?
     var nextInsertedID = -1
 
-    var query: RowQuery { RowQuery(sort: sort, filter: appliedFilter) }
+    var query: RowQuery { RowQuery(sort: sort) }
 
     /// Why the rows can't be edited, or `nil` if they can.
     var readOnlyReason: String? {
@@ -123,11 +118,6 @@ final class TableTab: Identifiable {
         return nil
     }
     var canLoadMore: Bool { data.value != nil && !reachedEnd && !isLoadingMore && loadMoreError == nil && !isReloading }
-    static func normalized(_ filter: String) -> String? {
-        let trimmed = filter.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
     init(connection: ConnectionConfig, table: TableInfo, isPreview: Bool) {
         self.connection = connection
         self.table = table
@@ -152,7 +142,6 @@ final class ScriptTab: Identifiable {
     var editorHeight: CGFloat?
     /// New scripts focus the editor the first time they're shown.
     var needsInitialFocus = true
-    var search = ""
     /// Editor selection (UTF-16 ranges). Not observed: it changes on every caret move.
     @ObservationIgnored var selectedRanges: [NSRange] = []
     /// Something non-blank is selected, so ⌘↩ runs just that. Only flips when it changes.
@@ -320,8 +309,6 @@ final class AppModel {
     let pageSize = 500
     /// Script results keep at most this many rows; the rest are counted, not kept.
     let scriptRowLimit = 10_000
-    /// Incremented by ⌘F to focus the toolbar search field.
-    var searchFocusRequest = 0
 
     /// SQL editor text size (⌘+ / ⌘- / ⌘0). Shared by all script tabs and remembered across launches.
     var editorFontSize: CGFloat = AppModel.storedEditorFontSize {
@@ -408,33 +395,6 @@ final class AppModel {
     var selectedTableID: TableInfo.ID? {
         guard case .table(let t) = activeTab, t.connection.driverKey == selectedTarget?.driverKey else { return nil }
         return t.table.id
-    }
-
-    /// Text of the toolbar search field for the active tab (each tab keeps its own): a table's
-    /// rows take a `WHERE` condition (applied with Return); its structure and script results
-    /// are searched as you type.
-    var activeSearch: String {
-        get {
-            switch activeTab {
-            case .table(let t) where t.mode == .data: t.filterText
-            case .table(let t): t.search
-            case .script(let s): s.search
-            case nil: ""
-            }
-        }
-        set {
-            switch activeTab {
-            case .table(let t) where t.mode == .data: t.filterText = newValue
-            case .table(let t): t.search = newValue
-            case .script(let s): s.search = newValue
-            case nil: break
-            }
-        }
-    }
-
-    /// The active tab's search field is a server-side `WHERE` filter (table rows), not a live search.
-    var isSearchAFilter: Bool {
-        if case .table(let t) = activeTab { t.mode == .data } else { false }
     }
 
     func table(withID id: TableInfo.ID) -> TableInfo? {
@@ -906,25 +866,6 @@ final class AppModel {
             tab.sort = [SortKey(column: column)]
         }
         tab.isPreview = false
-        Task { await load(tab) }
-    }
-
-    /// Reloads with the condition typed in the search field (Return; clearing the field passes "").
-    func applyFilter(_ tab: TableTab) {
-        // Clearing an already empty field isn't worth a reload; Return on the same filter re-runs it.
-        let filter = TableTab.normalized(tab.filterText)
-        if filter == nil, tab.appliedFilter == nil, tab.data.value != nil { return }
-        guard confirmDiscardingEdits(in: tab) else { return }
-        tab.appliedFilter = TableTab.normalized(tab.filterText)
-        tab.isPreview = false
-        Task { await load(tab) }
-    }
-
-    func clearFilter(_ tab: TableTab) {
-        guard tab.appliedFilter == nil || confirmDiscardingEdits(in: tab) else { return }
-        tab.filterText = ""
-        guard tab.appliedFilter != nil else { return }
-        tab.appliedFilter = nil
         Task { await load(tab) }
     }
 

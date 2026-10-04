@@ -101,7 +101,7 @@ struct ScriptTabView: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .loaded(let result):
-            DataGrid(result: result, search: tab.search, version: tab.runCount, duration: tab.lastDuration)
+            DataGrid(result: result, version: tab.runCount, duration: tab.lastDuration)
         }
     }
 }

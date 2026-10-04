@@ -1,8 +1,8 @@
 import AppKit
 import DBKit
 
-/// SQL completion while typing in an `NSTextView`: the script editor, or the field editor of a
-/// search field. Decides when the popup opens, refilters it, and inserts the accepted item.
+/// SQL completion while typing in an `NSTextView` (the script editor). Decides when the popup
+/// opens, refilters it, and inserts the accepted item.
 /// The owner supplies `complete` and forwards text changes, selection changes and keys.
 @MainActor
 final class CompletionSession {

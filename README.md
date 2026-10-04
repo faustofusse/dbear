@@ -78,10 +78,10 @@ cargo test -p dbcore              # core (Postgres tests skip without a database
 - Passwords go in the system keychain, never in that file.
 - SQL highlighting uses tree-sitter with [DerekStride/tree-sitter-sql](https://github.com/DerekStride/tree-sitter-sql)
   (crate `tree-sitter-sequel`) in `dbcore::highlight`. The core returns spans and each frontend picks the colors.
-- Table tabs sort on the server (click a header: ascending → descending → off). In a table's
-  Data view the toolbar search field (⌘L) is a raw `WHERE` filter, applied with Return and
-  completed like the script editor (`complete::complete_filter`). Elsewhere (Structure, script
-  results) it searches as you type. The core sorts by the primary key (or ctid/rowid) after the
+- Table tabs sort on the server (click a header: ascending → descending → off), and switch
+  between Data and Structure from the toolbar (⌥⌘1 / ⌥⌘2). The core also takes a raw `WHERE`
+  filter (`RowQuery::filter`, completed by `complete::complete_filter`); the macOS app doesn't
+  expose it right now. The core sorts by the primary key (or ctid/rowid) after the
   user's columns, so pages stay stable. Pages are fetched with keyset paging (`dbcore::keyset`: `where (sort keys) > (last row's)`
   instead of `OFFSET`), so deep pages load as fast as the first; views, keyless MySQL and SQL Server tables and sort types
   that don't compare the way they sort fall back to `OFFSET`. SQL Server has no row values, so it seeks with the expanded

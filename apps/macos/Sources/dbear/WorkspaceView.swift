@@ -9,14 +9,21 @@ struct WorkspaceView: View {
     var body: some View {
         content
             .toolbar {
-                // [New Script]  [Search] ……… [Discard] [Review] [Save]  [Refresh]
+                // [New Script]  [Data | Structure]  [+ −] ……… [Discard] [Review] [Save]  [Refresh]
                 ToolbarItem { newScriptButton }
-                if #available(macOS 26.0, *) {
-                    ToolbarSpacer(.fixed)
+                if let tab = model.activeTableTab {
+                    if #available(macOS 26.0, *) {
+                        ToolbarSpacer(.fixed)
+                    }
+                    ToolbarItem { TableModePicker(tab: tab) }
+                    if tab.mode == .data {
+                        if #available(macOS 26.0, *) {
+                            ToolbarSpacer(.fixed)
+                        }
+                        // One capsule for both, like the pending-changes buttons.
+                        ToolbarItemGroup { RowToolbarButtons(tab: tab) }
+                    }
                 }
-                // Its own bubble: the search field's bezel, not a capsule shared with the buttons.
-                ToolbarItem { searchField }
-                    .sharedBackgroundIfAvailable(hidden: true)
                 if #available(macOS 26.0, *) {
                     ToolbarSpacer(.flexible)
                 }
@@ -28,35 +35,6 @@ struct WorkspaceView: View {
                 }
                 ToolbarItem { RefreshButton() }
             }
-    }
-
-    private var searchField: some View {
-        @Bindable var model = model
-        let filterTab = model.isSearchAFilter ? model.activeTableTab : nil
-        return ToolbarSearchField(
-            text: $model.activeSearch,
-            prompt: filterTab != nil ? "WHERE …" : "Search",
-            help: filterTab != nil
-                ? "Filter rows with a SQL condition, e.g. status = 'paid' and total > 100. Return applies it, ✕ clears it, Esc leaves the field."
-                : nil,
-            monospaced: filterTab != nil,
-            onSubmit: filterTab.map { tab in { _ in model.applyFilter(tab) } },
-            complete: filterTab.map { tab in
-                { text, location in
-                    // Same catalog as the table's scripts; loaded on first use.
-                    guard let catalog = model.completionCatalog(for: tab.connection) else {
-                        model.loadCompletionCatalogIfNeeded(for: tab.connection)
-                        return nil
-                    }
-                    return catalog.completeFilter(text: text, location: location, kind: tab.connection.kind, table: tab.table)
-                }
-            },
-            focusRequest: model.searchFocusRequest,
-            // Esc drops a condition typed but not applied: the field shows the filter in effect again.
-            onCancel: filterTab.map { tab in { tab.filterText = tab.appliedFilter ?? "" } }
-        )
-            // Fixed size (never stretches with the window), with room for a WHERE condition.
-            .frame(width: 320)
     }
 
     private var newScriptButton: some View {

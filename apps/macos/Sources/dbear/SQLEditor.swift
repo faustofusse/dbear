@@ -109,7 +109,7 @@ struct SQLEditor: NSViewRepresentable {
         // MARK: Completion
         var catalog: CompletionCatalog?
         var databaseKind: DatabaseKind = .postgres
-        /// Shared with the search field (`CompletionSession`); this editor supplies the whole script.
+        /// This editor supplies the whole script to the completion session.
         let completion = CompletionSession()
         /// Text just inserted (or `nil`/empty for a deletion), captured before the change lands.
         private var lastInsertedText: String?

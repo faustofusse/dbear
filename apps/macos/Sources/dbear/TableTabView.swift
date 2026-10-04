@@ -1,8 +1,8 @@
 import DBKit
 import SwiftUI
 
-/// A table tab: rows (with a WHERE filter bar and sortable headers) or the table's structure,
-/// switched from the bottom bar like TablePlus.
+/// A table tab: rows (with sortable headers) or the table's structure, switched from the toolbar
+/// (`TableModePicker`).
 struct TableTabView: View {
     @Environment(AppModel.self) private var model
     let tab: TableTab
@@ -25,25 +25,18 @@ struct TableTabView: View {
         case .idle, .loading:
             ProgressView().controlSize(.small)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .safeAreaInset(edge: .bottom, spacing: 0) { BottomBar { ModePicker(tab: tab); Spacer() } }
         case .failed(let message):
             ContentUnavailableView {
-                Label(tab.appliedFilter == nil ? "Couldn’t Load Rows" : "Couldn’t Filter Rows",
-                      systemImage: "exclamationmark.triangle")
+                Label("Couldn’t Load Rows", systemImage: "exclamationmark.triangle")
             } description: {
                 Text(message).textSelection(.enabled)
             } actions: {
-                if tab.appliedFilter != nil {
-                    Button("Clear Filter") { model.clearFilter(tab) }
-                }
                 Button("Try Again") { Task { await model.load(tab) } }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .safeAreaInset(edge: .bottom, spacing: 0) { BottomBar { ModePicker(tab: tab); Spacer() } }
         case .loaded(let result):
             DataGrid(
-                // The search field is this tab's WHERE filter: rows are filtered by the server, not here.
-                result: result, search: "", version: tab.dataVersion,
+                result: result, version: tab.dataVersion,
                 paging: GridPaging(
                     hasMore: !tab.reachedEnd, isLoading: tab.isLoadingMore, error: tab.loadMoreError,
                     loadMore: { Task { await model.loadMore(tab) } },
@@ -51,12 +44,7 @@ struct TableTabView: View {
                 ),
                 sorting: GridSorting(keys: tab.sort) { model.toggleSort(tab, column: $0) },
                 editing: tab.readOnlyReason == nil ? editing : nil,
-                isReloading: tab.isReloading,
-                statusLeading: AnyView(HStack(spacing: 6) {
-                    ModePicker(tab: tab)
-                    RowButtons(tab: tab)
-                    FilterIndicator(tab: tab)
-                })
+                isReloading: tab.isReloading
             )
         }
     }
@@ -75,49 +63,22 @@ struct TableTabView: View {
     }
 }
 
-/// Funnel shown while the rows are filtered, with the condition in its tooltip; click to clear.
-private struct FilterIndicator: View {
-    @Environment(AppModel.self) private var model
-    let tab: TableTab
-
-    var body: some View {
-        if let filter = tab.appliedFilter {
-            Button { model.clearFilter(tab) } label: {
-                Image(systemName: "line.3.horizontal.decrease.circle.fill").foregroundStyle(.tint)
-            }
-            .buttonStyle(.borderless)
-            .help("Filtered: WHERE \(filter)\nClick to clear")
-            .padding(.trailing, 4)
-        }
-    }
-}
-
 // MARK: - Editing
 
-/// `+` / `−` next to the mode switch, or a lock saying why the rows are read-only.
-private struct RowButtons: View {
+/// `+` / `−` in the toolbar for the active table's rows. Disabled (with the reason in the tooltip)
+/// when the rows are read-only.
+struct RowToolbarButtons: View {
     @Environment(AppModel.self) private var model
     let tab: TableTab
 
     var body: some View {
-        if let reason = tab.readOnlyReason {
-            Image(systemName: "lock")
-                .foregroundStyle(.tertiary)
-                .help("Read-only: \(reason)")
-                .padding(.trailing, 4)
-        } else {
-            HStack(spacing: 2) {
-                Button { model.addRow(tab) } label: { Image(systemName: "plus").frame(width: 18, height: 18) }
-                    .help("Add Row")
-                Button { model.deleteRows(tab, ids: tab.selectedRowIDs) } label: {
-                    Image(systemName: "minus").frame(width: 18, height: 18)
-                }
-                .disabled(tab.selectedRowIDs.isEmpty)
-                .help("Delete Selected Rows (⌫)")
-            }
-            .buttonStyle(.borderless)
-            .padding(.trailing, 4)
-        }
+        let readOnly = tab.readOnlyReason
+        Button { model.addRow(tab) } label: { Label("Add Row", systemImage: "plus") }
+            .disabled(readOnly != nil)
+            .help(readOnly.map { "Read-only: \($0)" } ?? "Add Row")
+        Button { model.deleteRows(tab, ids: tab.selectedRowIDs) } label: { Label("Delete Rows", systemImage: "minus") }
+            .disabled(readOnly != nil || tab.selectedRowIDs.isEmpty)
+            .help(readOnly.map { "Read-only: \($0)" } ?? "Delete Selected Rows (⌫)")
     }
 }
 
@@ -226,21 +187,25 @@ private struct ReviewChangesSheet: View {
 
 // MARK: - Mode switch
 
-private struct ModePicker: View {
+/// Data | Structure for the active table tab, in the toolbar. A segmented control like Finder's
+/// view switcher: icons in one glass capsule, names in tooltips and the View menu (⌥⌘1 / ⌥⌘2).
+struct TableModePicker: View {
     @Environment(AppModel.self) private var model
     let tab: TableTab
 
     var body: some View {
         Picker("View", selection: Binding(get: { tab.mode }, set: { model.setMode($0, of: tab) })) {
-            Text("Data").tag(TableTabMode.data)
-            Text("Structure").tag(TableTabMode.structure)
+            Label("Data", systemImage: "tablecells")
+                .help("Data (\u{2325}\u{2318}1)")
+                .tag(TableTabMode.data)
+            Label("Structure", systemImage: "list.bullet.rectangle")
+                .help("Structure (\u{2325}\u{2318}2)")
+                .tag(TableTabMode.structure)
         }
         .pickerStyle(.segmented)
-        .labelsHidden()
-        .controlSize(.small)
+        .labelStyle(.iconOnly)
         .fixedSize()
-        .padding(.trailing, 6)
-        .help("Show rows or the table’s columns, indexes and DDL (⌥⌘1 / ⌥⌘2)")
+        .help("Show the rows or the table\u{2019}s columns, indexes and definition")
     }
 }
 
@@ -266,16 +231,15 @@ private struct StructureView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .loaded(let structure):
-                StructureContent(tab: tab, structure: structure, search: tab.search)
+                StructureContent(tab: tab, structure: structure)
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            BottomBar {
-                ModePicker(tab: tab)
-                if let s = tab.structure.value {
+            if let s = tab.structure.value {
+                BottomBar {
                     Text(summary(s))
+                    Spacer()
                 }
-                Spacer()
             }
         }
     }
@@ -296,13 +260,6 @@ private struct StructureContent: View {
     @Environment(AppModel.self) private var model
     let tab: TableTab
     let structure: TableStructure
-    let search: String
-
-    private var columns: [ColumnDetail] {
-        let q = search.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return structure.columns }
-        return structure.columns.filter { $0.name.localizedCaseInsensitiveContains(q) || $0.typeName.localizedCaseInsensitiveContains(q) }
-    }
 
     var body: some View {
         ScrollView {
@@ -351,7 +308,7 @@ private struct StructureContent: View {
                 if hasComments { HeaderCell("Comment") }
             }
         } rows: {
-            DividedRows(items: columns) { column in
+            DividedRows(items: structure.columns) { column in
                 GridRow {
                     Group {
                         if column.isPrimaryKey {
