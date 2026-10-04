@@ -420,6 +420,47 @@ pub fn match_filter(kind: DatabaseKind, columns: Vec<String>, values: Vec<Value>
     dbcore::dialect::Dialect(kind.into()).match_filter(&columns, &values)
 }
 
+// MARK: Copying rows
+
+#[derive(uniffi::Enum, Clone, Copy)]
+pub enum CopyFormat {
+    Tsv,
+    Csv,
+    Json,
+    Markdown,
+    Insert,
+}
+
+impl From<CopyFormat> for dbcore::export::CopyFormat {
+    fn from(f: CopyFormat) -> Self {
+        match f {
+            CopyFormat::Tsv => Self::Tsv,
+            CopyFormat::Csv => Self::Csv,
+            CopyFormat::Json => Self::Json,
+            CopyFormat::Markdown => Self::Markdown,
+            CopyFormat::Insert => Self::Insert,
+        }
+    }
+}
+
+/// Rows as clipboard text. `schema`/`table` name the `INSERT` target (`None` for script results).
+#[uniffi::export]
+pub fn format_rows(
+    format: CopyFormat, kind: DatabaseKind, schema: Option<String>, table: Option<String>, columns: Vec<ColumnInfo>,
+    rows: Vec<Vec<Value>>, headers: bool,
+) -> String {
+    let columns: Vec<dbcore::ColumnInfo> = columns.into_iter().map(Into::into).collect();
+    let rows: Vec<Vec<dbcore::Value>> = rows.into_iter().map(|r| r.into_iter().map(Into::into).collect()).collect();
+    let target = dbcore::export::Target { kind: kind.into(), schema: schema.as_deref(), table: table.as_deref() };
+    dbcore::export::format_rows(format.into(), target, &columns, &rows, headers)
+}
+
+/// A JSON object or array re-indented for reading (key order and digits kept), else `None`.
+#[uniffi::export]
+pub fn pretty_json(text: String) -> Option<String> {
+    dbcore::export::pretty_json(&text)
+}
+
 #[uniffi::export]
 pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").into()

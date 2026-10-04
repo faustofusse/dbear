@@ -101,7 +101,15 @@ struct ScriptTabView: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .loaded(let result):
-            DataGrid(result: result, version: tab.runCount, duration: tab.lastDuration)
+            DataGrid(
+                result: result, version: tab.runCount, duration: tab.lastDuration,
+                focus: GridFocus(
+                    initial: { tab.focusedCell },
+                    changed: { tab.focusedCell = $0 },
+                    inspect: { model.showsInspector = true }
+                ),
+                source: GridSource(kind: tab.connection.kind)
+            )
         }
     }
 }

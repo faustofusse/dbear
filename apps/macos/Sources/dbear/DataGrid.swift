@@ -47,6 +47,24 @@ struct GridForeignKeys {
     var openReferencing: (ReferencingKey, [DBValue]) -> Void
 }
 
+/// The grid's current cell: the selected row (the last one clicked, when several are selected) and
+/// the column last clicked or moved to with ←/→. It's outlined, and shown in the value inspector.
+struct GridFocus {
+    /// Where to put the focus when the grid is created (e.g. coming back to a tab).
+    var initial: () -> CellAddress?
+    /// The focus moved; `nil` when no row is selected.
+    var changed: (CellAddress?) -> Void
+    /// "Inspect Value" in the context menu.
+    var inspect: () -> Void
+}
+
+/// Where the rows come from, for copying them as `INSERT`s (`table` is `nil` for script results).
+struct GridSource {
+    var kind: DatabaseKind
+    var schema: String?
+    var table: String?
+}
+
 /// Result grid used by table tabs (editable when given `editing`) and script results.
 ///
 /// Backed by a plain `NSTableView` rather than SwiftUI's `Table`: cells are reused text fields,
@@ -61,11 +79,15 @@ struct DataGrid: View {
     var sorting: GridSorting? = nil
     var editing: GridEditing? = nil
     var foreignKeys: GridForeignKeys? = nil
+    var focus: GridFocus? = nil
+    var source: GridSource? = nil
     /// New rows are loading (re-sort, refresh) while these stay on screen.
     var isReloading = false
 
     var body: some View {
-        GridTable(result: result, version: version, paging: paging, sorting: sorting, editing: editing, foreignKeys: foreignKeys)
+        GridTable(
+            result: result, version: version, paging: paging, sorting: sorting, editing: editing,
+            foreignKeys: foreignKeys, focus: focus, source: source)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 StatusBar(
                     loaded: result.rows.count, total: result.totalCount, truncated: result.truncated,
@@ -85,6 +107,8 @@ private struct GridTable: NSViewRepresentable {
     let sorting: GridSorting?
     let editing: GridEditing?
     let foreignKeys: GridForeignKeys?
+    let focus: GridFocus?
+    let source: GridSource?
 
     func makeCoordinator() -> GridData { GridData() }
 
@@ -122,7 +146,7 @@ private struct GridTable: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.update(
             result: result, version: version, paging: paging, sorting: sorting, editing: editing,
-            foreignKeys: foreignKeys)
+            foreignKeys: foreignKeys, focus: focus, source: source)
     }
 
     static func dismantleNSView(_ scroll: NSScrollView, coordinator: GridData) {
@@ -142,8 +166,14 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     private var edits = PendingEdits()
     /// The field editor over the cell being edited.
     private var editor: CellEditor?
-    /// Column (model index) of the last clicked cell: Return edits that one.
-    private var lastColumn: Int?
+    /// Column (model index) of the focused cell, last clicked or moved to with ←/→: Return edits that one.
+    private var focusedColumn: Int?
+    /// The cell currently drawn with the focus outline (row index, model column).
+    private var drawnFocus: (row: Int, column: Int)?
+    private var focus: GridFocus?
+    private var source: GridSource?
+    /// What `focus.changed` was last told, so it's only called when the focus moves.
+    private var reportedFocus: CellAddress??
     private var version = Int.min
     private var paging: GridPaging?
     private var sorting: GridSorting?
@@ -173,6 +203,10 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         table.action = #selector(clicked)
         table.doubleAction = #selector(doubleClicked)
         table.onHover = { [weak self] point in self?.hover(at: point) }
+        table.onArrow = { [weak self] step in self?.moveFocus(by: step) }
+        table.onCopy = { [weak self] headers in self?.copySelection(headers: headers) }
+        table.onCopyValue = { [weak self] in self?.copyFocusedValue() }
+        table.canCopy = { [weak self] in !(self?.table?.selectedRowIndexes.isEmpty ?? true) }
         let menu = NSMenu()
         menu.delegate = self
         table.menu = menu
@@ -192,8 +226,10 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
 
     func update(
         result: QueryResult, version: Int, paging: GridPaging?, sorting: GridSorting?, editing: GridEditing?,
-        foreignKeys: GridForeignKeys?
+        foreignKeys: GridForeignKeys?, focus: GridFocus?, source: GridSource?
     ) {
+        self.focus = focus
+        self.source = source
         self.paging = paging
         self.sorting = sorting
         self.editing = editing
@@ -227,6 +263,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
 
         if version != self.version || result.columns != columns {
             finishEditing(commit: false)
+            let isFirstLoad = self.version == Int.min
             self.version = version
             allRows = result.rows
             if result.columns != columns {
@@ -235,8 +272,12 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
             }
             hideLink()
             rebuildRows()
+            drawnFocus = nil
             table.reloadData()
+            table.deselectAll(nil)
             table.scrollRowToVisible(0)
+            if isFirstLoad { restoreFocus(table) }
+            focusChanged()
         } else if result.rows.count != allRows.count {
             let appended = result.rows.count > allRows.count && !editsChanged
             let selected = selectedIDs()
@@ -273,9 +314,12 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     /// Rebuilds the shown rows and reloads; new rows shift the others, so selection follows row ids.
     private func reload(_ table: NSTableView, keeping selected: Set<Int>) {
         rebuildRows()
+        // Row indexes may have shifted: the outline is redrawn once the selection is back.
+        drawnFocus = nil
         table.reloadData()
         let indexes = IndexSet(rows.indices.filter { selected.contains(rows[$0].id) })
         table.selectRowIndexes(indexes, byExtendingSelection: false)
+        focusChanged()
     }
 
     /// Loads the next page once the last visible row is near the end.
@@ -509,6 +553,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         let id = rows[row].id
         let isHovered = hoveredLink.map { $0 == (row, index) } ?? false
         cell.trailingInset = isHovered ? LinkButton.size + 4 : 0
+        cell.isFocused = drawnFocus.map { $0 == (row, index) } ?? false
         if edits.deleted.contains(id) {
             cell.show(rows[row].values[safe: index] ?? .null, mark: .deleted)
         } else if let edit = edits.value(row: id, column: index) {
@@ -520,6 +565,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        focusChanged()
         guard let editing, let table else { return }
         editing.selectionChanged(Set(table.selectedRowIndexes.compactMap { rows.indices.contains($0) ? rows[$0].id : nil }))
     }
@@ -537,8 +583,114 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     }
 
     @objc private func clicked() {
-        guard let table, table.clickedColumn >= 0 else { return }
-        lastColumn = modelColumn(atTableColumn: table.clickedColumn)
+        guard let table, table.clickedColumn >= 0, table.clickedRow >= 0 else { return }
+        focusedColumn = modelColumn(atTableColumn: table.clickedColumn)
+        focusChanged()
+    }
+
+    // MARK: Focused cell
+
+    /// The focused cell as (row index, model column), or `nil` without a selected row.
+    private var focusedCell: (row: Int, column: Int)? {
+        guard let table, rows.indices.contains(table.selectedRow) else { return nil }
+        let order = displayOrder()
+        guard let column = focusedColumn.flatMap({ order.contains($0) ? $0 : nil }) ?? order.first else { return nil }
+        return (table.selectedRow, column)
+    }
+
+    /// Redraws the outline and tells `focus` when the focused cell moved.
+    private func focusChanged() {
+        let cell = focusedCell
+        let same = switch (drawnFocus, cell) {
+        case (nil, nil): true
+        case let (a?, b?): a == b
+        default: false
+        }
+        if !same {
+            if let old = drawnFocus { self.cell(row: old.row, modelColumn: old.column)?.isFocused = false }
+            if let cell { self.cell(row: cell.row, modelColumn: cell.column)?.isFocused = true }
+            drawnFocus = cell
+        }
+        let address = cell.map { CellAddress(row: rows[$0.row].id, column: $0.column) }
+        guard reportedFocus != .some(address) else { return }
+        reportedFocus = .some(address)
+        // Not during SwiftUI's view update (this also runs from `update`).
+        DispatchQueue.main.async { [weak self] in self?.focus?.changed(address) }
+    }
+
+    /// Puts back the focus the grid had before it was recreated (e.g. switching tabs).
+    private func restoreFocus(_ table: NSTableView) {
+        guard let address = focus?.initial(), let index = rows.firstIndex(where: { $0.id == address.row }) else { return }
+        focusedColumn = address.column
+        table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        let tableColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier(String(address.column)))
+        DispatchQueue.main.async {
+            table.scrollRowToVisible(index)
+            if tableColumn >= 0 { table.scrollColumnToVisible(tableColumn) }
+        }
+    }
+
+    /// ←/→: the previous or next column in on-screen order.
+    private func moveFocus(by step: Int) {
+        guard let table, let current = focusedCell else { return }
+        let order = displayOrder()
+        guard let position = order.firstIndex(of: current.column), order.indices.contains(position + step) else { return }
+        focusedColumn = order[position + step]
+        let tableColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier(String(order[position + step])))
+        if tableColumn >= 0 { table.scrollColumnToVisible(tableColumn) }
+        focusChanged()
+    }
+
+    private func cell(row: Int, modelColumn column: Int) -> GridCell? {
+        guard let table else { return nil }
+        return cell(row: row, column: table.column(withIdentifier: NSUserInterfaceItemIdentifier(String(column))))
+    }
+
+    // MARK: Copying
+
+    /// A row as shown: unsaved edits applied (DEFAULT reads as NULL).
+    private func shownValues(_ row: Row) -> [DBValue] {
+        (0..<columns.count).map { index in
+            switch edits.value(row: row.id, column: index) {
+            case .text(let text)?: .text(text)
+            case .null?, .default?: .null
+            case nil: row.values[safe: index] ?? .null
+            }
+        }
+    }
+
+    /// `ids` (in grid order) formatted by the core, with columns in on-screen order.
+    private func text(rows ids: Set<Int>, format: CopyFormat, headers: Bool) -> String {
+        let order = displayOrder()
+        let picked = rows.filter { ids.contains($0.id) }.map { row in
+            let values = shownValues(row)
+            return order.map { values[$0] }
+        }
+        let kind = source?.kind ?? .postgres
+        return RowFormatter.format(
+            picked, columns: order.map { columns[$0] }, as: format, kind: kind,
+            schema: source?.schema, table: source?.table, headers: headers)
+    }
+
+    private func copy(rows ids: Set<Int>, format: CopyFormat, headers: Bool = false) {
+        guard !ids.isEmpty else { return }
+        Self.setPasteboard(text(rows: ids, format: format, headers: headers))
+    }
+
+    /// ⌘C / ⇧⌘C: the selected rows, tab-separated.
+    private func copySelection(headers: Bool) {
+        copy(rows: selectedIDs(), format: .tsv, headers: headers)
+    }
+
+    /// ⌥⌘C: the focused cell's value.
+    private func copyFocusedValue() {
+        guard let cell = focusedCell else { return }
+        Self.setPasteboard(shownValues(rows[cell.row])[cell.column].displayString)
+    }
+
+    private static func setPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     @objc private func doubleClicked() {
@@ -551,7 +703,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     private func editSelectedRow() {
         guard let table, rows.indices.contains(table.selectedRow) else { return }
         let fallback = displayOrder().first { isEditable(column: $0) }
-        guard let column = lastColumn.flatMap({ isEditable(column: $0) ? $0 : nil }) ?? fallback else { return }
+        guard let column = focusedColumn.flatMap({ isEditable(column: $0) ? $0 : nil }) ?? fallback else { return }
         beginEditing(row: rows[table.selectedRow].id, column: column)
     }
 
@@ -579,7 +731,8 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         table.selectRowIndexes(IndexSet(integer: rowIndex), byExtendingSelection: false)
         table.scrollRowToVisible(rowIndex)
         table.scrollColumnToVisible(tableColumn)
-        lastColumn = column
+        focusedColumn = column
+        focusChanged()
 
         let current: EditValue = edits.value(row: id, column: column) ?? {
             let original = rows[rowIndex].values[safe: column] ?? .null
@@ -687,16 +840,36 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
             menu.addItem(.separator())
         }
         if let column {
-            let value = edits.value(row: row.id, column: column).map { edit -> String in
-                switch edit {
-                case .text(let t): t
-                case .null: "NULL"
-                case .default: "DEFAULT"
+            let value = shownValues(row)[column].displayString
+            menu.addItem(ClosureMenuItem("Copy Value", key: ("c", [.command, .option])) { Self.setPasteboard(value) })
+        }
+        let count = targets.count
+        menu.addItem(ClosureMenuItem(count == 1 ? "Copy Row" : "Copy \(count) Rows", key: ("c", .command)) { [weak self] in
+            self?.copy(rows: targets, format: .tsv)
+        })
+        menu.addItem(ClosureMenuItem("Copy with Headers", key: ("c", [.command, .shift])) { [weak self] in
+            self?.copy(rows: targets, format: .tsv, headers: true)
+        })
+        let copyAs = NSMenu()
+        for format in CopyFormat.allCases where format != .tsv {
+            copyAs.addItem(ClosureMenuItem(format.title) { [weak self] in
+                self?.copy(rows: targets, format: format, headers: format == .csv)
+            })
+        }
+        let copyAsItem = NSMenuItem(title: "Copy As", action: nil, keyEquivalent: "")
+        copyAsItem.submenu = copyAs
+        menu.addItem(copyAsItem)
+        if let focus, let column {
+            menu.addItem(.separator())
+            menu.addItem(ClosureMenuItem("Inspect Value", key: ("i", [.command, .option])) { [weak self] in
+                guard let self, let table = self.table else { return }
+                // Focus the clicked cell first, so that's the one inspected.
+                if !table.selectedRowIndexes.contains(clickedRow) {
+                    table.selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
                 }
-            } ?? (row.values[safe: column]?.displayString ?? "")
-            menu.addItem(ClosureMenuItem("Copy Value") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(value, forType: .string)
+                self.focusedColumn = column
+                self.focusChanged()
+                focus.inspect()
             })
         }
     }
@@ -746,7 +919,39 @@ final class GridTableView: NSTableView {
     var onDelete: (() -> Void)?
     /// Mouse position in the table's coordinates (`nil` when it leaves), for the foreign key links.
     var onHover: ((NSPoint?) -> Void)?
+    /// ← (-1) / → (+1): move the focused cell.
+    var onArrow: ((Int) -> Void)?
+    /// ⌘C (Edit ▸ Copy) copies rows; ⇧⌘C with headers.
+    var onCopy: ((_ headers: Bool) -> Void)?
+    /// ⌥⌘C copies the focused cell's value.
+    var onCopyValue: (() -> Void)?
+    var canCopy: (() -> Bool)?
     private var hoverArea: NSTrackingArea?
+
+    @objc func copy(_ sender: Any?) {
+        onCopy?(false)
+    }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(copy(_:)) { return canCopy?() ?? false }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard window?.firstResponder === self, event.charactersIgnoringModifiers?.lowercased() == "c" else {
+            return super.performKeyEquivalent(with: event)
+        }
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if flags == [.command, .shift], canCopy?() ?? false {
+            onCopy?(true)
+            return true
+        }
+        if flags == [.command, .option], let onCopyValue {
+            onCopyValue()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -772,7 +977,10 @@ final class GridTableView: NSTableView {
         let plain = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
         let isReturn = event.keyCode == 36 || event.keyCode == 76  // Return, Enter
         let isDelete = event.keyCode == 51 || event.keyCode == 117  // ⌫, ⌦
-        if plain, isReturn, let onReturn {
+        let arrow = event.keyCode == 123 ? -1 : event.keyCode == 124 ? 1 : 0  // ←, →
+        if plain, arrow != 0, let onArrow {
+            onArrow(arrow)
+        } else if plain, isReturn, let onReturn {
             onReturn()
         } else if plain, isDelete, let onDelete {
             onDelete()
@@ -875,9 +1083,11 @@ private final class LinkButton: NSButton {
 private final class ClosureMenuItem: NSMenuItem {
     private let handler: () -> Void
 
-    init(_ title: String, handler: @escaping () -> Void) {
+    /// `key` is only shown in the menu (the grid handles the shortcut itself).
+    init(_ title: String, key: (String, NSEvent.ModifierFlags)? = nil, handler: @escaping () -> Void) {
         self.handler = handler
-        super.init(title: title, action: #selector(run), keyEquivalent: "")
+        super.init(title: title, action: #selector(run), keyEquivalent: key?.0 ?? "")
+        if let key { keyEquivalentModifierMask = key.1 }
         target = self
     }
 
@@ -894,6 +1104,10 @@ private final class GridCell: NSTableCellView {
     /// Room kept free at the trailing edge (for the foreign key arrow while hovered).
     var trailingInset: CGFloat = 0 {
         didSet { if trailingInset != oldValue { needsDisplay = true } }
+    }
+    /// The grid's focused cell: outlined.
+    var isFocused = false {
+        didSet { if isFocused != oldValue { needsDisplay = true } }
     }
 
     enum Style { case text, number, null, dimmed }
@@ -966,6 +1180,12 @@ private final class GridCell: NSTableCellView {
         if mark == .edited {
             mark!.tint.setFill()
             NSBezierPath(roundedRect: bounds.insetBy(dx: -4, dy: 2), xRadius: 4, yRadius: 4).fill()
+        }
+        if isFocused {
+            let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: -4.5, dy: 2.5), xRadius: 4, yRadius: 4)
+            outline.lineWidth = 1.5
+            (selected ? NSColor.alternateSelectedControlTextColor.withAlphaComponent(0.85) : .controlAccentColor).setStroke()
+            outline.stroke()
         }
         let font = style == .null ? Self.nullFont : Self.font
         let lineHeight = ceil(font.ascender - font.descender + font.leading)

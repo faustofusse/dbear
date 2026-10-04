@@ -67,7 +67,7 @@ impl Dialect {
     }
 
     /// A value as a SQL literal (not `NULL`, which needs `is null` in a comparison).
-    fn literal(self, value: &Value) -> String {
+    pub(crate) fn literal(self, value: &Value) -> String {
         match value {
             Value::Null => "null".into(),
             Value::Bool(b) if self.0 == DatabaseKind::Postgres => b.to_string(),

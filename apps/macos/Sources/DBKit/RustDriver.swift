@@ -495,3 +495,31 @@ extension DBCoreFFI.DumpOptions {
             dataStyle: o.dataStyle == .insert ? .insert : .copy, dropObjects: o.dropObjects, createDatabase: o.createDatabase)
     }
 }
+
+// MARK: - Copying rows
+
+public enum RowFormatter {
+    /// Rows as clipboard text in `format`. `schema`/`table` name the `INSERT` target
+    /// (`nil` for script results); `headers` adds a header line to TSV/CSV.
+    public static func format(
+        _ rows: [[DBValue]], columns: [ColumnInfo], as format: CopyFormat, kind: DatabaseKind,
+        schema: String? = nil, table: String? = nil, headers: Bool = false
+    ) -> String {
+        let ffiFormat: DBCoreFFI.CopyFormat = switch format {
+        case .tsv: .tsv
+        case .csv: .csv
+        case .json: .json
+        case .markdown: .markdown
+        case .insert: .insert
+        }
+        return DBCoreFFI.formatRows(
+            format: ffiFormat, kind: DBCoreFFI.DatabaseKind(kind), schema: schema, table: table,
+            columns: columns.map(DBCoreFFI.ColumnInfo.init), rows: rows.map { $0.map(DBCoreFFI.Value.init) },
+            headers: headers)
+    }
+
+    /// A JSON object or array re-indented for reading (key order and digits kept), else `nil`.
+    public static func prettyJSON(_ text: String) -> String? {
+        DBCoreFFI.prettyJson(text: text)
+    }
+}

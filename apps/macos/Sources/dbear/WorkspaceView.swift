@@ -7,7 +7,12 @@ struct WorkspaceView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        @Bindable var model = model
         content
+            .inspector(isPresented: $model.showsInspector) {
+                ValueInspector()
+                    .inspectorColumnWidth(min: 220, ideal: 300, max: 640)
+            }
             .toolbar {
                 // [New Script]  [Data | Structure]  [+ −] ……… [Discard] [Review] [Save]  [Refresh]
                 ToolbarItem { newScriptButton }
@@ -34,6 +39,14 @@ struct WorkspaceView: View {
                     }
                 }
                 ToolbarItem { RefreshButton() }
+                ToolbarItem {
+                    Button {
+                        model.showsInspector.toggle()
+                    } label: {
+                        Label("Inspector", systemImage: "sidebar.trailing")
+                    }
+                    .help(model.showsInspector ? "Hide Inspector (\u{2325}\u{2318}I)" : "Show Inspector (\u{2325}\u{2318}I)")
+                }
             }
     }
 

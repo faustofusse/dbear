@@ -50,6 +50,12 @@ struct TableTabView: View {
                     open: { model.openReferencedRow($0, values: $1, from: tab) },
                     openReferencing: { model.openReferencingRows($0, values: $1, from: tab) }
                 ),
+                focus: GridFocus(
+                    initial: { tab.focusedCell },
+                    changed: { tab.focusedCell = $0 },
+                    inspect: { model.showsInspector = true }
+                ),
+                source: GridSource(kind: tab.connection.kind, schema: tab.table.schema, table: tab.table.name),
                 isReloading: tab.isReloading
             )
             .safeAreaInset(edge: .top, spacing: 0) {

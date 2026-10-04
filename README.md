@@ -98,6 +98,11 @@ cargo test -p dbcore              # core (Postgres tests skip without a database
   UPDATE/DELETE doesn't match exactly one row (the row changed since it was loaded). Values
   are sent as string literals and cast by the database. Views, keyless tables and binary
   columns are read-only.
+- Grids have a focused cell (click, or ←/→ to change column). ⌘C copies the selected rows as TSV,
+  ⇧⌘C with headers, ⌥⌘C the focused value; the context menu also copies as CSV, JSON, a Markdown
+  table or `INSERT`s (`dbcore::export::format_rows`). The inspector (⌥⌘I) shows the focused value in
+  full, with JSON pretty-printed (`export::pretty_json` keeps key order and digits), and edits it
+  for editable tables.
 - Turso / libSQL connections (`libsql://db-org.turso.io?authToken=…`) speak Hrana 3 over HTTP
   (`dbcore::libsql`, reqwest + rustls/ring, no libSQL C library). The auth token is stored in the
   keychain like a password. Each call runs on its own short-lived stream, so a transaction a script

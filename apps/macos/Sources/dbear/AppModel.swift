@@ -89,6 +89,9 @@ final class TableTab: Identifiable {
     var mode = TableTabMode.data
     var structure: LoadState<TableStructure> = .idle
 
+    /// The grid's focused cell (row id, column index), shown in the value inspector.
+    var focusedCell: CellAddress?
+
     /// Server-side sort, cycled by clicking column headers.
     var sort: [SortKey] = []
     /// Only the rows matching this `WHERE` condition, e.g. the row a foreign key points at.
@@ -147,6 +150,8 @@ final class ScriptTab: Identifiable {
     var lastDuration: Duration?
     /// Bumped on every run so the grid knows the result was replaced.
     var runCount = 0
+    /// The result grid's focused cell (row index, column index), shown in the value inspector.
+    var focusedCell: CellAddress?
     /// The last run was stopped by the user.
     var wasCancelled = false
     /// Editor pane height once the user drags the divider; `nil` = half the available height.
@@ -326,6 +331,12 @@ final class AppModel {
     var editorFontSize: CGFloat = AppModel.storedEditorFontSize {
         didSet { UserDefaults.standard.set(Double(editorFontSize), forKey: Self.editorFontSizeKey) }
     }
+    /// The value inspector on the right of the data pane (⌥⌘I). Remembered across launches.
+    var showsInspector = UserDefaults.standard.bool(forKey: AppModel.showsInspectorKey) {
+        didSet { UserDefaults.standard.set(showsInspector, forKey: Self.showsInspectorKey) }
+    }
+    private static let showsInspectorKey = "showsInspector"
+
     static let defaultEditorFontSize = NSFont.systemFontSize
     static let editorFontSizes: ClosedRange<CGFloat> = 8...40
 

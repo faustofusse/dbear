@@ -362,3 +362,20 @@ public struct QueryResult: Sendable {
         self.truncated = truncated
     }
 }
+
+// MARK: - Copying
+
+/// Clipboard formats for grid rows (formatted by the core, `RowFormatter`).
+public enum CopyFormat: String, CaseIterable, Sendable {
+    case tsv, csv, json, markdown, insert
+
+    public var title: String {
+        switch self {
+        case .tsv: "Tab-Separated"
+        case .csv: "CSV"
+        case .json: "JSON"
+        case .markdown: "Markdown Table"
+        case .insert: "SQL INSERT"
+        }
+    }
+}

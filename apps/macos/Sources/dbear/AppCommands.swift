@@ -55,6 +55,8 @@ struct AppCommands: Commands {
             Button("Structure") { if let tab = model.activeTableTab { model.setMode(.structure, of: tab) } }
                 .keyboardShortcut("2", modifiers: [.command, .option])
                 .disabled(model.activeTableTab == nil)
+            Button(model.showsInspector ? "Hide Inspector" : "Show Inspector") { model.showsInspector.toggle() }
+                .keyboardShortcut("i", modifiers: [.command, .option])
             Divider()
 
             Button("Actual Size") { model.resetEditorZoom() }

@@ -11,6 +11,7 @@ pub mod dialect;
 pub mod dump;
 pub mod driver;
 pub mod edit;
+pub mod export;
 pub mod highlight;
 pub mod import;
 pub mod keyset;
