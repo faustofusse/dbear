@@ -672,6 +672,31 @@ async fn describe(lease: &mut Lease<'_>, table: &TableInfo) -> Result<TableStruc
         fk.referenced_columns.push(ref_column);
     }
 
+    let incoming_rows = lease
+        .conn()
+        .query::<(String, String, String, String, String), _>(format!(
+            "select table_schema, table_name, constraint_name, column_name, referenced_column_name
+             from information_schema.key_column_usage
+             where referenced_table_schema = {schema} and referenced_table_name = {name}
+             order by table_schema, table_name, constraint_name, ordinal_position"
+        ))
+        .await;
+    let mut referenced_by: Vec<ReferencingKey> = Vec::new();
+    for (ref_schema, ref_table, constraint, column, referenced_column) in lease.check(incoming_rows).map_err(|e| query_error(&e))? {
+        if referenced_by.last().is_none_or(|k| (&k.schema, &k.table, &k.name) != (&ref_schema, &ref_table, &constraint)) {
+            referenced_by.push(ReferencingKey {
+                schema: ref_schema,
+                table: ref_table,
+                name: constraint,
+                columns: Vec::new(),
+                referenced_columns: Vec::new(),
+            });
+        }
+        let key = referenced_by.last_mut().expect("pushed above");
+        key.columns.push(column);
+        key.referenced_columns.push(referenced_column);
+    }
+
     // `SHOW CREATE TABLE` works for views too; the statement is the second column either way.
     let ddl = lease.conn().query_first::<mysql_async::Row, _>(format!("show create table {relation}")).await;
     let ddl = lease
@@ -680,7 +705,7 @@ async fn describe(lease: &mut Lease<'_>, table: &TableInfo) -> Result<TableStruc
         .and_then(|row| row.get_opt::<String, _>(1).and_then(|r| r.ok()))
         .map(|sql| format!("{sql};"));
 
-    Ok(TableStructure { columns, primary_key, indexes, foreign_keys, ddl })
+    Ok(TableStructure { columns, primary_key, indexes, foreign_keys, referenced_by, ddl })
 }
 
 /// What the structure view shows as a column's default: the default and the `extra` flags

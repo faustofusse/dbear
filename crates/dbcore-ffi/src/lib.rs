@@ -134,12 +134,23 @@ pub struct ForeignKeyInfo {
     pub on_delete: String,
 }
 
+/// A foreign key in another table that points at this one (see `dbcore::ReferencingKey`).
+#[derive(uniffi::Record)]
+pub struct ReferencingKey {
+    pub schema: String,
+    pub table: String,
+    pub name: String,
+    pub columns: Vec<String>,
+    pub referenced_columns: Vec<String>,
+}
+
 #[derive(uniffi::Record)]
 pub struct TableStructure {
     pub columns: Vec<ColumnDetail>,
     pub primary_key: Vec<String>,
     pub indexes: Vec<IndexInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+    pub referenced_by: Vec<ReferencingKey>,
     pub ddl: Option<String>,
 }
 
@@ -817,6 +828,17 @@ impl From<dbcore::TableStructure> for TableStructure {
                     referenced_columns: f.referenced_columns,
                     on_update: f.on_update,
                     on_delete: f.on_delete,
+                })
+                .collect(),
+            referenced_by: s
+                .referenced_by
+                .into_iter()
+                .map(|k| ReferencingKey {
+                    schema: k.schema,
+                    table: k.table,
+                    name: k.name,
+                    columns: k.columns,
+                    referenced_columns: k.referenced_columns,
                 })
                 .collect(),
             ddl: s.ddl,

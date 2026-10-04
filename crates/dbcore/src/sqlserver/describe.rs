@@ -250,7 +250,16 @@ pub(super) async fn describe(lease: &mut Lease<'_>, table: &TableInfo, is_view: 
          where fk.parent_object_id = {object}
          order by fk.name, fkc.constraint_column_id;
          select name, definition from sys.check_constraints where parent_object_id = {object} order by name;
-         select object_definition({object})",
+         select object_definition({object});
+         select rs.name, ro.name, fk.name, pc.name, rc.name
+         from sys.foreign_keys fk
+         join sys.foreign_key_columns fkc on fkc.constraint_object_id = fk.object_id
+         join sys.objects ro on ro.object_id = fk.parent_object_id
+         join sys.schemas rs on rs.schema_id = ro.schema_id
+         join sys.columns pc on pc.object_id = fkc.parent_object_id and pc.column_id = fkc.parent_column_id
+         join sys.columns rc on rc.object_id = fkc.referenced_object_id and rc.column_id = fkc.referenced_column_id
+         where fk.referenced_object_id = {object}
+         order by rs.name, ro.name, fk.name, fkc.constraint_column_id",
         columns = columns_query(&format!("o.object_id = {object}")),
     );
     let mut sets = lease.results(&sql).await?.into_iter();
@@ -301,6 +310,16 @@ pub(super) async fn describe(lease: &mut Lease<'_>, table: &TableInfo, is_view: 
     }
     let checks: Vec<(String, String)> = next().iter().map(|r| (text(r, 0), text(r, 1))).collect();
     let module = next().first().and_then(|r| opt_text(r, 0));
+    let mut referenced_by: Vec<ReferencingKey> = Vec::new();
+    for row in next() {
+        let (schema, table, name) = (text(&row, 0), text(&row, 1), text(&row, 2));
+        if referenced_by.last().is_none_or(|k| (&k.schema, &k.table, &k.name) != (&schema, &table, &name)) {
+            referenced_by.push(ReferencingKey { schema, table, name, columns: Vec::new(), referenced_columns: Vec::new() });
+        }
+        let key = referenced_by.last_mut().expect("pushed above");
+        key.columns.push(text(&row, 3));
+        key.referenced_columns.push(text(&row, 4));
+    }
 
     let mut primary_key: Vec<&ColumnRow> = columns.iter().filter(|c| c.pk_ordinal > 0).collect();
     primary_key.sort_by_key(|c| c.pk_ordinal);
@@ -324,6 +343,7 @@ pub(super) async fn describe(lease: &mut Lease<'_>, table: &TableInfo, is_view: 
         primary_key,
         indexes: def.indexes.iter().map(|i| i.info(&relation)).collect(),
         foreign_keys: def.foreign_keys,
+        referenced_by,
         ddl,
     })
 }

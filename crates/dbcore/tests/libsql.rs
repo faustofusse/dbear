@@ -172,6 +172,8 @@ fn describes_tables() {
     assert!(links.indexes.iter().any(|i| i.is_primary && i.columns == ["note_id", "tag_id"]));
 
     let tags = block_on(conn.describe_table(TableInfo::new("main", "tags"))).unwrap();
+    let incoming: Vec<_> = tags.referenced_by.iter().map(|k| (k.table.as_str(), k.columns.clone(), k.referenced_columns.clone())).collect();
+    assert_eq!(incoming, [("note_tags", vec!["tag_id".to_string()], vec!["id".to_string()])]);
     assert!(tags.indexes.iter().any(|i| i.is_unique && i.columns == ["name"] && i.definition.is_none()));
     let notes = block_on(conn.describe_table(TableInfo::new("main", "notes"))).unwrap();
     let pinned = notes.columns.iter().find(|c| c.name == "pinned").unwrap();

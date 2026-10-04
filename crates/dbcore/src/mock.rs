@@ -463,6 +463,7 @@ impl Driver for MockDriver {
             },
             primary_key,
             foreign_keys: Vec::new(),
+            referenced_by: Vec::new(),
             ddl: Some(ddl),
         })
     }

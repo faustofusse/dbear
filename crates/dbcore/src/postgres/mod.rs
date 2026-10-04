@@ -731,6 +731,27 @@ async fn describe(client: &Client, relation: &str, table: &TableInfo) -> Result<
         })
         .collect();
 
+    // Clones of a key on partitions (or pointing at this table's partitions) have a parent: skip them.
+    let referenced_by: Vec<ReferencingKey> = client
+        .query(
+            "select n.nspname, c.relname, con.conname,
+                    array(select a.attname from unnest(con.conkey) with ordinality k(n, o)
+                          join pg_attribute a on a.attrelid = con.conrelid and a.attnum = k.n order by k.o),
+                    array(select a.attname from unnest(con.confkey) with ordinality k(n, o)
+                          join pg_attribute a on a.attrelid = con.confrelid and a.attnum = k.n order by k.o)
+             from pg_constraint con
+             join pg_class c on c.oid = con.conrelid
+             join pg_namespace n on n.oid = c.relnamespace
+             where con.confrelid = $1::text::regclass and con.contype = 'f' and con.conparentid = 0
+             order by n.nspname, c.relname, con.conname",
+            &[&relation],
+        )
+        .await
+        .map_err(not_found)?
+        .iter()
+        .map(|r| ReferencingKey { schema: r.get(0), table: r.get(1), name: r.get(2), columns: r.get(3), referenced_columns: r.get(4) })
+        .collect();
+
     let constraints: Vec<(String, String)> = client
         .query(
             "select conname, pg_get_constraintdef(oid, true)
@@ -807,6 +828,7 @@ async fn describe(client: &Client, relation: &str, table: &TableInfo) -> Result<
         primary_key,
         indexes: indexes.into_iter().map(|(i, _)| i).collect(),
         foreign_keys,
+        referenced_by,
         ddl: Some(ddl.trim_end().to_string()),
     })
 }

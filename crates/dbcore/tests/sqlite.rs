@@ -205,6 +205,13 @@ fn describes_tables() {
 
     let tags = block_on(conn.describe_table(TableInfo::new("main", "tags"))).unwrap();
     assert!(tags.indexes.iter().any(|i| i.is_unique && i.columns == ["name"]));
+    let incoming: Vec<_> = tags.referenced_by.iter().map(|k| (k.table.as_str(), k.columns.clone(), k.referenced_columns.clone())).collect();
+    assert_eq!(incoming, [("note_tags", vec!["tag_id".to_string()], vec!["id".to_string()])]);
+    // A key without columns points at the primary key: no referenced columns.
+    block_on(conn.execute("create table tag_aliases (alias text, tag integer references tags)".into())).unwrap();
+    let tags = block_on(conn.describe_table(TableInfo::new("main", "tags"))).unwrap();
+    let alias = tags.referenced_by.iter().find(|k| k.table == "tag_aliases").unwrap();
+    assert_eq!((alias.columns.as_slice(), alias.referenced_columns.is_empty()), (&["tag".to_string()][..], true));
     let notes = block_on(conn.describe_table(TableInfo::new("main", "notes"))).unwrap();
     let pinned = notes.columns.iter().find(|c| c.name == "pinned").unwrap();
     assert_eq!(pinned.default_value.as_deref(), Some("0"));

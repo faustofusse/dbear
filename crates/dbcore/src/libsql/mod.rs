@@ -226,14 +226,14 @@ impl Driver for LibsqlDriver {
 
     async fn describe_table(&self, table: &TableInfo) -> Result<TableStructure> {
         let [master, info] = catalog::table_meta_statements(table);
-        let [indexes, foreign_keys, ddl] = catalog::structure_statements(table);
-        let mut results = self.run([master, info, indexes, foreign_keys, ddl]).await?.into_iter();
+        let [indexes, foreign_keys, ddl, referenced_by] = catalog::structure_statements(table);
+        let mut results = self.run([master, info, indexes, foreign_keys, ddl, referenced_by]).await?.into_iter();
         let mut next = || results.next().expect("one result per statement");
         let (master, info) = (next()?, next()?);
         let meta = catalog::table_meta(table, master, info)?;
         // Optional parts: a server without one of these pragmas still shows the columns.
-        let (indexes, foreign_keys, ddl) = (next().ok(), next().ok(), next().ok());
-        Ok(catalog::structure(table, meta, indexes, foreign_keys, ddl))
+        let (indexes, foreign_keys, ddl, referenced_by) = (next().ok(), next().ok(), next().ok(), next().ok());
+        Ok(catalog::structure(table, meta, indexes, foreign_keys, ddl, referenced_by))
     }
 
     async fn execute(&self, sql: &str, max_rows: Option<u32>) -> Result<QueryResult> {

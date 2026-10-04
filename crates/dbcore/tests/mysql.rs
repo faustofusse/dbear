@@ -259,6 +259,11 @@ fn describes_tables_and_views() {
     assert!(orders.indexes.iter().any(|i| i.is_primary && i.columns == ["id"]));
     assert!(orders.ddl.unwrap().starts_with("CREATE TABLE `orders`"));
 
+    let customers = block_on(dev().describe_table(TableInfo::new("shop", "customers"))).unwrap();
+    let from_orders = customers.referenced_by.iter().find(|k| k.table == "orders").expect("orders.customer_id references customers");
+    assert_eq!((from_orders.schema.as_str(), from_orders.columns.as_slice()), ("shop", &["customer_id".to_string()][..]));
+    assert_eq!(from_orders.referenced_columns, ["id"]);
+
     let items = block_on(dev().describe_table(TableInfo::new("shop", "order_items"))).unwrap();
     assert_eq!(items.primary_key, ["order_id", "product_id"]);
 

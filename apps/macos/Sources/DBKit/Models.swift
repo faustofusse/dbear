@@ -219,6 +219,28 @@ public struct ForeignKeyInfo: Identifiable, Hashable, Sendable {
     }
 }
 
+/// A foreign key in another table that points at this one: rows of `schema.table` whose `columns`
+/// hold this table's `referencedColumns` belong to that row.
+public struct ReferencingKey: Identifiable, Hashable, Sendable {
+    public var schema: String
+    public var table: String
+    /// Empty for SQLite, which doesn't name foreign keys.
+    public var name: String
+    /// The key's columns, in `table`.
+    public var columns: [String]
+    /// The columns of this table they point at; empty when SQLite references the primary key implicitly.
+    public var referencedColumns: [String]
+    public var id: String { "\(schema).\(table)|\(name)|\(columns.joined(separator: ","))" }
+
+    public init(schema: String, table: String, name: String, columns: [String], referencedColumns: [String]) {
+        self.schema = schema
+        self.table = table
+        self.name = name
+        self.columns = columns
+        self.referencedColumns = referencedColumns
+    }
+}
+
 /// Columns, keys, indexes, foreign keys and DDL of a table or view.
 public struct TableStructure: Hashable, Sendable {
     public var columns: [ColumnDetail]
@@ -226,16 +248,19 @@ public struct TableStructure: Hashable, Sendable {
     public var primaryKey: [String]
     public var indexes: [IndexInfo]
     public var foreignKeys: [ForeignKeyInfo]
+    /// Foreign keys of other tables (in the same database) that point at this one.
+    public var referencedBy: [ReferencingKey]
     public var ddl: String?
 
     public init(
         columns: [ColumnDetail], primaryKey: [String] = [], indexes: [IndexInfo] = [],
-        foreignKeys: [ForeignKeyInfo] = [], ddl: String? = nil
+        foreignKeys: [ForeignKeyInfo] = [], referencedBy: [ReferencingKey] = [], ddl: String? = nil
     ) {
         self.columns = columns
         self.primaryKey = primaryKey
         self.indexes = indexes
         self.foreignKeys = foreignKeys
+        self.referencedBy = referencedBy
         self.ddl = ddl
     }
 }

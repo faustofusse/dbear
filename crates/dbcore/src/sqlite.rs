@@ -534,6 +534,11 @@ fn describe(conn: &rusqlite::Connection, table: &TableInfo) -> Result<TableStruc
         }
     }
 
+    let incoming_rows: Vec<(String, i64, String, Option<String>)> = conn
+        .prepare(&referenced_by_query(&table.schema))
+        .and_then(|mut s| s.query_map([&table.name, &table.schema], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect())
+        .map_err(err)?;
+
     // The table's own SQL, then its indexes and triggers, as SQLite stored them.
     let statements: Vec<String> = conn
         .prepare(&format!(
@@ -549,8 +554,39 @@ fn describe(conn: &rusqlite::Connection, table: &TableInfo) -> Result<TableStruc
         primary_key: meta.primary_key,
         indexes,
         foreign_keys: foreign_keys.into_iter().map(|(_, fk)| fk).collect(),
+        referenced_by: group_referenced_by(&table.schema, incoming_rows),
         ddl,
     })
+}
+
+/// Foreign keys of the other tables in `schema` that point at table `?1` (`?2` = `schema`):
+/// rows of `(table, key id, column, referenced column)`. Also used by the libSQL driver.
+pub(crate) fn referenced_by_query(schema: &str) -> String {
+    format!(
+        "select m.name, f.id, f.\"from\", f.\"to\"
+         from {}.sqlite_master m join pragma_foreign_key_list(m.name, ?2) f
+         where m.type = 'table' and f.\"table\" = ?1 collate nocase
+         order by m.name, f.id, f.seq",
+        SQLITE.quote_ident(schema)
+    )
+}
+
+/// Groups [`referenced_by_query`] rows into keys. A NULL referenced column means the key points at
+/// the primary key implicitly (`referenced_columns` stays empty).
+pub(crate) fn group_referenced_by(schema: &str, rows: impl IntoIterator<Item = (String, i64, String, Option<String>)>) -> Vec<ReferencingKey> {
+    let mut keys: Vec<(i64, ReferencingKey)> = Vec::new();
+    for (table, id, from, to) in rows {
+        if keys.last().is_none_or(|(last, k)| *last != id || k.table != table) {
+            let key = ReferencingKey { schema: schema.into(), table, name: String::new(), columns: Vec::new(), referenced_columns: Vec::new() };
+            keys.push((id, key));
+        }
+        let key = &mut keys.last_mut().expect("pushed above").1;
+        key.columns.push(from);
+        if let Some(to) = to {
+            key.referenced_columns.push(to);
+        }
+    }
+    keys.into_iter().map(|(_, k)| k).collect()
 }
 
 // MARK: Running SQL

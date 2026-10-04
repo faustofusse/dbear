@@ -255,6 +255,21 @@ pub struct ForeignKeyInfo {
     pub on_delete: String,
 }
 
+/// A foreign key in another table that points at this one: rows of `schema.table` whose `columns`
+/// hold this table's `referenced_columns` belong to that row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReferencingKey {
+    /// The table holding the key.
+    pub schema: String,
+    pub table: String,
+    /// Constraint name (empty for SQLite).
+    pub name: String,
+    /// The key's columns, in `table`.
+    pub columns: Vec<String>,
+    /// The columns of this table they point at; empty when SQLite references the primary key implicitly.
+    pub referenced_columns: Vec<String>,
+}
+
 /// Everything the structure view shows for a table or view (`Driver::describe_table`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct TableStructure {
@@ -263,6 +278,8 @@ pub struct TableStructure {
     pub primary_key: Vec<String>,
     pub indexes: Vec<IndexInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+    /// Foreign keys of other tables (in the same database) that point at this one.
+    pub referenced_by: Vec<ReferencingKey>,
     /// `CREATE TABLE` / `CREATE VIEW` (plus indexes) as SQL, when it can be produced.
     pub ddl: Option<String>,
 }

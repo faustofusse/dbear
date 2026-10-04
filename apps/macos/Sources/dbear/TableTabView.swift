@@ -44,9 +44,12 @@ struct TableTabView: View {
                 ),
                 sorting: GridSorting(keys: tab.sort) { model.toggleSort(tab, column: $0) },
                 editing: tab.readOnlyReason == nil ? editing : nil,
-                foreignKeys: GridForeignKeys(keys: tab.foreignKeys) { fk, values in
-                    model.openReferencedRow(fk, values: values, from: tab)
-                },
+                foreignKeys: GridForeignKeys(
+                    keys: tab.foreignKeys, referencedBy: tab.referencedBy, schema: tab.table.schema,
+                    primaryKey: tab.structure.value?.primaryKey ?? [],
+                    open: { model.openReferencedRow($0, values: $1, from: tab) },
+                    openReferencing: { model.openReferencingRows($0, values: $1, from: tab) }
+                ),
                 isReloading: tab.isReloading
             )
             .safeAreaInset(edge: .top, spacing: 0) {
@@ -307,6 +310,9 @@ private struct StructureContent: View {
                 if !structure.foreignKeys.isEmpty {
                     section("Foreign Keys", count: structure.foreignKeys.count) { foreignKeysGrid }
                 }
+                if !structure.referencedBy.isEmpty {
+                    section("Referenced By", count: structure.referencedBy.count) { referencedByGrid }
+                }
                 if let ddl = structure.ddl {
                     section("Definition", count: nil) { DDLView(sql: ddl, fontSize: 12) }
                 }
@@ -434,6 +440,35 @@ private struct StructureContent: View {
                     Text(fk.onUpdate).foregroundStyle(.secondary)
                     Text(fk.onDelete).foregroundStyle(fk.onDelete == "CASCADE" ? .orange : .secondary)
                     Text(fk.name).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var referencedByGrid: some View {
+        StructureGrid {
+            GridRow {
+                HeaderCell("Table")
+                HeaderCell("Columns")
+                HeaderCell("References")
+                HeaderCell("Name")
+            }
+        } rows: {
+            DividedRows(items: structure.referencedBy) { key in
+                GridRow {
+                    Button {
+                        model.openReferencingTable(key, from: tab)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(key.schema == tab.table.schema ? key.table : "\(key.schema).\(key.table)")
+                            Image(systemName: "arrow.right.circle.fill").font(.system(size: 11))
+                        }
+                    }
+                    .buttonStyle(.link)
+                    .help("Open \(key.schema).\(key.table)")
+                    Code(key.columns.joined(separator: ", "))
+                    Code(key.referencedColumns.isEmpty ? structure.primaryKey.joined(separator: ", ") : key.referencedColumns.joined(separator: ", "))
+                    Text(key.name).foregroundStyle(.secondary)
                 }
             }
         }

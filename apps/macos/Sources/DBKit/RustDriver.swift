@@ -319,6 +319,10 @@ extension TableStructure {
                                referencedTable: $0.referencedTable, referencedColumns: $0.referencedColumns,
                                onUpdate: $0.onUpdate, onDelete: $0.onDelete)
             },
+            referencedBy: s.referencedBy.map {
+                ReferencingKey(schema: $0.schema, table: $0.table, name: $0.name, columns: $0.columns,
+                               referencedColumns: $0.referencedColumns)
+            },
             ddl: s.ddl
         )
     }

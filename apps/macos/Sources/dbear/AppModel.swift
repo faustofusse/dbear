@@ -114,6 +114,8 @@ final class TableTab: Identifiable {
 
     /// Known once the structure has loaded (fetched in the background when the rows load).
     var foreignKeys: [ForeignKeyInfo] { structure.value?.foreignKeys ?? [] }
+    /// Other tables' foreign keys pointing at this table (also from the structure).
+    var referencedBy: [ReferencingKey] { structure.value?.referencedBy ?? [] }
 
     /// Why the rows can't be edited, or `nil` if they can.
     var readOnlyReason: String? {
@@ -904,39 +906,49 @@ final class AppModel {
 
     /// Opens the table a foreign key points to (same connection and database as `tab`).
     func openReferencedTable(_ foreignKey: ForeignKeyInfo, from tab: TableTab) {
-        if tab.connection.driverKey != selectedTarget?.driverKey {
-            select(tab.connection.id, database: tab.connection.database)
-        }
-        let id = TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable).id
-        openTable(table(withID: id) ?? TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable), pinned: true)
+        openRelated(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable, from: tab)
+    }
+
+    /// Opens a table that has a foreign key to `tab`'s table, unfiltered.
+    func openReferencingTable(_ key: ReferencingKey, from tab: TableTab) {
+        openRelated(schema: key.schema, name: key.table, from: tab)
     }
 
     /// Opens the row a foreign key cell points at: the referenced table, filtered to the rows whose
     /// referenced columns hold `values` (the cell's row's values for the key's columns, in order).
     func openReferencedRow(_ foreignKey: ForeignKeyInfo, values: [DBValue], from tab: TableTab) {
-        if tab.connection.driverKey != selectedTarget?.driverKey {
-            select(tab.connection.id, database: tab.connection.database)
-        }
-        let fallback = TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable)
-        let target = table(withID: fallback.id) ?? fallback
+        let target = TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable)
         Task {
             var columns = foreignKey.referencedColumns
             if columns.isEmpty {
                 // SQLite references the parent's primary key implicitly.
-                do {
-                    columns = try await driver(for: tab.connection).describeTable(target).primaryKey
-                } catch {
-                    columns = []
-                }
-                guard !columns.isEmpty else {
-                    openTable(target, pinned: true)
-                    return
-                }
+                columns = (try? await driver(for: tab.connection).describeTable(target).primaryKey) ?? []
+                guard !columns.isEmpty else { return openRelated(schema: target.schema, name: target.name, from: tab) }
             }
-            let filter = RowQuery.matching(columns: columns, values: values, kind: tab.connection.kind)
-            let label = zip(columns, values).map { "\($0) = \($1.displayString)" }.joined(separator: ", ")
-            openTable(target, pinned: true, filter: filter, filterLabel: label)
+            openRelated(schema: target.schema, name: target.name, from: tab, matching: columns, values: values)
         }
+    }
+
+    /// Opens the rows of another table that point at a row of `tab` through `key`. `values` are the
+    /// row's values for the columns the key references, in key order.
+    func openReferencingRows(_ key: ReferencingKey, values: [DBValue], from tab: TableTab) {
+        openRelated(schema: key.schema, name: key.table, from: tab, matching: key.columns, values: values)
+    }
+
+    /// Opens `schema.name` from `tab`'s connection and database (switching the tables column to it),
+    /// filtered to the rows whose `columns` hold `values` when given.
+    private func openRelated(
+        schema: String, name: String, from tab: TableTab, matching columns: [String] = [], values: [DBValue] = []
+    ) {
+        if tab.connection.driverKey != selectedTarget?.driverKey {
+            select(tab.connection.id, database: tab.connection.database)
+        }
+        let fallback = TableInfo(schema: schema, name: name)
+        let target = table(withID: fallback.id) ?? fallback
+        guard !columns.isEmpty else { return openTable(target, pinned: true) }
+        let filter = RowQuery.matching(columns: columns, values: values, kind: tab.connection.kind)
+        let label = zip(columns, values).map { "\($0) = \($1.displayString)" }.joined(separator: ", ")
+        openTable(target, pinned: true, filter: filter, filterLabel: label)
     }
 
     /// Shows every row again in a tab opened on a single referenced row.

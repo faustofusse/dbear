@@ -541,4 +541,15 @@ fn follows_a_foreign_key_to_its_row() {
     let email = column(&row, "email")[0].clone();
     let by_email = block_on(dev().fetch_rows_with(users, filtered(&dialect.match_filter(&["email".into()], &[email])), 10, 0)).unwrap();
     assert_eq!(column(&by_email, "id"), [&user_id]);
+
+    // And back: the tables pointing at users, then that user's orders.
+    let structure = block_on(dev().describe_table(TableInfo::new("public", "users"))).unwrap();
+    let incoming: Vec<(&str, &str)> = structure.referenced_by.iter().map(|k| (k.schema.as_str(), k.table.as_str())).collect();
+    assert_eq!(incoming, [("billing", "subscriptions"), ("public", "orders"), ("public", "sessions")]);
+    let key = structure.referenced_by.iter().find(|k| k.table == "orders").unwrap();
+    assert_eq!((key.columns.as_slice(), key.referenced_columns.as_slice()), (&["user_id".to_string()][..], &["id".to_string()][..]));
+    let filter = dialect.match_filter(&key.columns, std::slice::from_ref(&user_id));
+    let their_orders = block_on(dev().fetch_rows_with(TableInfo::new("public", "orders"), filtered(&filter), 1000, 0)).unwrap();
+    assert!(!their_orders.rows.is_empty());
+    assert!(column(&their_orders, "user_id").iter().all(|v| **v == user_id));
 }

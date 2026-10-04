@@ -152,8 +152,9 @@ pub(crate) fn keyset_for(meta: &TableMeta, table: &TableInfo, query: &RowQuery) 
     Keyset::new(SQLITE, table, query, &columns, tiebreak, enabled)
 }
 
-/// Indexes (with their columns and SQL), foreign keys and the DDL, after [`table_meta_statements`].
-pub(crate) fn structure_statements(table: &TableInfo) -> [Stmt; 3] {
+/// Indexes (with their columns and SQL), foreign keys, the DDL and the keys pointing at the
+/// table, after [`table_meta_statements`].
+pub(crate) fn structure_statements(table: &TableInfo) -> [Stmt; 4] {
     let schema = SQLITE.quote_ident(&table.schema);
     let args: &[&str] = &[&table.name, &table.schema];
     [
@@ -178,13 +179,15 @@ pub(crate) fn structure_statements(table: &TableInfo) -> [Stmt; 3] {
             ),
             &[&table.name],
         ),
+        Stmt::with_args(crate::sqlite::referenced_by_query(&table.schema), args),
     ]
 }
 
-/// Builds the structure. Indexes, foreign keys and DDL are optional: a server that doesn't support
-/// one of those pragmas (`None`) still gets the columns.
+/// Builds the structure. Indexes, foreign keys, DDL and incoming keys are optional: a server that
+/// doesn't support one of those pragmas (`None`) still gets the columns.
 pub(crate) fn structure(
     table: &TableInfo, meta: TableMeta, indexes: Option<StmtResult>, foreign_keys: Option<StmtResult>, ddl: Option<StmtResult>,
+    referenced_by: Option<StmtResult>,
 ) -> TableStructure {
     let columns = meta
         .columns
@@ -245,11 +248,17 @@ pub(crate) fn structure(
     let ddl = (!statements.is_empty())
         .then(|| statements.iter().map(|s| format!("{};", s.trim_end_matches(';'))).collect::<Vec<_>>().join("\n\n"));
 
+    let incoming = referenced_by.map(|r| r.rows).unwrap_or_default().into_iter().map(|row| {
+        let text = |i: usize| row.get(i).and_then(HValue::as_text);
+        (text(0).unwrap_or_default(), row.get(1).and_then(HValue::as_i64).unwrap_or(0), text(2).unwrap_or_default(), text(3))
+    });
+
     TableStructure {
         columns,
         primary_key: meta.primary_key,
         indexes: index_list,
         foreign_keys: fks.into_iter().map(|(_, fk)| fk).collect(),
+        referenced_by: crate::sqlite::group_referenced_by(&table.schema, incoming.collect::<Vec<_>>()),
         ddl,
     }
 }
