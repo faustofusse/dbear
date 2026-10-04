@@ -402,6 +402,13 @@ pub fn is_binary_column(column: ColumnInfo) -> bool {
     dbcore::edit::is_binary(&column.into())
 }
 
+/// A `WHERE` filter for the rows whose `columns` hold `values` (e.g. the row a foreign key points at).
+#[uniffi::export]
+pub fn match_filter(kind: DatabaseKind, columns: Vec<String>, values: Vec<Value>) -> String {
+    let values: Vec<dbcore::Value> = values.into_iter().map(Into::into).collect();
+    dbcore::dialect::Dialect(kind.into()).match_filter(&columns, &values)
+}
+
 #[uniffi::export]
 pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").into()

@@ -91,6 +91,10 @@ final class TableTab: Identifiable {
 
     /// Server-side sort, cycled by clicking column headers.
     var sort: [SortKey] = []
+    /// Only the rows matching this `WHERE` condition, e.g. the row a foreign key points at.
+    var filter: String?
+    /// `filter` for people (`id = 42`), shown in the tab title and the filter bar.
+    var filterLabel: String?
 
     /// Unsaved cell edits, new and deleted rows.
     var edits = PendingEdits()
@@ -106,7 +110,10 @@ final class TableTab: Identifiable {
     var saveError: String?
     var nextInsertedID = -1
 
-    var query: RowQuery { RowQuery(sort: sort) }
+    var query: RowQuery { RowQuery(sort: sort, filter: filter) }
+
+    /// Known once the structure has loaded (fetched in the background when the rows load).
+    var foreignKeys: [ForeignKeyInfo] { structure.value?.foreignKeys ?? [] }
 
     /// Why the rows can't be edited, or `nil` if they can.
     var readOnlyReason: String? {
@@ -118,10 +125,12 @@ final class TableTab: Identifiable {
         return nil
     }
     var canLoadMore: Bool { data.value != nil && !reachedEnd && !isLoadingMore && loadMoreError == nil && !isReloading }
-    init(connection: ConnectionConfig, table: TableInfo, isPreview: Bool) {
+    init(connection: ConnectionConfig, table: TableInfo, isPreview: Bool, filter: String? = nil, filterLabel: String? = nil) {
         self.connection = connection
         self.table = table
         self.isPreview = isPreview
+        self.filter = filter
+        self.filterLabel = filterLabel
     }
 }
 
@@ -193,13 +202,14 @@ enum WorkspaceTab: Identifiable {
 
     @MainActor var title: String {
         switch self {
-        case .table(let t): t.table.name
+        case .table(let t): t.filterLabel.map { "\(t.table.name) \u{B7} \($0)" } ?? t.table.name
         case .script(let s): s.title
         }
     }
 
     @MainActor var systemImage: String {
         switch self {
+        case .table(let t) where t.filter != nil: "line.3.horizontal.decrease"
         case .table(let t): t.table.kind == .view ? "eye" : "tablecells"
         case .script: "chevron.left.forwardslash.chevron.right"
         }
@@ -708,20 +718,22 @@ final class AppModel {
         }
     }
 
-    /// Opens a table from the selected connection. Reuses an existing tab for the same table,
-    /// otherwise replaces the current preview tab (unless `pinned`).
-    func openTable(_ table: TableInfo, pinned: Bool) {
+    /// Opens a table from the selected connection. Reuses an existing tab for the same table (and
+    /// `filter`), otherwise replaces the current preview tab (unless `pinned`).
+    func openTable(_ table: TableInfo, pinned: Bool, filter: String? = nil, filterLabel: String? = nil) {
         guard let connection = selectedTarget else { return }
 
         if let existing = tabs.first(where: {
-            if case .table(let t) = $0 { t.connection.driverKey == connection.driverKey && t.table.id == table.id } else { false }
+            if case .table(let t) = $0 {
+                t.connection.driverKey == connection.driverKey && t.table.id == table.id && t.filter == filter
+            } else { false }
         }) {
             if pinned, case .table(let t) = existing { t.isPreview = false }
             activeTabID = existing.id
             return
         }
 
-        let tab = TableTab(connection: connection, table: table, isPreview: !pinned)
+        let tab = TableTab(connection: connection, table: table, isPreview: !pinned, filter: filter, filterLabel: filterLabel)
         if !pinned, let previewIndex = tabs.firstIndex(where: \.isPreview) {
             tabs[previewIndex] = .table(tab)
         } else {
@@ -819,6 +831,10 @@ final class AppModel {
         tab.reachedEnd = false
         tab.nextPage = nil
         defer { if generation == tab.generation { tab.isReloading = false } }
+        // Foreign keys make cells links to the rows they point at; views have none.
+        if tab.table.kind == .table, case .idle = tab.structure {
+            Task { await loadStructure(tab) }
+        }
         do {
             let page = try await driver(for: tab.connection).fetchPage(
                 of: tab.table, query: tab.query, limit: pageSize, after: nil, firstRowID: 0)
@@ -893,6 +909,42 @@ final class AppModel {
         }
         let id = TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable).id
         openTable(table(withID: id) ?? TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable), pinned: true)
+    }
+
+    /// Opens the row a foreign key cell points at: the referenced table, filtered to the rows whose
+    /// referenced columns hold `values` (the cell's row's values for the key's columns, in order).
+    func openReferencedRow(_ foreignKey: ForeignKeyInfo, values: [DBValue], from tab: TableTab) {
+        if tab.connection.driverKey != selectedTarget?.driverKey {
+            select(tab.connection.id, database: tab.connection.database)
+        }
+        let fallback = TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable)
+        let target = table(withID: fallback.id) ?? fallback
+        Task {
+            var columns = foreignKey.referencedColumns
+            if columns.isEmpty {
+                // SQLite references the parent's primary key implicitly.
+                do {
+                    columns = try await driver(for: tab.connection).describeTable(target).primaryKey
+                } catch {
+                    columns = []
+                }
+                guard !columns.isEmpty else {
+                    openTable(target, pinned: true)
+                    return
+                }
+            }
+            let filter = RowQuery.matching(columns: columns, values: values, kind: tab.connection.kind)
+            let label = zip(columns, values).map { "\($0) = \($1.displayString)" }.joined(separator: ", ")
+            openTable(target, pinned: true, filter: filter, filterLabel: label)
+        }
+    }
+
+    /// Shows every row again in a tab opened on a single referenced row.
+    func clearFilter(_ tab: TableTab) {
+        guard tab.filter != nil, confirmDiscardingEdits(in: tab) else { return }
+        tab.filter = nil
+        tab.filterLabel = nil
+        Task { await load(tab) }
     }
 
     // MARK: Editing rows

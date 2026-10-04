@@ -295,7 +295,7 @@ private struct TabItem: View {
 
     private var tooltip: String {
         switch tab {
-        case .table(let t): t.table.id
+        case .table(let t): t.filterLabel.map { "\(t.table.id) where \($0)" } ?? t.table.id
         case .script(let s): s.title
         }
     }

@@ -252,6 +252,14 @@ extension ColumnInfo {
     public var isBinary: Bool { DBCoreFFI.isBinaryColumn(column: DBCoreFFI.ColumnInfo(self)) }
 }
 
+extension RowQuery {
+    /// A `WHERE` filter for the rows whose `columns` hold `values`, spelled for `kind` (by the core),
+    /// e.g. `"id" = 42` for the row a foreign key points at.
+    public static func matching(columns: [String], values: [DBValue], kind: DatabaseKind) -> String {
+        DBCoreFFI.matchFilter(kind: DBCoreFFI.DatabaseKind(kind), columns: columns, values: values.map(DBCoreFFI.Value.init))
+    }
+}
+
 extension DBCoreFFI.Value {
     init(_ v: DBValue) {
         switch v {

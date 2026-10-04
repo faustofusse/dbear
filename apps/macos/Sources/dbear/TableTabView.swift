@@ -44,8 +44,16 @@ struct TableTabView: View {
                 ),
                 sorting: GridSorting(keys: tab.sort) { model.toggleSort(tab, column: $0) },
                 editing: tab.readOnlyReason == nil ? editing : nil,
+                foreignKeys: GridForeignKeys(keys: tab.foreignKeys) { fk, values in
+                    model.openReferencedRow(fk, values: values, from: tab)
+                },
                 isReloading: tab.isReloading
             )
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if let label = tab.filterLabel {
+                    FilterBar(label: label) { model.clearFilter(tab) }
+                }
+            }
         }
     }
 
@@ -60,6 +68,34 @@ struct TableTabView: View {
             selectionChanged: { tab.selectedRowIDs = $0 },
             requestHandled: { tab.editRequest = nil }
         )
+    }
+}
+
+/// Above a tab opened on a referenced row: what it's filtered by, and a way back to every row.
+private struct FilterBar: View {
+    let label: String
+    let showAll: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "line.3.horizontal.decrease")
+            Text("Where")
+            Text(label)
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Spacer(minLength: 8)
+            Button("Show All Rows", action: showAll)
+                .buttonStyle(.link)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 

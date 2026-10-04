@@ -32,6 +32,13 @@ struct GridEditing {
     var requestHandled: () -> Void
 }
 
+/// Foreign keys of a table's grid: hovering a key cell shows an arrow that calls `open` with the
+/// key and the row's values for its columns (in key order).
+struct GridForeignKeys {
+    var keys: [ForeignKeyInfo]
+    var open: (ForeignKeyInfo, [DBValue]) -> Void
+}
+
 /// Result grid used by table tabs (editable when given `editing`) and script results.
 ///
 /// Backed by a plain `NSTableView` rather than SwiftUI's `Table`: cells are reused text fields,
@@ -45,11 +52,12 @@ struct DataGrid: View {
     var paging: GridPaging? = nil
     var sorting: GridSorting? = nil
     var editing: GridEditing? = nil
+    var foreignKeys: GridForeignKeys? = nil
     /// New rows are loading (re-sort, refresh) while these stay on screen.
     var isReloading = false
 
     var body: some View {
-        GridTable(result: result, version: version, paging: paging, sorting: sorting, editing: editing)
+        GridTable(result: result, version: version, paging: paging, sorting: sorting, editing: editing, foreignKeys: foreignKeys)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 StatusBar(
                     loaded: result.rows.count, total: result.totalCount, truncated: result.truncated,
@@ -68,6 +76,7 @@ private struct GridTable: NSViewRepresentable {
     let paging: GridPaging?
     let sorting: GridSorting?
     let editing: GridEditing?
+    let foreignKeys: GridForeignKeys?
 
     func makeCoordinator() -> GridData { GridData() }
 
@@ -104,7 +113,8 @@ private struct GridTable: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.update(
-            result: result, version: version, paging: paging, sorting: sorting, editing: editing)
+            result: result, version: version, paging: paging, sorting: sorting, editing: editing,
+            foreignKeys: foreignKeys)
     }
 
     static func dismantleNSView(_ scroll: NSScrollView, coordinator: GridData) {
@@ -131,6 +141,17 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     private var sorting: GridSorting?
     private var observer: NSObjectProtocol?
     private var loadRequested = false
+    private var foreignKeys: GridForeignKeys?
+    /// Model column index to the foreign key it belongs to (the narrowest one, if several).
+    private var keyByColumn: [Int: ForeignKeyInfo] = [:]
+    /// The foreign key cell under the mouse (row index, model column), showing `linkButton`.
+    private var hoveredLink: (row: Int, column: Int)?
+    private lazy var linkButton: LinkButton = {
+        let button = LinkButton()
+        button.target = self
+        button.action = #selector(openHoveredLink)
+        return button
+    }()
 
     /// Start fetching the next page this many rows before the end: about a page ahead,
     /// so fast scrolling doesn't run into the end and wait.
@@ -143,13 +164,17 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         table.target = self
         table.action = #selector(clicked)
         table.doubleAction = #selector(doubleClicked)
+        table.onHover = { [weak self] point in self?.hover(at: point) }
         let menu = NSMenu()
         menu.delegate = self
         table.menu = menu
         observer = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.prefetchIfNeeded() }
+            MainActor.assumeIsolated {
+                self?.prefetchIfNeeded()
+                self?.hoverUnderMouse()
+            }
         }
     }
 
@@ -158,11 +183,20 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     }
 
     func update(
-        result: QueryResult, version: Int, paging: GridPaging?, sorting: GridSorting?, editing: GridEditing?
+        result: QueryResult, version: Int, paging: GridPaging?, sorting: GridSorting?, editing: GridEditing?,
+        foreignKeys: GridForeignKeys?
     ) {
         self.paging = paging
         self.sorting = sorting
         self.editing = editing
+        let keysChanged = foreignKeys?.keys != self.foreignKeys?.keys
+        self.foreignKeys = foreignKeys
+        defer {
+            if keysChanged || hoveredLink != nil {
+                // After the rows below are settled: the hovered cell may be gone or no longer a link.
+                DispatchQueue.main.async { [weak self] in self?.hoverUnderMouse() }
+            }
+        }
         let newEdits = editing?.edits ?? PendingEdits()
         let editsChanged = newEdits != edits
         edits = newEdits
@@ -191,6 +225,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
                 columns = result.columns
                 rebuildColumns(table)
             }
+            hideLink()
             rebuildRows()
             table.reloadData()
             table.scrollRowToVisible(0)
@@ -207,6 +242,9 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
             }
         } else if editsChanged {
             reload(table, keeping: selectedIDs())
+        }
+        if keysChanged {
+            indexForeignKeys(table)
         }
         // Tall windows can show the whole first page; ask for more on the next run loop turn
         // (not during SwiftUI's view update).
@@ -261,18 +299,125 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         sorting.toggle(columns[index].name)
     }
 
+    // MARK: Foreign key links
+
+    /// Maps columns to their foreign keys (single-column keys win over composite ones) and notes
+    /// the reference in the header tooltips.
+    private func indexForeignKeys(_ table: NSTableView) {
+        keyByColumn = [:]
+        let keys = (foreignKeys?.keys ?? []).sorted { $0.columns.count < $1.columns.count }
+        for key in keys {
+            for name in key.columns {
+                guard let index = columns.firstIndex(where: { $0.name == name }), keyByColumn[index] == nil else { continue }
+                keyByColumn[index] = key
+            }
+        }
+        for column in table.tableColumns {
+            guard let index = Int(column.identifier.rawValue), columns.indices.contains(index) else { continue }
+            column.headerToolTip = headerToolTip(for: index)
+        }
+    }
+
+    private func headerToolTip(for index: Int) -> String {
+        let info = columns[index]
+        var lines = [info.typeName.isEmpty ? info.name : "\(info.name) \u{B7} \(info.typeName)"]
+        if let key = keyByColumn[index] {
+            lines.append("References \(Self.reference(key))")
+        }
+        if sorting != nil { lines.append("Click to sort") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// `public.users(id)`.
+    private static func reference(_ key: ForeignKeyInfo) -> String {
+        let table = key.referencedSchema.isEmpty ? key.referencedTable : "\(key.referencedSchema).\(key.referencedTable)"
+        return key.referencedColumns.isEmpty ? table : "\(table)(\(key.referencedColumns.joined(separator: ", ")))"
+    }
+
+    /// The foreign key a cell links through and the row's values for the key's columns, or `nil`
+    /// when it isn't a link: not a key column, a NULL in the key, a new or deleted row, or an unsaved edit.
+    private func link(row: Int, column: Int) -> (key: ForeignKeyInfo, values: [DBValue])? {
+        guard foreignKeys != nil, let key = keyByColumn[column], rows.indices.contains(row) else { return nil }
+        let id = rows[row].id
+        guard id >= 0, !edits.deleted.contains(id) else { return nil }
+        var values: [DBValue] = []
+        for name in key.columns {
+            guard let index = columns.firstIndex(where: { $0.name == name }), !columns[index].isBinary,
+                  edits.value(row: id, column: index) == nil,
+                  let value = rows[row].values[safe: index], !value.isNull
+            else { return nil }
+            values.append(value)
+        }
+        return (key, values)
+    }
+
+    /// `point` is in the table's coordinates; `nil` when the mouse left it.
+    private func hover(at point: NSPoint?) {
+        guard let table, let point, editor == nil else { return hideLink() }
+        let row = table.row(at: point)
+        let tableColumn = table.column(at: point)
+        guard row >= 0, let column = modelColumn(atTableColumn: tableColumn), link(row: row, column: column) != nil else {
+            return hideLink()
+        }
+        if let hovered = hoveredLink, hovered == (row, column), linkButton.superview != nil { return }
+        hideLink()
+        hoveredLink = (row, column)
+        let cellFrame = table.frameOfCell(atColumn: tableColumn, row: row)
+        let size = LinkButton.size
+        linkButton.frame = NSRect(
+            x: cellFrame.maxX - size, y: cellFrame.midY - size / 2, width: size, height: size
+        ).integral
+        let emphasized = table.selectedRowIndexes.contains(row) && table.window?.firstResponder === table
+        linkButton.contentTintColor = emphasized ? .alternateSelectedControlTextColor : .secondaryLabelColor
+        if let key = keyByColumn[column] { linkButton.toolTip = "Open in \(Self.reference(key))" }
+        table.addSubview(linkButton)
+        cell(row: row, column: tableColumn)?.trailingInset = size + 4
+    }
+
+    /// Re-checks what's under the mouse (after scrolling or a reload, which move cells under it).
+    private func hoverUnderMouse() {
+        guard let table, let window = table.window else { return hideLink() }
+        let point = table.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        hover(at: table.visibleRect.contains(point) ? point : nil)
+    }
+
+    private func hideLink() {
+        if let hovered = hoveredLink, let table {
+            let tableColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier(String(hovered.column)))
+            if tableColumn >= 0 { cell(row: hovered.row, column: tableColumn)?.trailingInset = 0 }
+        }
+        hoveredLink = nil
+        linkButton.removeFromSuperview()
+    }
+
+    private func cell(row: Int, column tableColumn: Int) -> GridCell? {
+        guard let table, row < table.numberOfRows, tableColumn >= 0, tableColumn < table.numberOfColumns else { return nil }
+        return table.view(atColumn: tableColumn, row: row, makeIfNecessary: false) as? GridCell
+    }
+
+    @objc private func openHoveredLink() {
+        guard let hovered = hoveredLink else { return }
+        openLink(row: hovered.row, column: hovered.column)
+    }
+
+    private func openLink(row: Int, column: Int) {
+        guard let foreignKeys, let (key, values) = link(row: row, column: column) else { return }
+        foreignKeys.open(key, values)
+    }
+
     private func rebuildColumns(_ table: NSTableView) {
+        hideLink()
         table.tableColumns.forEach(table.removeTableColumn)
         for (index, info) in columns.enumerated() {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(String(index)))
             column.title = info.name
-            let type = info.typeName.isEmpty ? info.name : "\(info.name) · \(info.typeName)"
-            column.headerToolTip = sorting == nil ? type : "\(type)\nClick to sort"
             column.minWidth = 40
             column.width = Self.idealWidth(for: info)
             column.headerCell.alignment = info.isNumeric ? .right : .left
             table.addTableColumn(column)
         }
+        // Column indexes changed: re-map the foreign keys (this also sets the header tooltips).
+        indexForeignKeys(table)
     }
 
     private static func idealWidth(for column: ColumnInfo) -> CGFloat {
@@ -311,6 +456,8 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
             return c
         }()
         let id = rows[row].id
+        let isHovered = hoveredLink.map { $0 == (row, index) } ?? false
+        cell.trailingInset = isHovered ? LinkButton.size + 4 : 0
         if edits.deleted.contains(id) {
             cell.show(rows[row].values[safe: index] ?? .null, mark: .deleted)
         } else if let edit = edits.value(row: id, column: index) {
@@ -373,6 +520,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         guard let table, isEditable(column: column), !edits.deleted.contains(id),
               let rowIndex = rows.firstIndex(where: { $0.id == id })
         else { return }
+        hideLink()
         let tableColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier(String(column)))
         guard tableColumn >= 0 else { return }
         finishEditing(commit: true)
@@ -477,6 +625,13 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
             }
             menu.addItem(.separator())
         }
+        if let column, link(row: table.clickedRow, column: column) != nil, let key = keyByColumn[column] {
+            let clickedRow = table.clickedRow
+            menu.addItem(ClosureMenuItem("Open \(key.referencedTable) Row") { [weak self] in
+                self?.openLink(row: clickedRow, column: column)
+            })
+            menu.addItem(.separator())
+        }
         if let column {
             let value = edits.value(row: row.id, column: column).map { edit -> String in
                 switch edit {
@@ -535,6 +690,29 @@ private final class GridRowView: NSTableRowView {
 final class GridTableView: NSTableView {
     var onReturn: (() -> Void)?
     var onDelete: (() -> Void)?
+    /// Mouse position in the table's coordinates (`nil` when it leaves), for the foreign key links.
+    var onHover: ((NSPoint?) -> Void)?
+    private var hoverArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(
+            rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        onHover?(convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onHover?(nil)
+    }
 
     override func keyDown(with event: NSEvent) {
         let plain = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
@@ -618,6 +796,27 @@ private final class CellEditorCell: NSTextFieldCell {
     }
 }
 
+/// The arrow at the end of a hovered foreign key cell: opens the row it points at.
+private final class LinkButton: NSButton {
+    static let size: CGFloat = 16
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        isBordered = false
+        imagePosition = .imageOnly
+        image = NSImage(systemSymbolName: "arrow.right.circle.fill", accessibilityDescription: "Open referenced row")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        setButtonType(.momentaryChange)
+        refusesFirstResponder = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
 /// Menu item that runs a closure.
 private final class ClosureMenuItem: NSMenuItem {
     private let handler: () -> Void
@@ -638,6 +837,10 @@ private final class GridCell: NSTableCellView {
     private var text = ""
     private var style = Style.text
     private var mark: EditMark?
+    /// Room kept free at the trailing edge (for the foreign key arrow while hovered).
+    var trailingInset: CGFloat = 0 {
+        didSet { if trailingInset != oldValue { needsDisplay = true } }
+    }
 
     enum Style { case text, number, null, dimmed }
 
@@ -712,7 +915,7 @@ private final class GridCell: NSTableCellView {
         }
         let font = style == .null ? Self.nullFont : Self.font
         let lineHeight = ceil(font.ascender - font.descender + font.leading)
-        let rect = NSRect(x: 0, y: ((bounds.height - lineHeight) / 2).rounded(), width: bounds.width, height: lineHeight)
+        let rect = NSRect(x: 0, y: ((bounds.height - lineHeight) / 2).rounded(), width: max(0, bounds.width - trailingInset), height: lineHeight)
         var attributes: [NSAttributedString.Key: Any] = [
             .font: font, .foregroundColor: mark == .deleted && !selected ? NSColor.secondaryLabelColor : color,
             .paragraphStyle: style == .number ? Self.right : Self.left,
@@ -783,7 +986,7 @@ private struct StatusBar: View {
         if let total, hasMore || total > loaded {
             return "\(loaded.formatted()) of \(max(total, loaded).formatted()) rows"
         }
-        return hasMore ? "\(loaded.formatted())+ rows" : "\(loaded.formatted()) rows"
+        return hasMore ? "\(loaded.formatted())+ rows" : loaded == 1 ? "1 row" : "\(loaded.formatted()) rows"
     }
 }
 

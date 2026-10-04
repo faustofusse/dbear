@@ -515,3 +515,30 @@ fn saves_row_edits_in_one_transaction() {
     assert!(matches!(&err, Error::Query(m) if m.contains("\"id\" = 1") && m.contains("integer")), "{err:?}");
     block_on(conn.execute("drop table public.dbear_edit_test".into())).unwrap();
 }
+
+#[test]
+fn follows_a_foreign_key_to_its_row() {
+    if !enabled() {
+        return;
+    }
+    let orders = TableInfo::new("public", "orders");
+    let fk = block_on(dev().describe_table(orders.clone()))
+        .unwrap()
+        .foreign_keys
+        .into_iter()
+        .find(|fk| fk.columns == ["user_id"])
+        .expect("orders.user_id references users");
+    assert_eq!((fk.referenced_table.as_str(), fk.referenced_columns.as_slice()), ("users", ["id".to_string()].as_slice()));
+
+    let first = block_on(dev().fetch_rows(orders, 1, 0)).unwrap();
+    let user_id = column(&first, "user_id")[0].clone();
+    let dialect = dbcore::dialect::Dialect(dbcore::DatabaseKind::Postgres);
+    let users = TableInfo::new(&fk.referenced_schema, &fk.referenced_table);
+    let row = block_on(dev().fetch_rows_with(users.clone(), filtered(&dialect.match_filter(&fk.referenced_columns, std::slice::from_ref(&user_id))), 10, 0)).unwrap();
+    assert_eq!(column(&row, "id"), [&user_id]);
+
+    // Text values are cast by the database (here to text; uuid/date keys work the same way).
+    let email = column(&row, "email")[0].clone();
+    let by_email = block_on(dev().fetch_rows_with(users, filtered(&dialect.match_filter(&["email".into()], &[email])), 10, 0)).unwrap();
+    assert_eq!(column(&by_email, "id"), [&user_id]);
+}

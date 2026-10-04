@@ -2,7 +2,7 @@
 //! (sorting, filters, editing…), so those are written once for every backend.
 
 use crate::driver::{Error, Result};
-use crate::model::{ColumnInfo, DatabaseKind, SortKey};
+use crate::model::{ColumnInfo, DatabaseKind, SortKey, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dialect(pub DatabaseKind);
@@ -48,6 +48,38 @@ impl Dialect {
         format!("select * from {relation}{}{order} limit {limit} offset {offset}", where_clause(filter))
     }
 
+    /// `"a" = 1 and "b" = 'x'`: the rows whose `columns` hold `values`, e.g. the row a foreign key
+    /// points at. Numbers go in bare; text goes in as a string literal the database casts to the
+    /// column's type (uuid, date…). Pairs past the shorter of the two lists are ignored.
+    pub fn match_filter(self, columns: &[String], values: &[Value]) -> String {
+        let terms: Vec<String> = columns
+            .iter()
+            .zip(values)
+            .map(|(column, value)| {
+                let ident = self.quote_ident(column);
+                match value {
+                    Value::Null => format!("{ident} is null"),
+                    value => format!("{ident} = {}", self.literal(value)),
+                }
+            })
+            .collect();
+        terms.join(" and ")
+    }
+
+    /// A value as a SQL literal (not `NULL`, which needs `is null` in a comparison).
+    fn literal(self, value: &Value) -> String {
+        match value {
+            Value::Null => "null".into(),
+            Value::Bool(b) if self.0 == DatabaseKind::Postgres => b.to_string(),
+            Value::Bool(b) => (if *b { "1" } else { "0" }).into(),
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) if f.is_finite() => f.to_string(),
+            Value::Decimal(d) if is_plain_number(d) => d.clone(),
+            Value::Float(_) | Value::Decimal(_) => self.quote_literal(&value.display()),
+            Value::Text(t) => self.quote_literal(t),
+        }
+    }
+
     /// `select count(*) from rel [where (…)]`.
     pub fn count_query(self, relation: &str, filter: Option<&str>) -> String {
         format!("select count(*) from {relation}{}", where_clause(filter))
@@ -73,6 +105,11 @@ impl Dialect {
         terms.extend(tiebreak.iter().filter(|t| !used.contains(t)).cloned());
         Ok(terms)
     }
+}
+
+/// `-12.50`, `1e5`: safe to put in SQL without quotes.
+fn is_plain_number(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_digit()) && s.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
 }
 
 /// The filter goes on its own lines so a trailing `-- comment` can't swallow the closing paren.
@@ -201,6 +238,26 @@ mod tests {
         assert_eq!(my.quote_relation("shop", "we`ird"), "`shop`.`we``ird`");
         assert_eq!(my.quote_literal(r"it's a\b"), r"'it''s a\\b'");
         assert_eq!(pg.quote_literal(r"it's a\b"), r"'it''s a\b'");
+    }
+
+    #[test]
+    fn match_filter_per_dialect() {
+        let cols = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pg = Dialect(DatabaseKind::Postgres);
+        assert_eq!(pg.match_filter(&cols(&["id"]), &[Value::Int(42)]), r#""id" = 42"#);
+        assert_eq!(
+            pg.match_filter(&cols(&["org", "code"]), &[Value::Text("o'k".into()), Value::Bool(true)]),
+            r#""org" = 'o''k' and "code" = true"#
+        );
+        assert_eq!(pg.match_filter(&cols(&["a"]), &[Value::Null]), r#""a" is null"#);
+        assert_eq!(pg.match_filter(&cols(&["a"]), &[Value::Decimal("-1.50".into())]), r#""a" = -1.50"#);
+        assert_eq!(pg.match_filter(&cols(&["a"]), &[Value::Decimal("NaN".into())]), r#""a" = 'NaN'"#);
+        let my = Dialect(DatabaseKind::Mysql);
+        assert_eq!(my.match_filter(&cols(&["flag"]), &[Value::Bool(true)]), "`flag` = 1");
+        let ms = Dialect(DatabaseKind::SqlServer);
+        assert_eq!(ms.match_filter(&cols(&["id"]), &[Value::Text("a-b".into())]), "[id] = N'a-b'");
+        // The result is a valid single-condition filter.
+        assert!(normalize_filter(Some(&pg.match_filter(&cols(&["x"]), &[Value::Text("a;b".into())]))).is_ok());
     }
 
     #[test]
