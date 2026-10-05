@@ -76,7 +76,7 @@ extension AppModel {
     }
 }
 
-/// Right-hand inspector (⌥⌘I): the focused cell's full value. JSON is pretty-printed, long text
+/// Right-hand inspector (⌘I): the focused cell's full value. JSON is pretty-printed, long text
 /// wraps, and cells of editable tables can be edited here (staged like grid edits).
 struct ValueInspector: View {
     @Environment(AppModel.self) private var model

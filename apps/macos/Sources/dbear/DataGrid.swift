@@ -861,7 +861,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         menu.addItem(copyAsItem)
         if let focus, let column {
             menu.addItem(.separator())
-            menu.addItem(ClosureMenuItem("Inspect Value", key: ("i", [.command, .option])) { [weak self] in
+            menu.addItem(ClosureMenuItem("Inspect Value", key: ("i", [.command])) { [weak self] in
                 guard let self, let table = self.table else { return }
                 // Focus the clicked cell first, so that's the one inspected.
                 if !table.selectedRowIndexes.contains(clickedRow) {

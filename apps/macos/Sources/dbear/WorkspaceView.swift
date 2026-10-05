@@ -45,7 +45,7 @@ struct WorkspaceView: View {
                     } label: {
                         Label("Inspector", systemImage: "sidebar.trailing")
                     }
-                    .help(model.showsInspector ? "Hide Inspector (\u{2325}\u{2318}I)" : "Show Inspector (\u{2325}\u{2318}I)")
+                    .help(model.showsInspector ? "Hide Inspector (\u{2318}I)" : "Show Inspector (\u{2318}I)")
                 }
             }
     }

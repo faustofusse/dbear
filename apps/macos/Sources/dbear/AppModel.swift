@@ -1,6 +1,7 @@
 import AppKit
 import DBKit
 import Foundation
+import SwiftUI
 import Observation
 
 enum LoadState<Value> {
@@ -366,7 +367,9 @@ final class AppModel {
     var editorFontSize: CGFloat = AppModel.storedEditorFontSize {
         didSet { UserDefaults.standard.set(Double(editorFontSize), forKey: Self.editorFontSizeKey) }
     }
-    /// The value inspector on the right of the data pane (⌥⌘I). Remembered across launches.
+    /// The connections column of the split view (⌘B): `.all`, or `.doubleColumn` when hidden.
+    var sidebarVisibility: NavigationSplitViewVisibility = .all
+    /// The value inspector on the right of the data pane (⌘I). Remembered across launches.
     var showsInspector = UserDefaults.standard.bool(forKey: AppModel.showsInspectorKey) {
         didSet { UserDefaults.standard.set(showsInspector, forKey: Self.showsInspectorKey) }
     }

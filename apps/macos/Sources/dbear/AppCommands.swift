@@ -50,6 +50,13 @@ struct AppCommands: Commands {
             #endif
         }
 
+        CommandGroup(replacing: .sidebar) {
+            Button(model.sidebarVisibility == .all ? "Hide Connections" : "Show Connections") {
+                withAnimation { model.sidebarVisibility = model.sidebarVisibility == .all ? .doubleColumn : .all }
+            }
+            .keyboardShortcut("b", modifiers: .command)
+        }
+
         // View menu. Only the SQL editor zooms; the rest of the UI keeps the system size.
         CommandGroup(after: .toolbar) {
             Button("Data") { if let tab = model.activeTableTab { model.setMode(.data, of: tab) } }
@@ -59,7 +66,7 @@ struct AppCommands: Commands {
                 .keyboardShortcut("2", modifiers: [.command, .option])
                 .disabled(model.activeTableTab == nil)
             Button(model.showsInspector ? "Hide Inspector" : "Show Inspector") { model.showsInspector.toggle() }
-                .keyboardShortcut("i", modifiers: [.command, .option])
+                .keyboardShortcut("i", modifiers: .command)
             Divider()
 
             Button("Actual Size") { model.resetEditorZoom() }

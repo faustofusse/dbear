@@ -5,7 +5,7 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var model = model
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $model.sidebarVisibility) {
             ConnectionsSidebar()
                 .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
         } content: {
