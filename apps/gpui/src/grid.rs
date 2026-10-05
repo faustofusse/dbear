@@ -1,20 +1,54 @@
-//! The data grid: one page of rows from `dbcore`, shown with gpui-component's virtualized table.
+//! The data grid: a table's rows from `dbcore`, shown with gpui-component's virtualized table.
+//! The first page comes from the workspace; scrolling near the end loads the next one (keyset
+//! paging in the core, OFFSET where the table has no usable key).
 
-use dbcore::{ColumnInfo, Value};
+use std::sync::Arc;
+
+use dbcore::{ColumnInfo, Connection, PageCursor, RowPage, RowQuery, TableInfo, Value};
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::component::{ActiveTheme as _, h_flex};
 use gpui_kit::*;
+
+/// Rows per page, like the macOS app.
+pub const PAGE_SIZE: u32 = 500;
 
 #[derive(Default)]
 pub struct RowsDelegate {
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Vec<Value>>,
+    /// Table size when the driver knows it (first page only).
+    pub total: Option<u64>,
+    pub loading_more: bool,
+    pub load_more_error: Option<String>,
+    source: Option<(Arc<Connection>, TableInfo)>,
+    next: Option<PageCursor>,
+    /// Bumped whenever the rows are replaced, so a page for the previous table is dropped.
+    generation: u64,
+    load_more_task: Option<Task<()>>,
 }
 
 impl RowsDelegate {
-    pub fn set(&mut self, columns: Vec<ColumnInfo>, rows: Vec<Vec<Value>>) {
-        self.columns = columns;
-        self.rows = rows;
+    /// Empties the grid (no table, or a new one loading).
+    pub fn clear(&mut self) {
+        self.generation += 1;
+        self.columns.clear();
+        self.rows.clear();
+        self.total = None;
+        self.source = None;
+        self.next = None;
+        self.loading_more = false;
+        self.load_more_error = None;
+        self.load_more_task = None;
+    }
+
+    /// Shows the first page of `table`; later pages load on scroll.
+    pub fn show(&mut self, connection: Arc<Connection>, table: TableInfo, page: RowPage) {
+        self.clear();
+        self.columns = page.result.columns;
+        self.rows = page.result.rows;
+        self.total = page.result.total_count;
+        self.next = page.next;
+        self.source = Some((connection, table));
     }
 
     fn is_numeric(&self, col_ix: usize) -> bool {
@@ -40,6 +74,44 @@ fn width(column: &ColumnInfo) -> f32 {
 }
 
 impl TableDelegate for RowsDelegate {
+    fn has_more(&self, _: &App) -> bool {
+        self.next.is_some() && !self.loading_more && self.load_more_error.is_none()
+    }
+
+    fn load_more_threshold(&self) -> usize {
+        100
+    }
+
+    fn load_more(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) {
+        let (Some((connection, table)), Some(cursor)) = (self.source.clone(), self.next.clone()) else { return };
+        if self.loading_more {
+            return;
+        }
+        self.loading_more = true;
+        let generation = self.generation;
+        self.load_more_task = Some(cx.spawn(async move |state, cx| {
+            let result = connection.fetch_page(table, RowQuery::default(), PAGE_SIZE, Some(cursor)).await;
+            state
+                .update(cx, |state, cx| {
+                    let rows = state.delegate_mut();
+                    if rows.generation != generation {
+                        return;
+                    }
+                    rows.loading_more = false;
+                    match result {
+                        Ok(page) => {
+                            rows.rows.extend(page.result.rows);
+                            rows.next = page.next;
+                        }
+                        Err(e) => rows.load_more_error = Some(e.to_string()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        }));
+        cx.notify();
+    }
+
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len()
     }
