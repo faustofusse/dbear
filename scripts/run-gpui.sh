@@ -42,10 +42,23 @@ if [[ $SAMPLES == 1 ]]; then
 fi
 
 CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" cargo build -p dbear-gpui --profile "$PROFILE"
+BIN="$ROOT/target/$TARGET_DIR/dbear"
+
+# macOS remembers "Always Allow" for Keychain items by the program's code signature. Cargo's
+# ad-hoc signature changes on every build, so sign with a stable identity, like bundle-mac.sh.
+if [[ "$(uname)" == Darwin ]]; then
+    IDENTITY="${CODESIGN_IDENTITY:-$(security find-identity -p codesigning -v 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -1)}"
+    if [[ -n "$IDENTITY" ]]; then
+        codesign --force --sign "$IDENTITY" --identifier ar.fausto.dbear.gpui "$BIN" 2>/dev/null \
+            || echo "warning: couldn't sign with $IDENTITY; Keychain will ask again after each build" >&2
+    else
+        echo "warning: no Apple Development identity; Keychain will ask again after each build" >&2
+    fi
+fi
 
 export RUST_LOG="$LOG"
 if [[ -n "$STORE" ]]; then
     export DBEAR_CONNECTIONS_FILE="$STORE"
     echo "connections: $STORE"
 fi
-exec "$ROOT/target/$TARGET_DIR/dbear"
+exec "$BIN"
