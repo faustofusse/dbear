@@ -36,7 +36,7 @@ Without Nix (it only pins the toolchain):
 crates/dbcore/      Rust core: models, drivers (Postgres, MySQL, SQLite, SQL Server, libSQL, mock), connection store, SQL highlighting
 crates/dbcore-ffi/  UniFFI bindings for Swift
 apps/macos/         SwiftUI app
-apps/linux/         GPUI app (todo)
+apps/gpui/          GPUI app for Linux (also builds on macOS/Windows; todo)
 scripts/            build, bundle, dev database, tests, release
 vendor/             third-party crates patched for dbear (tiberius; see vendor/README.md)
 ```
@@ -46,6 +46,7 @@ vendor/             third-party crates patched for dbear (tiberius; see vendor/R
 ```sh
 cargo test -p dbcore              # core (Postgres tests skip without a database)
 ./scripts/test-postgres.sh        # core against the dev database
+./scripts/test-linux.sh [--windows] # core on Linux in an Apple container (running dev DBs forwarded); --windows also cross-checks x86_64-pc-windows-gnu
 ./scripts/test-libsql.sh          # core against the dev libSQL server (container dbear-libsql)
 ./scripts/test-sqlserver.sh       # core against the dev SQL Server (amd64 image under Rosetta, 4 GB)
 (cd apps/macos && swift test)     # Swift ⇄ Rust bridge

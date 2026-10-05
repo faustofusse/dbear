@@ -104,6 +104,7 @@ impl ConnectionStore {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             fs::create_dir_all(dir).map_err(|e| err(&e))?;
         }
+        #[cfg(unix)]
         let existed = path.exists();
         let db = rusqlite::Connection::open(&path).map_err(|e| err(&e))?;
         #[cfg(unix)]
