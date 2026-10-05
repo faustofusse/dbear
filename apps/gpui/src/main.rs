@@ -3,6 +3,8 @@
 
 mod connection_editor;
 mod grid;
+mod sql_highlight;
+mod tabs;
 mod workspace;
 
 use gpui_kit::component::Theme;
@@ -21,6 +23,8 @@ fn main() {
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+        workspace::bind_keys(cx);
+        tabs::bind_keys(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

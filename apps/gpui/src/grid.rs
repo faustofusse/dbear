@@ -41,6 +41,14 @@ impl RowsDelegate {
         self.load_more_task = None;
     }
 
+    /// Shows a script's result: all of it at once, no paging.
+    pub fn show_result(&mut self, result: dbcore::QueryResult) {
+        self.clear();
+        self.columns = result.columns;
+        self.rows = result.rows;
+        self.total = result.total_count;
+    }
+
     /// Shows the first page of `table`; later pages load on scroll.
     pub fn show(&mut self, connection: Arc<Connection>, table: TableInfo, page: RowPage) {
         self.clear();

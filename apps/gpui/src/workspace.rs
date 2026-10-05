@@ -1,24 +1,24 @@
-//! The main window: connections | schemas and tables | rows, like the macOS app.
+//! The main window: connections | schemas and tables | tabs (tables and SQL scripts), like the macOS app.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dbcore::secrets::{self, KeyringSecretStore};
-use dbcore::{Connection, ConnectionConfig, ConnectionStore, RowQuery, Schema, TableInfo, TableKind};
+use dbcore::{Connection, ConnectionConfig, ConnectionStore, Schema, TableInfo, TableKind};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::tab::{Tab as TabItem, TabBar};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::connection_editor::ConnectionEditor;
-use crate::grid::{PAGE_SIZE, RowsDelegate};
+use crate::tabs::{ScriptTab, TableTab, count, plural};
 
 enum Load<T> {
     Idle,
@@ -29,6 +29,42 @@ enum Load<T> {
 
 /// One connection per (connection id, database): Postgres can't switch databases on a session.
 type TargetKey = (String, String);
+
+actions!(dbear, [NewScript, CloseTab]);
+
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("secondary-t", NewScript, Some("Workspace")),
+        KeyBinding::new("secondary-w", CloseTab, Some("Workspace")),
+    ]);
+}
+
+enum TabView {
+    Table(Entity<TableTab>),
+    Script(Entity<ScriptTab>),
+}
+
+struct OpenTab {
+    /// The connection and database it uses.
+    key: TargetKey,
+    view: TabView,
+}
+
+impl OpenTab {
+    fn title(&self, cx: &App) -> String {
+        match &self.view {
+            TabView::Table(tab) => tab.read(cx).title(),
+            TabView::Script(tab) => tab.read(cx).name.clone(),
+        }
+    }
+
+    fn table(&self, cx: &App) -> Option<TableInfo> {
+        match &self.view {
+            TabView::Table(tab) => Some(tab.read(cx).table.clone()),
+            TabView::Script(_) => None,
+        }
+    }
+}
 
 pub struct Workspace {
     store: Option<ConnectionStore>,
@@ -48,14 +84,13 @@ pub struct Workspace {
     database: String,
     schemas: Load<Vec<Schema>>,
     collapsed: HashSet<String>,
-    table: Option<TableInfo>,
-    /// The first page's state; the rows themselves (and later pages) live in the grid's delegate.
-    rows: Load<()>,
-    grid: Entity<TableState<RowsDelegate>>,
+    tabs: Vec<OpenTab>,
+    active: usize,
+    /// Scripts opened so far, for their names ("SQL 1", "SQL 2"…).
+    scripts_made: usize,
+    focus: FocusHandle,
     // Dropping a task cancels it, so switching selection abandons the previous load.
     schemas_task: Option<Task<()>>,
-    rows_task: Option<Task<()>>,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
@@ -70,9 +105,8 @@ impl Workspace {
                 None
             }
         };
-        let grid = cx.new(|cx| TableState::new(RowsDelegate::default(), window, cx).row_selectable(true));
-        // Pages loaded on scroll change the status bar.
-        let subscriptions = vec![cx.observe(&grid, |_, _, cx| cx.notify())];
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         Self {
             store,
             connections,
@@ -86,12 +120,11 @@ impl Workspace {
             database: String::new(),
             schemas: Load::Idle,
             collapsed: HashSet::new(),
-            table: None,
-            rows: Load::Idle,
-            grid,
+            tabs: Vec::new(),
+            active: 0,
+            scripts_made: 0,
+            focus,
             schemas_task: None,
-            rows_task: None,
-            _subscriptions: subscriptions,
         }
     }
 
@@ -103,8 +136,10 @@ impl Workspace {
         }
     }
 
-    /// Drops everything opened or cached for connection `id` (it was edited or deleted).
+    /// Drops everything opened or cached for connection `id` (it was edited or deleted), its tabs too.
     fn forget(&mut self, id: &str) {
+        self.tabs.retain(|tab| tab.key.0 != id);
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
         self.open.retain(|(open, _), _| open != id);
         self.schema_cache.retain(|(cached, _), _| cached != id);
         self.databases.remove(id);
@@ -218,7 +253,6 @@ impl Workspace {
             self.selected = None;
             self.schemas = Load::Idle;
             self.schemas_task = None;
-            self.close_table(cx);
         }
         let (connections, showing_samples) = Self::listed_connections(self.store.as_ref());
         self.connections = connections;
@@ -240,7 +274,6 @@ impl Workspace {
         self.selected = Some(id);
         self.database = database;
         self.collapsed.clear();
-        self.close_table(cx);
         self.load_schemas(cx);
     }
 
@@ -270,7 +303,6 @@ impl Workspace {
         }
         self.database = database;
         self.collapsed.clear();
-        self.close_table(cx);
         self.load_schemas(cx);
     }
 
@@ -348,48 +380,94 @@ impl Workspace {
         cx.notify();
     }
 
-    fn close_table(&mut self, cx: &mut Context<Self>) {
-        self.table = None;
-        self.rows = Load::Idle;
-        self.rows_task = None;
-        self.grid.update(cx, |state, cx| {
-            state.delegate_mut().clear();
-            state.refresh(cx);
-        });
+    // MARK: tabs
+
+    fn open_connection(&self) -> Option<(TargetKey, Arc<Connection>)> {
+        let (_, key) = self.target()?;
+        let connection = self.open.get(&key)?.clone();
+        Some((key, connection))
     }
 
-    fn open_table(&mut self, table: TableInfo, cx: &mut Context<Self>) {
-        if self.table.as_ref() == Some(&table) {
+    fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
             return;
         }
-        let Some(connection) = self.target().and_then(|(_, key)| self.open.get(&key).cloned()) else { return };
-        self.table = Some(table.clone());
-        self.rows = Load::Loading;
-        self.rows_task = Some(cx.spawn(async move |this, cx| {
-            let result = connection.fetch_page(table.clone(), RowQuery::default(), PAGE_SIZE, None).await;
-            this.update(cx, |this, cx| {
-                if this.table.as_ref() != Some(&table) {
-                    return;
-                }
-                this.rows = match result {
-                    Ok(page) => {
-                        this.grid.update(cx, |state, cx| {
-                            let has_rows = !page.result.rows.is_empty();
-                            state.delegate_mut().show(connection, table, page);
-                            state.refresh(cx);
-                            if has_rows {
-                                state.scroll_to_row(0, cx);
-                            }
-                        });
-                        Load::Loaded(())
-                    }
-                    Err(e) => Load::Failed(e.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.active = ix;
+        if let TabView::Script(script) = &self.tabs[ix].view {
+            let focus = script.read(cx).editor_focus(cx);
+            focus.focus(window, cx);
+        }
         cx.notify();
+    }
+
+    /// Opens `table` in a tab. A single click reuses the preview tab; `pin` (double-click) keeps it.
+    fn open_table(&mut self, table: TableInfo, pin: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((key, connection)) = self.open_connection() else { return };
+        let existing = self.tabs.iter().position(|tab| tab.key == key && tab.table(cx).as_ref() == Some(&table));
+        if let Some(ix) = existing {
+            if let (true, TabView::Table(tab)) = (pin, &self.tabs[ix].view) {
+                tab.update(cx, |tab, cx| {
+                    tab.preview = false;
+                    cx.notify();
+                });
+            }
+            self.activate(ix, window, cx);
+            return;
+        }
+        let view = cx.new(|cx| {
+            let mut tab = TableTab::new(connection, table, window, cx);
+            tab.preview = !pin;
+            tab
+        });
+        let tab = OpenTab { key, view: TabView::Table(view) };
+        let preview = self.tabs.iter().position(|tab| match &tab.view {
+            TabView::Table(t) => t.read(cx).preview,
+            TabView::Script(_) => false,
+        });
+        match preview {
+            Some(ix) => self.tabs[ix] = tab,
+            None => self.tabs.push(tab),
+        }
+        let ix = preview.unwrap_or(self.tabs.len() - 1);
+        self.activate(ix, window, cx);
+    }
+
+    fn new_script(&mut self, _: &NewScript, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((key, connection)) = self.open_connection() else { return };
+        self.scripts_made += 1;
+        let name = format!("SQL {}", self.scripts_made);
+        let target = match self.selected_connection() {
+            Some(c) if Self::browses_databases(c) && c.name != key.1 => format!("{} · {}", c.name, key.1),
+            Some(c) => c.name.clone(),
+            None => key.1.clone(),
+        };
+        let view = cx.new(|cx| ScriptTab::new(connection, name, target, window, cx));
+        self.tabs.push(OpenTab { key, view: TabView::Script(view) });
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(ix);
+        if self.active > ix || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        if self.tabs.is_empty() {
+            window.focus(&self.focus, cx);
+        } else {
+            self.activate(self.active, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            window.remove_window();
+        } else {
+            self.close_tab_at(self.active, window, cx);
+        }
     }
 
     fn toggle_schema(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -512,12 +590,28 @@ impl Workspace {
             }
             None => div().font_semibold().truncate().child(connection.name.clone()).into_any_element(),
         };
+        let connected = self.open_connection().is_some();
+        let active_table = self
+            .tabs
+            .get(self.active)
+            .filter(|tab| self.target().is_some_and(|(_, key)| key == tab.key))
+            .and_then(|tab| tab.table(cx));
         let header = v_flex()
             .px_3()
             .py_2()
             .border_b_1()
             .border_color(theme.border)
-            .child(h_flex().child(title))
+            .child(
+                h_flex().gap_2().child(h_flex().flex_1().min_w_0().child(title)).child(
+                    Button::new("new-script")
+                        .ghost()
+                        .small()
+                        .icon(IconName::SquareTerminal)
+                        .disabled(!connected)
+                        .tooltip("New SQL Script (⌘T)")
+                        .on_click(cx.listener(|this, _, window, cx| this.new_script(&NewScript, window, cx))),
+                ),
+            )
             .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(subtitle));
 
         let body = match &self.schemas {
@@ -551,7 +645,7 @@ impl Workspace {
                         continue;
                     }
                     for table in &schema.tables {
-                        let selected = self.table.as_ref() == Some(table);
+                        let selected = active_table.as_ref() == Some(table);
                         let open = table.clone();
                         let icon = if table.kind == TableKind::View { IconName::Eye } else { IconName::FileText };
                         list = list.child(
@@ -565,7 +659,9 @@ impl Workspace {
                                 .children(table.estimated_row_count.map(|n| {
                                     div().text_xs().text_color(theme.muted_foreground).child(count(n))
                                 }))
-                                .on_click(cx.listener(move |this, _, _, cx| this.open_table(open.clone(), cx))),
+                                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                    this.open_table(open.clone(), event.click_count() >= 2, window, cx)
+                                })),
                         );
                     }
                 }
@@ -575,9 +671,9 @@ impl Workspace {
         v_flex().size_full().bg(theme.background).child(header).child(div().flex_1().min_h_0().child(body))
     }
 
-    fn render_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let Some(table) = &self.table else {
+        let Some(active) = self.tabs.get(self.active) else {
             return centered()
                 .bg(theme.background)
                 .text_2xl()
@@ -585,72 +681,53 @@ impl Workspace {
                 .child("No Table Selected")
                 .into_any_element();
         };
-        let body = match &self.rows {
-            Load::Idle | Load::Loading => centered().child(Spinner::new()).into_any_element(),
-            Load::Failed(message) => centered()
-                .p_4()
-                .gap_2()
-                .child(div().font_semibold().child("Couldn’t Load Rows"))
-                .child(div().text_sm().text_color(theme.muted_foreground).text_center().child(message.clone()))
-                .into_any_element(),
-            Load::Loaded(_) => DataTable::new(&self.grid).stripe(true).bordered(false).into_any_element(),
+        let content = match &active.view {
+            TabView::Table(tab) => tab.clone().into_any_element(),
+            TabView::Script(tab) => tab.clone().into_any_element(),
         };
-        let status = match &self.rows {
-            Load::Loaded(()) => {
-                let grid = self.grid.read(cx).delegate();
-                let shown = grid.rows.len();
-                let rows = match grid.total {
-                    Some(total) if total as usize > shown => {
-                        format!("{} of {}", count(shown as u64), plural(total as usize, "row"))
-                    }
-                    _ => plural(shown, "row"),
-                };
-                let mut status = format!("{rows} · {}", plural(grid.columns.len(), "column"));
-                if grid.loading_more {
-                    status.push_str(" · Loading more…");
-                } else if let Some(error) = &grid.load_more_error {
-                    status.push_str(&format!(" · Couldn’t load more: {error}"));
-                }
-                status
+        // Like the macOS app: no tab bar while there's only one tab.
+        let bar = (self.tabs.len() > 1).then(|| {
+            let mut bar = TabBar::new("tabs").selected_index(self.active).on_click(cx.listener(
+                |this, ix: &usize, window, cx| this.activate(*ix, window, cx),
+            ));
+            for (ix, tab) in self.tabs.iter().enumerate() {
+                let close = Button::new(("close-tab", ix))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab_at(ix, window, cx)
+                    }));
+                bar = bar.child(TabItem::new().label(tab.title(cx)).suffix(close));
             }
-            Load::Loading => "Loading…".into(),
-            _ => String::new(),
-        };
+            bar
+        });
         v_flex()
             .size_full()
             .bg(theme.background)
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(div().font_semibold().child(table.name.clone()))
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(table.schema.clone())),
-            )
-            .child(div().flex_1().min_h_0().child(body))
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .bg(theme.status_bar)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(status),
-            )
+            .children(bar)
+            .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_resizable("workspace")
-            .child(resizable_panel().size(px(240.)).size_range(px(180.)..px(400.)).child(self.render_connections(cx)))
-            .child(resizable_panel().size(px(300.)).size_range(px(200.)..px(520.)).child(self.render_tables(cx)))
-            .child(resizable_panel().child(self.render_rows(cx)))
+        div()
+            .size_full()
+            .key_context("Workspace")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::new_script))
+            .on_action(cx.listener(Self::close_tab))
+            .child(
+                h_resizable("workspace")
+                    .child(
+                        resizable_panel().size(px(240.)).size_range(px(180.)..px(400.)).child(self.render_connections(cx)),
+                    )
+                    .child(resizable_panel().size(px(300.)).size_range(px(200.)..px(520.)).child(self.render_tables(cx)))
+                    .child(resizable_panel().child(self.render_tabs(cx))),
+            )
     }
 }
 
@@ -682,20 +759,4 @@ fn row(id: SharedString, selected: bool, cx: &App) -> Stateful<Div> {
 
 fn centered() -> Div {
     v_flex().size_full().items_center().justify_center()
-}
-
-fn count(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn plural(n: usize, word: &str) -> String {
-    format!("{} {word}{}", count(n as u64), if n == 1 { "" } else { "s" })
 }
