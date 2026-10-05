@@ -32,7 +32,9 @@ wait_for() { # name, ready-check command, seed-error pattern, url
       echo "$url"
       return 0
     fi
-    if container logs "$name" 2>/dev/null | grep -qE "$error_pattern"; then
+    # grep without -q reads the whole log: with -q it exits at the first match, `container logs`
+    # dies of SIGPIPE on long logs, and pipefail turns the match into a failure.
+    if container logs "$name" 2>/dev/null | grep -E "$error_pattern" >/dev/null; then
       echo ' seed failed:' >&2
       container logs "$name" | grep -E -A2 "$error_pattern" >&2
       return 1
@@ -67,7 +69,7 @@ up_postgres() {
     "$PG_IMAGE"
   # The entrypoint runs init.sql on a temporary server first; wait for the real one.
   wait_for "$PG_NAME" \
-    "container logs $PG_NAME | grep -q 'PostgreSQL init process complete' && container exec $PG_NAME pg_isready -q -U postgres -d app_dev" \
+    "container logs $PG_NAME | grep 'PostgreSQL init process complete' >/dev/null && container exec $PG_NAME pg_isready -q -U postgres -d app_dev" \
     'init.sql:[0-9]*: ERROR' \
     "postgres://postgres:postgres@localhost:$PG_PORT/app_dev"
 }
@@ -79,7 +81,7 @@ up_mysql() {
     -v "$PWD/dev/mysql:/docker-entrypoint-initdb.d:ro" \
     "$MY_IMAGE"
   wait_for "$MY_NAME" \
-    "container logs $MY_NAME | grep -q 'MySQL init process done' && container exec $MY_NAME mysqladmin ping -uroot -pmysql --silent >/dev/null" \
+    "container logs $MY_NAME | grep 'MySQL init process done' >/dev/null && container exec $MY_NAME mysqladmin ping -uroot -pmysql --silent >/dev/null" \
     'ERROR [0-9]+ \(' \
     "mysql://root:mysql@localhost:$MY_PORT"
 }
