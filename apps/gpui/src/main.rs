@@ -3,6 +3,7 @@
 
 mod connection_editor;
 mod grid;
+mod inspector;
 mod sql_highlight;
 mod tabs;
 mod workspace;
@@ -22,6 +23,8 @@ fn main() {
         Theme::sync_scrollbar_appearance(cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.set_global(inspector::ShowInspector(false));
+        cx.on_action(|_: &tabs::ToggleInspector, cx| inspector::toggle(cx));
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         workspace::bind_keys(cx);
         tabs::bind_keys(cx);
