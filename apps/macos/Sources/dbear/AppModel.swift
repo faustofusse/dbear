@@ -295,30 +295,47 @@ final class AppModel {
         // Show the new connection's cached tables, or a spinner (never the previous connection's).
         didSet {
             guard selectedConnectionID != oldValue else { return }
-            selectedDatabase = selectedConnectionID.flatMap { lastDatabase[$0] }
+            selectedDatabase = selectedConnectionID.flatMap { rememberedDatabase(of: $0) }
             showCachedSchemas()
         }
     }
     /// Database shown for the selected connection; `nil` means the connection's own `database`.
     var selectedDatabase: String? {
         didSet {
-            if let id = selectedConnectionID { lastDatabase[id] = selectedDatabase }
+            if let id = selectedConnectionID, selectedDatabase != rememberedDatabase(of: id) {
+                remember(database: selectedDatabase, of: id)
+            }
             if selectedDatabase != oldValue { showCachedSchemas() }
         }
     }
-    /// The database last shown for each connection, restored when it's selected again.
-    private var lastDatabase: [ConnectionConfig.ID: String] = [:]
+
+    /// The database last shown for a connection, saved with it so it reopens there, also after a
+    /// restart (nil: its own). Only for connections that offer their server's other databases.
+    private func rememberedDatabase(of id: ConnectionConfig.ID) -> String? {
+        guard let connection = connections.first(where: { $0.id == id }),
+              connection.showAllDatabases, connection.supportsMultipleDatabases else { return nil }
+        if let cached = lastDatabase[id] { return cached }
+        let stored = store?.lastDatabase(of: id).flatMap { $0 == connection.defaultDatabase ? nil : $0 }
+        lastDatabase[id] = .some(stored)
+        return stored
+    }
+
+    private func remember(database: String?, of id: ConnectionConfig.ID) {
+        lastDatabase[id] = .some(database)
+        try? store?.setLastDatabase(database, of: id)
+    }
+
+    /// `rememberedDatabase` as read from the store (`.some(nil)`: read, nothing remembered).
+    @ObservationIgnored private var lastDatabase: [ConnectionConfig.ID: String?] = [:]
     /// Schemas already listed per database, so switching back and forth doesn't reload them.
     /// Dropped by Refresh, (re)connecting, disconnecting, and scripts that change the schema.
     private var schemaCache: [DriverKey: [Schema]] = [:]
     /// Databases on each connection's server, once listed (only for "show all databases" connections).
     var databaseLists: [ConnectionConfig.ID: [String]] = [:]
-    /// Connection whose database menu (tables column title) should pop open by itself: it has no
-    /// database, so Postgres fell back to `postgres` on a server with others to choose from.
-    /// Cleared by the menu once shown.
-    var databaseMenuRequest: ConnectionConfig.ID?
 
     var schemas: LoadState<[Schema]> = .idle
+    /// Open "New Database" sheet (see `NewDatabaseSheet.swift`).
+    var newDatabaseRequest: NewDatabaseRequest?
     /// Connections whose last attempt failed (shows a warning in the sidebar).
     var failedConnections: Set<ConnectionConfig.ID> = []
     /// Connections with an open server connection (green dot in the sidebar).
@@ -417,7 +434,7 @@ final class AppModel {
     /// Databases offered in the tables column's title menu (nil when there's nothing to choose).
     func databases(of connection: ConnectionConfig) -> [String]? {
         guard connection.showAllDatabases, connection.supportsMultipleDatabases,
-              let list = databaseLists[connection.id], list.count > 1 else { return nil }
+              let list = databaseLists[connection.id], !list.isEmpty else { return nil }
         return list
     }
 
@@ -683,15 +700,12 @@ final class AppModel {
     /// Lists the server's databases for the tables column's database menu.
     func loadDatabases(_ connection: ConnectionConfig) async {
         guard connection.showAllDatabases, connection.supportsMultipleDatabases else { return }
-        let firstLoad = databaseLists[connection.id] == nil
         do {
             let list = try await driver(for: connection).listDatabases()
             databaseLists[connection.id] = list
-            // No database configured and the server fell back to its default (Postgres): offer the
-            // others right away instead of silently browsing `postgres`.
-            if firstLoad, list.count > 1, connection.database.isEmpty, !connection.defaultDatabase.isEmpty,
-               connection.id == selectedConnectionID, selectedDatabase == nil {
-                databaseMenuRequest = connection.id
+            // The remembered database is gone (dropped or renamed): back to the connection's own.
+            if connection.id == selectedConnectionID, let shown = selectedDatabase, !list.contains(shown) {
+                selectedDatabase = nil
             }
         } catch {
             // Not fatal: the connection still works with its own database.

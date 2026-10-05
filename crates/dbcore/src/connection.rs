@@ -173,6 +173,17 @@ impl Connection {
         on_runtime(async move { d.execute(&sql, max_rows).await }).await
     }
 
+    /// The statement [`create_database`](Self::create_database) runs.
+    pub fn preview_create_database(&self, name: &str) -> Result<String> {
+        crate::dialect::Dialect(self.config().kind).create_database(name)
+    }
+
+    /// Creates a database on this connection's server (with the server's defaults).
+    pub async fn create_database(&self, name: String) -> Result<()> {
+        let sql = self.preview_create_database(&name)?;
+        self.execute(sql).await.map(|_| ())
+    }
+
     /// Users and roles on the server (see [`crate::access`]).
     pub async fn list_roles(&self) -> Result<Vec<Role>> {
         let d = self.driver.clone();

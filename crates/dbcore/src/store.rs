@@ -41,6 +41,8 @@ const MIGRATIONS: &[&str] = &[
         show_all_databases integer not null default 1
     ) strict;
     create index connections_position on connections (position);",
+    // 2: the database last browsed on each connection, reopened next time.
+    "alter table connections add column last_database text;",
 ];
 
 fn storage(path: &Path, e: impl std::fmt::Display) -> Error {
@@ -200,6 +202,26 @@ impl ConnectionStore {
         Ok(removed)
     }
 
+    /// The database last browsed on connection `id` (see [`set_last_database`](Self::set_last_database)).
+    pub fn last_database(&self, id: &str) -> Option<String> {
+        self.db
+            .query_row("select last_database from connections where id = ?1", [id], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+    }
+
+    /// Remembers the database browsed on connection `id`; `None` means its own `database`.
+    /// Cleared automatically when the connection's `database` is edited.
+    pub fn set_last_database(&mut self, id: &str, database: Option<&str>) -> Result<()> {
+        let database = database.map(str::trim).filter(|d| !d.is_empty());
+        self.db
+            .execute("update connections set last_database = ?2 where id = ?1", params![id, database])
+            .map_err(|e| storage(&self.path, e))?;
+        Ok(())
+    }
+
     /// Runs `body` in an immediate transaction, then reloads the list.
     fn write(&mut self, body: impl FnOnce(&Transaction) -> rusqlite::Result<()>) -> Result<()> {
         let path = self.path.clone();
@@ -290,8 +312,10 @@ fn insert_or_update(tx: &Transaction, c: &ConnectionConfig) -> rusqlite::Result<
     ];
     if exists {
         tx.execute(
-            "update connections set name = ?2, grp = ?3, kind = ?4, host = ?5, port = ?6, database = ?7,
-             user = ?8, ssl_mode = ?9, show_all_databases = ?10 where id = ?1",
+            "update connections set name = ?2, grp = ?3, kind = ?4, host = ?5, port = ?6,
+             last_database = case when database = ?7 and host = ?5 and show_all_databases = ?10
+                                  then last_database end,
+             database = ?7, user = ?8, ssl_mode = ?9, show_all_databases = ?10 where id = ?1",
             values,
         )?;
     } else {
@@ -541,5 +565,48 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(p.to_string_lossy().contains("Library/Application Support/dbear"));
         }
+    }
+
+    #[test]
+    fn remembers_the_last_database_until_the_database_is_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbear.db");
+        let mut store = ConnectionStore::open(&path).unwrap();
+        let saved = store.upsert(sample("dev")).unwrap();
+        assert_eq!(store.last_database(&saved.id), None);
+
+        store.set_last_database(&saved.id, Some("billing")).unwrap();
+        assert_eq!(ConnectionStore::open(&path).unwrap().last_database(&saved.id).as_deref(), Some("billing"));
+
+        // Renaming keeps it; pointing the connection at another database forgets it.
+        store.upsert(ConnectionConfig { name: "renamed".into(), ..saved.clone() }).unwrap();
+        assert_eq!(store.last_database(&saved.id).as_deref(), Some("billing"));
+        store.upsert(ConnectionConfig { database: "other".into(), ..saved.clone() }).unwrap();
+        assert_eq!(store.last_database(&saved.id), None);
+
+        store.set_last_database(&saved.id, Some("x")).unwrap();
+        store.set_last_database(&saved.id, None).unwrap();
+        assert_eq!(store.last_database(&saved.id), None);
+        assert_eq!(store.last_database("missing"), None);
+    }
+
+    #[test]
+    fn upgrades_a_version_1_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbear.db");
+        {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(MIGRATIONS[0]).unwrap();
+            db.pragma_update(None, "user_version", 1).unwrap();
+            db.execute(
+                "insert into connections (id, position, name, kind, ssl_mode) values ('a', 0, 'old', 'postgres', 'prefer')",
+                [],
+            )
+            .unwrap();
+        }
+        let mut store = ConnectionStore::open(&path).unwrap();
+        assert_eq!(store.connections().len(), 1);
+        store.set_last_database("a", Some("app")).unwrap();
+        assert_eq!(store.last_database("a").as_deref(), Some("app"));
     }
 }

@@ -35,6 +35,10 @@ public protocol DatabaseDriver: Sendable {
     /// Databases on the same server this login can open (just the configured one for SQLite).
     func listDatabases() async throws -> [String]
     func listSchemas() async throws -> [Schema]
+    /// The statement `createDatabase` runs (throws for an empty name or an engine without databases).
+    func previewCreateDatabase(named name: String) throws -> String
+    /// Creates a database on the same server, with the server's defaults.
+    func createDatabase(named name: String) async throws
     /// Columns of every table and view this connection can see, for SQL completion.
     func listColumns() async throws -> [TableColumns]
     /// One page of a table, sorted and filtered by `query`. `totalCount` is only set for the

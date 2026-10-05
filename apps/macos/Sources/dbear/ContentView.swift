@@ -24,6 +24,7 @@ struct ContentView: View {
         }
         .sheet(item: $model.dumpRequest) { DumpSheet(request: $0) }
         .sheet(item: $model.restoreRequest) { RestoreSheet(request: $0) }
+        .sheet(item: $model.newDatabaseRequest) { NewDatabaseSheet(connection: $0.connection) }
         .usersSheets(model)
         .overlay(alignment: .bottomTrailing) { BackupJobsPanel() }
         .confirmationDialog(

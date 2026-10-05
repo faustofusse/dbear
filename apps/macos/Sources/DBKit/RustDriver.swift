@@ -35,6 +35,18 @@ final class RustDriver: DatabaseDriver {
         try await bridged { try await connection.listDatabases() }
     }
 
+    func previewCreateDatabase(named name: String) throws -> String {
+        do {
+            return try connection.previewCreateDatabase(name: name)
+        } catch let error as DBCoreFFI.DbError {
+            throw DatabaseError(error)
+        }
+    }
+
+    func createDatabase(named name: String) async throws {
+        try await bridged { try await connection.createDatabase(name: name) }
+    }
+
     func listSchemas() async throws -> [Schema] {
         try await bridged { try await connection.listSchemas() }.map(Schema.init)
     }

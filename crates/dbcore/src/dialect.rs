@@ -22,6 +22,25 @@ impl Dialect {
         format!("{}.{}", self.quote_ident(schema), self.quote_ident(name))
     }
 
+    /// `create database <name>`. Databases are server-level, so SQLite and libSQL have none to create.
+    pub fn create_database(self, name: &str) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::InvalidConfig("Enter a database name.".into()));
+        }
+        if name.contains('\0') {
+            return Err(Error::InvalidConfig("Database names can’t contain NUL characters.".into()));
+        }
+        match self.0 {
+            DatabaseKind::Postgres | DatabaseKind::Mysql | DatabaseKind::SqlServer => {
+                Ok(format!("create database {}", self.quote_ident(name)))
+            }
+            DatabaseKind::Sqlite | DatabaseKind::Libsql => {
+                Err(Error::Unsupported(format!("{} has no databases to create", self.0.display_name())))
+            }
+        }
+    }
+
     /// A string literal, e.g. for catalog queries that can't take parameters.
     pub fn quote_literal(self, value: &str) -> String {
         match self.0 {
@@ -229,6 +248,15 @@ pub(crate) fn line_column(sql: &str, char_offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_database_quotes_the_name() {
+        assert_eq!(Dialect(DatabaseKind::Postgres).create_database(" My \"db\" ").unwrap(), r#"create database "My ""db""""#);
+        assert_eq!(Dialect(DatabaseKind::Mysql).create_database("shop`x").unwrap(), "create database `shop``x`");
+        assert_eq!(Dialect(DatabaseKind::SqlServer).create_database("a]b").unwrap(), "create database [a]]b]");
+        assert!(matches!(Dialect(DatabaseKind::Postgres).create_database("  "), Err(Error::InvalidConfig(_))));
+        assert!(matches!(Dialect(DatabaseKind::Sqlite).create_database("x"), Err(Error::Unsupported(_))));
+    }
 
     #[test]
     fn quotes_per_dialect() {

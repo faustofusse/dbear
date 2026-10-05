@@ -37,6 +37,16 @@ public final class ConnectionStore: @unchecked Sendable {
     public func remove(id: ConnectionConfig.ID) throws -> Bool {
         try bridged { try inner.remove(id: id) }
     }
+
+    /// The database last browsed on a connection (forgotten when its `database` is edited).
+    public func lastDatabase(of id: ConnectionConfig.ID) -> String? {
+        inner.lastDatabase(id: id)
+    }
+
+    /// Remembers the database browsed on a connection; nil = its own `database`.
+    public func setLastDatabase(_ database: String?, of id: ConnectionConfig.ID) throws {
+        try bridged { try inner.setLastDatabase(id: id, database: database) }
+    }
 }
 
 extension ConnectionConfig {

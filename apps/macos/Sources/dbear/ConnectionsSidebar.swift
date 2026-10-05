@@ -86,6 +86,12 @@ struct ConnectionsSidebar: View {
             model.select(connection.id)
             model.newScript()
         }
+        if model.canCreateDatabases(on: connection) {
+            Button("New Database…") {
+                model.select(connection.id)
+                model.requestNewDatabase(on: connection)
+            }
+        }
         if connection.showAllDatabases, connection.supportsMultipleDatabases, model.openConnections.contains(connection.id) {
             Button("Refresh Databases") { Task { await model.loadDatabases(connection) } }
         }

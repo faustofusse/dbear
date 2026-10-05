@@ -70,3 +70,17 @@ private func tempStorePath() -> String {
     secrets.deletePassword(for: "a")
     #expect(!secrets.hasPassword(for: "a"))
 }
+
+@Test func storeRemembersTheLastDatabase() throws {
+    let path = tempStorePath()
+    defer { try? FileManager.default.removeItem(atPath: (path as NSString).deletingLastPathComponent) }
+    let store = try ConnectionStore.open(path: path)
+    var draft = ConnectionConfig.blank()
+    draft.host = "localhost"
+    let saved = try store.upsert(draft)
+    #expect(store.lastDatabase(of: saved.id) == nil)
+    try store.setLastDatabase("billing", of: saved.id)
+    #expect(try ConnectionStore.open(path: path).lastDatabase(of: saved.id) == "billing")
+    try store.setLastDatabase(nil, of: saved.id)
+    #expect(store.lastDatabase(of: saved.id) == nil)
+}

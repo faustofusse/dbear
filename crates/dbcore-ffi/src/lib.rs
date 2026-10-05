@@ -305,6 +305,16 @@ impl Connection {
         Ok(self.inner.execute_limited(sql, max_rows).await?.into())
     }
 
+    /// The statement `create_database` runs (validates the name).
+    pub fn preview_create_database(&self, name: String) -> Result<String, DbError> {
+        Ok(self.inner.preview_create_database(&name)?)
+    }
+
+    /// Creates a database on this connection's server.
+    pub async fn create_database(&self, name: String) -> Result<(), DbError> {
+        Ok(self.inner.create_database(name).await?)
+    }
+
     /// Cancels the running `execute`, which then fails with `DbError::Cancelled`.
     /// (Swift task cancellation doesn't reach Rust futures through UniFFI, so call this.)
     pub async fn cancel(&self) {
@@ -347,6 +357,16 @@ impl ConnectionStore {
 
     pub fn remove(&self, id: String) -> Result<bool, DbError> {
         Ok(self.lock().remove(&id)?)
+    }
+
+    /// The database last browsed on connection `id`, if any.
+    pub fn last_database(&self, id: String) -> Option<String> {
+        self.lock().last_database(&id)
+    }
+
+    /// Remembers the database browsed on connection `id` (`None` = its own database).
+    pub fn set_last_database(&self, id: String, database: Option<String>) -> Result<(), DbError> {
+        Ok(self.lock().set_last_database(&id, database.as_deref())?)
     }
 }
 

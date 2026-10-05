@@ -30,11 +30,7 @@ struct TablesList: View {
                             help: model.showsUsers
                                 ? "Roles are the server\u{2019}s; privileges are per database. Pick whose privileges to show."
                                 : model.selectedTarget?.summary,
-                            maxWidth: titleWidth,
-                            popUpRequested: model.databaseMenuRequest != nil
-                                && model.databaseMenuRequest == model.selectedConnectionID,
-                            popUpItems: databaseMenuItems,
-                            onPopUp: { model.databaseMenuRequest = nil }
+                            maxWidth: titleWidth
                         ) { databaseMenu }
                     }
                     .sharedBackgroundIfAvailable(hidden: true)
@@ -150,21 +146,9 @@ struct TablesList: View {
             .pickerStyle(.inline)
             .labelsHidden()
             Divider()
+            Button("New Database…") { model.requestNewDatabase(on: connection) }
             Button("Refresh Databases") { Task { await model.loadDatabases(connection) } }
         }
-    }
-
-    /// `databaseMenu` as AppKit items, for opening it without a click (SwiftUI menus can't be).
-    private func databaseMenuItems() -> [PopUpMenuItem] {
-        guard let connection = model.selectedConnection, let databases = model.databases(of: connection) else { return [] }
-        let current = model.selectedTarget?.defaultDatabase ?? connection.defaultDatabase
-        let picks = databases.map { database in
-            PopUpMenuItem.action(
-                database == connection.defaultDatabase ? "\(database) (default)" : database,
-                checked: database == current
-            ) { model.select(connection.id, database: database) }
-        }
-        return picks + [.separator, .action("Refresh Databases") { Task { await model.loadDatabases(connection) } }]
     }
 
     /// The one database a MySQL connection browses (its only "schema"), if that's what's shown.
@@ -328,10 +312,6 @@ private struct DatabaseTitle<Items: View>: View {
     let subtitle: String
     let help: String?
     let maxWidth: CGFloat
-    /// Pops the menu open without a click; `onPopUp` should reset it.
-    let popUpRequested: Bool
-    let popUpItems: () -> [PopUpMenuItem]
-    let onPopUp: () -> Void
     @ViewBuilder let menu: Items
     @Environment(\.controlActiveState) private var activeState
 
@@ -365,8 +345,6 @@ private struct DatabaseTitle<Items: View>: View {
         // Truncates like the native title instead of growing with long names (it pushed the
         // column's buttons around); the full connection summary is in the tooltip.
         .frame(maxWidth: maxWidth, alignment: .leading)
-        // Spans the button, so the menu lands where a click would open it.
-        .background(PopUpMenuAnchor(requested: popUpRequested, items: popUpItems, onPopUp: onPopUp))
         .help(help.map { "\($0)\nClick to switch database" } ?? "Click to switch database")
     }
 }
@@ -379,69 +357,6 @@ extension ToolbarContent {
         } else {
             return self
         }
-    }
-}
-
-/// An item of a menu opened by `PopUpMenuAnchor`.
-enum PopUpMenuItem {
-    case action(String, checked: Bool = false, perform: () -> Void)
-    case separator
-}
-
-/// Pops an AppKit menu below itself when `requested`: for opening a menu without a click,
-/// which SwiftUI's `Menu` can't do.
-private struct PopUpMenuAnchor: NSViewRepresentable {
-    let requested: Bool
-    let items: () -> [PopUpMenuItem]
-    let onPopUp: () -> Void
-
-    func makeNSView(context: Context) -> NSView { FlippedView() }
-
-    func updateNSView(_ view: NSView, context: Context) {
-        guard requested, !context.coordinator.pending else { return }
-        context.coordinator.pending = true
-        let items = items()
-        // Not during the SwiftUI update: the reset changes state, and the menu runs a nested event loop.
-        DispatchQueue.main.async {
-            context.coordinator.pending = false
-            onPopUp()
-            guard !items.isEmpty, view.window != nil else { return }
-            let menu = NSMenu()
-            for item in items {
-                switch item {
-                case .separator:
-                    menu.addItem(.separator())
-                case .action(let title, let checked, let perform):
-                    // `target` is weak and the toolbar may rebuild this view while the menu is open:
-                    // the item keeps its own action alive.
-                    let action = MenuAction(perform)
-                    let menuItem = NSMenuItem(title: title, action: #selector(MenuAction.run), keyEquivalent: "")
-                    menuItem.target = action
-                    menuItem.representedObject = action
-                    menuItem.state = checked ? .on : .off
-                    menu.addItem(menuItem)
-                }
-            }
-            // The gap a click on the title menu leaves below the button.
-            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 15), in: view)
-        }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    final class Coordinator: NSObject {
-        var pending = false
-    }
-
-    private final class MenuAction: NSObject {
-        let perform: () -> Void
-        init(_ perform: @escaping () -> Void) { self.perform = perform }
-        @objc func run() { perform() }
-    }
-
-    private final class FlippedView: NSView {
-        override var isFlipped: Bool { true }
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
 

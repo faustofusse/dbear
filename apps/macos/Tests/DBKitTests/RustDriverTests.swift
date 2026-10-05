@@ -194,6 +194,17 @@ private func pageThrough(_ driver: any DatabaseDriver, _ table: TableInfo, query
     #expect(result.rows.first?.values.first == .text("postgres"))
 }
 
+@Test(.enabled(if: postgresEnabled)) func realPostgresCreatesADatabase() async throws {
+    let driver = Drivers.make(for: devDB)
+    #expect(try driver.previewCreateDatabase(named: " dbear swift ") == #"create database "dbear swift""#)
+    #expect(throws: DatabaseError.self) { try driver.previewCreateDatabase(named: "  ") }
+    _ = try await driver.execute(#"drop database if exists "dbear swift""#)
+    try await driver.createDatabase(named: "dbear swift")
+    let listed = try await driver.listDatabases()
+    _ = try await driver.execute(#"drop database if exists "dbear swift""#)
+    #expect(listed.contains("dbear swift"))
+}
+
 @Test func emptyDatabaseAndNameFallBack() throws {
     let noDatabase = try ConnectionConfig.parse(url: "postgres://u@db.example.com:5432")
     #expect(noDatabase.validationError == nil)

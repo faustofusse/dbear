@@ -687,3 +687,16 @@ fn sets_database_levels_in_another_database() {
 
     cleanup();
 }
+
+#[test]
+fn creates_a_database() {
+    if !enabled() {
+        return;
+    }
+    let conn = dev();
+    block_on(conn.execute("drop database if exists \"dbear create test\"".into())).unwrap();
+    block_on(conn.create_database(" dbear create test ".into())).unwrap();
+    let listed = block_on(conn.list_databases()).unwrap();
+    block_on(conn.execute("drop database if exists \"dbear create test\"".into())).unwrap();
+    assert!(listed.contains(&"dbear create test".to_string()), "{listed:?}");
+}

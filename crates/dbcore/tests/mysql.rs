@@ -429,3 +429,16 @@ fn creates_grants_and_drops_an_account() {
     block_on(conn.apply_access(vec![AccessChange::DropRole(reader)])).unwrap();
     assert!(!block_on(conn.list_roles()).unwrap().iter().any(|r| r.reference() == me));
 }
+
+#[test]
+fn creates_a_database() {
+    if !enabled() {
+        return;
+    }
+    let conn = dev();
+    block_on(conn.execute("drop database if exists `dbear create test`".into())).unwrap();
+    block_on(conn.create_database(" dbear create test ".into())).unwrap();
+    let listed = block_on(conn.list_databases()).unwrap();
+    block_on(conn.execute("drop database if exists `dbear create test`".into())).unwrap();
+    assert!(listed.contains(&"dbear create test".to_string()), "{listed:?}");
+}
