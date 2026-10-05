@@ -1,6 +1,7 @@
 //! dbear for Linux, written with GPUI. It also runs on macOS and Windows, which is handy for
 //! development; the macOS release is the SwiftUI app in `apps/macos`.
 
+mod connection_editor;
 mod grid;
 mod workspace;
 

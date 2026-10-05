@@ -6,16 +6,18 @@ use std::sync::Arc;
 use dbcore::secrets::{self, KeyringSecretStore};
 use dbcore::{Connection, ConnectionConfig, ConnectionStore, RowQuery, Schema, TableInfo, TableKind};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::dialog::DialogButtonProps;
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::connection_editor::ConnectionEditor;
 use crate::grid::{PAGE_SIZE, RowsDelegate};
 
 enum Load<T> {
@@ -33,6 +35,8 @@ pub struct Workspace {
     connections: Vec<ConnectionConfig>,
     /// Why the saved connections or passwords aren't available, shown under the list.
     notice: Option<String>,
+    /// No saved connections: the list shows the samples.
+    showing_samples: bool,
     secrets: Option<Arc<KeyringSecretStore>>,
     open: HashMap<TargetKey, Arc<Connection>>,
     /// Schemas already listed per target, so switching back to a database is instant.
@@ -58,11 +62,7 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut notices = Vec::new();
         let store = open_store().map_err(|e| notices.push(format!("Couldn’t open saved connections: {e}"))).ok();
-        let mut connections = store.as_ref().map(|s| s.connections().to_vec()).unwrap_or_default();
-        if connections.is_empty() {
-            notices.push("No saved connections yet; showing the samples.".into());
-            connections = dbcore::mock::connections();
-        }
+        let (connections, showing_samples) = Self::listed_connections(store.as_ref());
         let secrets = match KeyringSecretStore::new() {
             Ok(store) => Some(Arc::new(store)),
             Err(e) => {
@@ -76,6 +76,7 @@ impl Workspace {
         Self {
             store,
             connections,
+            showing_samples,
             notice: (!notices.is_empty()).then(|| notices.join("\n")),
             secrets,
             open: HashMap::new(),
@@ -92,6 +93,137 @@ impl Workspace {
             rows_task: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Saved connections, or the samples when there are none yet.
+    fn listed_connections(store: Option<&ConnectionStore>) -> (Vec<ConnectionConfig>, bool) {
+        match store.map(|s| s.connections().to_vec()).filter(|c| !c.is_empty()) {
+            Some(connections) => (connections, false),
+            None => (dbcore::mock::connections(), true),
+        }
+    }
+
+    /// Drops everything opened or cached for connection `id` (it was edited or deleted).
+    fn forget(&mut self, id: &str) {
+        self.open.retain(|(open, _), _| open != id);
+        self.schema_cache.retain(|(cached, _), _| cached != id);
+        self.databases.remove(id);
+    }
+
+    // MARK: editing connections
+
+    fn open_editor(&mut self, original: Option<ConnectionConfig>, window: &mut Window, cx: &mut Context<Self>) {
+        let title = if original.is_some() { "Edit Connection" } else { "New Connection" };
+        let secrets = self.secrets.clone();
+        let editor = cx.new(|cx| ConnectionEditor::new(original, secrets, window, cx));
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (editor, workspace) = (editor.clone(), workspace.clone());
+            let footer = h_flex()
+                .w_full()
+                .gap_2()
+                .child(Button::new("test").outline().label("Test Connection").on_click({
+                    let editor = editor.clone();
+                    move |_, _, cx| editor.update(cx, |e, cx| e.test(cx))
+                }))
+                .child(div().flex_1())
+                .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("save").primary().label("Save").on_click({
+                    let editor = editor.clone();
+                    move |_, window, cx| {
+                        let saved = workspace.update(cx, |w, cx| w.save_connection(&editor, cx)).unwrap_or(false);
+                        if saved {
+                            window.close_dialog(cx);
+                        }
+                    }
+                }));
+            let _ = cx;
+            dialog.title(title).w(px(560.)).child(editor).footer(footer)
+        });
+    }
+
+    /// Saves the editor's connection (and password). Returns whether it worked; errors show in the form.
+    fn save_connection(&mut self, editor: &Entity<ConnectionEditor>, cx: &mut Context<Self>) -> bool {
+        let (config, password) = match editor.read(cx).config(cx) {
+            Ok(config) => config,
+            Err(e) => {
+                editor.update(cx, |e2, cx| e2.show_error(e, cx));
+                return false;
+            }
+        };
+        let is_new = editor.read(cx).is_new();
+        let Some(store) = self.store.as_mut() else {
+            editor.update(cx, |e, cx| e.show_error("The connection store isn’t available.".into(), cx));
+            return false;
+        };
+        let saved = match store.upsert(config) {
+            Ok(saved) => saved,
+            Err(e) => {
+                editor.update(cx, |ed, cx| ed.show_error(e.to_string(), cx));
+                return false;
+            }
+        };
+        if let Some(password) = password {
+            match &self.secrets {
+                Some(secrets) => {
+                    if let Err(e) = secrets::save_password(secrets.as_ref(), &saved.id, Some(&password)) {
+                        editor.update(cx, |ed, cx| ed.show_error(format!("Saved, but the password wasn’t: {e}"), cx));
+                    }
+                }
+                None => log::warn!("no keyring: the password for {} isn’t saved", saved.name),
+            }
+        }
+        let (connections, showing_samples) = Self::listed_connections(self.store.as_ref());
+        self.connections = connections;
+        self.showing_samples = showing_samples;
+        self.forget(&saved.id);
+        // Reopen it with the new settings (or open the new one).
+        if is_new || self.selected.as_deref() == Some(saved.id.as_str()) {
+            self.selected = None;
+            self.select_connection(saved.id, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    fn confirm_delete(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.connections.iter().find(|c| c.id == id) else { return };
+        let name = config.name.clone();
+        let workspace = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (workspace, id) = (workspace.clone(), id.clone());
+            alert
+                .title(format!("Delete “{name}”?"))
+                .description("Its saved password is deleted too. This can’t be undone.")
+                .show_cancel(true)
+                .button_props(DialogButtonProps::default().ok_text("Delete"))
+                .on_ok(move |_, _, cx| {
+                    workspace.update(cx, |w, cx| w.delete_connection(&id, cx)).ok();
+                    true
+                })
+        });
+    }
+
+    fn delete_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(store) = self.store.as_mut() else { return };
+        if let Err(e) = store.remove(id) {
+            log::error!("couldn’t delete the connection: {e}");
+            return;
+        }
+        if let Some(secrets) = &self.secrets {
+            let _ = secrets::save_password(secrets.as_ref(), id, None);
+        }
+        self.forget(id);
+        if self.selected.as_deref() == Some(id) {
+            self.selected = None;
+            self.schemas = Load::Idle;
+            self.schemas_task = None;
+            self.close_table(cx);
+        }
+        let (connections, showing_samples) = Self::listed_connections(self.store.as_ref());
+        self.connections = connections;
+        self.showing_samples = showing_samples;
+        cx.notify();
     }
 
     fn selected_connection(&self) -> Option<&ConnectionConfig> {
@@ -299,14 +431,47 @@ impl Workspace {
                             let summary = SharedString::from(c.summary());
                             move |window, cx| Tooltip::new(summary.clone()).build(window, cx)
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| this.select_connection(id.clone(), cx))),
+                        .on_click({
+                            let id = id.clone();
+                            cx.listener(move |this, _, _, cx| this.select_connection(id.clone(), cx))
+                        })
+                        .context_menu({
+                            let this = cx.entity().downgrade();
+                            let config = c.clone();
+                            move |menu, _, _| {
+                                let (edit, delete) = (this.clone(), this.clone());
+                                let (config, id) = (config.clone(), config.id.clone());
+                                menu.item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
+                                    let config = config.clone();
+                                    edit.update(cx, |w, cx| w.open_editor(Some(config), window, cx)).ok();
+                                }))
+                                .item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
+                                    let id = id.clone();
+                                    delete.update(cx, |w, cx| w.confirm_delete(id, window, cx)).ok();
+                                }))
+                            }
+                        }),
                 );
             }
         }
-        if let Some(notice) = &self.notice {
-            list = list.child(div().mt_4().px_2().text_xs().text_color(theme.muted_foreground).child(notice.clone()));
+        let notices = self
+            .showing_samples
+            .then(|| "No saved connections yet; showing the samples.".to_string())
+            .into_iter()
+            .chain(self.notice.clone());
+        for notice in notices {
+            list = list.child(div().mt_4().px_2().text_xs().text_color(theme.muted_foreground).child(notice));
         }
-        div().size_full().bg(theme.sidebar).child(list)
+        v_flex().size_full().bg(theme.sidebar).child(div().flex_1().min_h_0().child(list)).child(
+            h_flex().p_2().border_t_1().border_color(theme.sidebar_border).child(
+                Button::new("new-connection")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Plus)
+                    .label("New Connection")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_editor(None, window, cx))),
+            ),
+        )
     }
 
     fn render_tables(&self, cx: &mut Context<Self>) -> impl IntoElement {
