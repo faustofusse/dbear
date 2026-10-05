@@ -118,7 +118,7 @@ private struct InspectorContent: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            InspectorTextView(text: $draft, isEditable: isEditable)
+            InspectorTextView(text: $draft, isEditable: isEditable, highlightsJSON: pretty != nil)
                 .overlay(alignment: .topLeading) {
                     if draft.isEmpty {
                         Text(cell.isDefault ? "DEFAULT" : cell.text == nil ? "NULL" : "Empty")
@@ -233,12 +233,14 @@ private struct InspectorContent: View {
     }
 }
 
-/// Plain monospaced text view that wraps lines and handles large values (an `NSTextView`).
+/// Monospaced text view that wraps lines and handles large values (an `NSTextView`).
+/// JSON values get tree-sitter highlighting from the core, refreshed as they're edited.
 private struct InspectorTextView: NSViewRepresentable {
     @Binding var text: String
     var isEditable: Bool
+    var highlightsJSON: Bool
 
-    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text, highlightsJSON: highlightsJSON) }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSTextView.scrollableTextView()
@@ -263,13 +265,22 @@ private struct InspectorTextView: NSViewRepresentable {
         view.smartInsertDeleteEnabled = false
         view.string = text
         view.delegate = context.coordinator
+        context.coordinator.textView = view
+        context.coordinator.highlight()
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let view = scroll.documentView as? NSTextView else { return }
-        context.coordinator.text = $text
-        if view.string != text { view.string = text }
+        let coordinator = context.coordinator
+        coordinator.text = $text
+        var needsHighlight = coordinator.highlightsJSON != highlightsJSON
+        coordinator.highlightsJSON = highlightsJSON
+        if view.string != text {
+            view.string = text
+            needsHighlight = true
+        }
+        if needsHighlight { coordinator.highlight() }
         if view.isEditable != isEditable { view.isEditable = isEditable }
         view.isSelectable = true
     }
@@ -277,11 +288,56 @@ private struct InspectorTextView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var text: Binding<String>
-        init(text: Binding<String>) { self.text = text }
+        var highlightsJSON: Bool
+        weak var textView: NSTextView?
+        private let theme = SQLTheme.json(fontSize: 12)
+        private var generation = 0
+
+        init(text: Binding<String>, highlightsJSON: Bool) {
+            self.text = text
+            self.highlightsJSON = highlightsJSON
+        }
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
             text.wrappedValue = view.string
+            highlight()
+        }
+
+        /// Small values synchronously; large ones off the main thread, applied only if the
+        /// text hasn't changed meanwhile (as in `SQLEditor`).
+        func highlight() {
+            guard let textView else { return }
+            generation += 1
+            textView.typingAttributes = theme.baseAttributes
+            guard highlightsJSON else {
+                apply([], to: textView)
+                return
+            }
+            let source = textView.string
+            if source.utf16.count < 50_000 {
+                apply(JSONSyntax.highlight(source), to: textView)
+                return
+            }
+            let generation = generation
+            Task.detached(priority: .userInitiated) {
+                let spans = JSONSyntax.highlight(source)
+                await MainActor.run { [weak self] in
+                    guard let self, self.generation == generation, let textView = self.textView else { return }
+                    self.apply(spans, to: textView)
+                }
+            }
+        }
+
+        private func apply(_ spans: [SyntaxSpan], to textView: NSTextView) {
+            guard let storage = textView.textStorage else { return }
+            let length = storage.length
+            storage.beginEditing()
+            storage.setAttributes(theme.baseAttributes, range: NSRange(location: 0, length: length))
+            for span in spans where NSMaxRange(span.range) <= length {
+                storage.addAttributes(theme.attributes(for: span.kind), range: span.range)
+            }
+            storage.endEditing()
         }
     }
 }

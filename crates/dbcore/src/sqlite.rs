@@ -72,11 +72,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// `~/x.db` → `/Users/me/x.db`.
 pub(crate) fn database_path(database: &str) -> PathBuf {
-    let database = database.trim();
-    match (database.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(database),
-    }
+    crate::paths::expand_home(database.trim())
 }
 
 fn open(path: &std::path::Path) -> Result<rusqlite::Connection> {
@@ -727,8 +723,8 @@ mod tests {
 
     #[test]
     fn expands_home() {
-        if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(database_path("~/a.db"), PathBuf::from(home).join("a.db"));
+        if let Some(home) = crate::paths::home_dir() {
+            assert_eq!(database_path("~/a.db"), home.join("a.db"));
         }
         assert_eq!(database_path(" /tmp/a.db "), PathBuf::from("/tmp/a.db"));
     }

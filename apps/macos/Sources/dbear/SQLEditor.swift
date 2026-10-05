@@ -235,7 +235,16 @@ struct SQLTheme {
     let baseAttributes: [NSAttributedString.Key: Any]
     private let kinds: [SyntaxKind: [NSAttributedString.Key: Any]]
 
+    /// The inspector's JSON theme: like SQL, plus a color for object keys (`.field`).
+    static func json(fontSize: CGFloat) -> SQLTheme {
+        SQLTheme(fontSize: fontSize, fieldColor: dynamic(light: 0x0B4F79, dark: 0x5DD8FF))
+    }
+
     init(fontSize: CGFloat) {
+        self.init(fontSize: fontSize, fieldColor: nil)
+    }
+
+    private init(fontSize: CGFloat, fieldColor: NSColor?) {
         self.fontSize = fontSize
         font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
         let keywordFont = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold)
@@ -243,7 +252,7 @@ struct SQLTheme {
         var kinds: [SyntaxKind: [NSAttributedString.Key: Any]] = [:]
         for kind in SyntaxKind.allCases {
             var attrs: [NSAttributedString.Key: Any] = [:]
-            if let color = Self.colors[kind] { attrs[.foregroundColor] = color }
+            if let color = kind == .field ? fieldColor : Self.colors[kind] { attrs[.foregroundColor] = color }
             if kind == .keyword || kind == .constant { attrs[.font] = keywordFont }
             kinds[kind] = attrs
         }

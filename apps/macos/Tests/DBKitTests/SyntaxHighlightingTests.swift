@@ -16,3 +16,14 @@ import Testing
 @Test func emptyTextHasNoSpans() {
     #expect(SQLSyntax.highlight("").isEmpty)
 }
+
+@Test func jsonKeysAreFieldsAndRangesAreUTF16() {
+    let json = #"{"🐻": "ñ", "n": 1, "ok": null}"#
+    let spans = JSONSyntax.highlight(json)
+    let ns = json as NSString
+    func text(_ kind: SyntaxKind) -> [String] { spans.filter { $0.kind == kind }.map { ns.substring(with: $0.range) } }
+    #expect(text(.field) == [#""🐻""#, #""n""#, #""ok""#])
+    #expect(text(.string) == [#""ñ""#])
+    #expect(text(.number) == ["1"])
+    #expect(text(.constant) == ["null"])
+}

@@ -29,6 +29,7 @@ url.workspace = true
 percent-encoding.workspace = true
 tree-sitter.workspace = true
 tree-sitter-sequel.workspace = true
+tree-sitter-json.workspace = true
 reqwest.workspace = true
 base64.workspace = true
 flate2.workspace = true

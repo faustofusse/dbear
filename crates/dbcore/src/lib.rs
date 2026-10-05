@@ -1,7 +1,7 @@
 //! dbear shared core.
 //!
 //! Everything that isn't UI lives here: models, drivers, value decoding, SQL handling.
-//! - The GPUI (Linux) app depends on this crate directly.
+//! - The GPUI app (Linux, also builds on macOS/Windows) depends on this crate directly.
 //! - The SwiftUI (macOS) app uses it through `dbcore-ffi` (UniFFI).
 
 pub mod access;
@@ -20,6 +20,7 @@ pub mod libsql;
 pub mod mock;
 pub mod model;
 pub mod mysql;
+pub mod paths;
 pub mod restore;
 pub mod postgres;
 pub mod sqlite;

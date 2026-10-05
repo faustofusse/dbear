@@ -22,17 +22,20 @@ const CREDENTIALS_KEY: [u8; 16] = [
 
 /// Where DBeaver keeps its data on this machine (existing directories only).
 pub fn default_data_dirs() -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
-    let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"));
-    [
-        home.join("Library/DBeaverData"),                                    // macOS
-        xdg.join("DBeaverData"),                                             // Linux
-        home.join(".var/app/io.dbeaver.DBeaverCommunity/data/DBeaverData"), // Linux, Flatpak
-        home.join("snap/dbeaver-ce/current/.local/share/DBeaverData"),      // Linux, Snap
-    ]
-    .into_iter()
-    .filter(|p| p.is_dir())
-    .collect()
+    use crate::paths;
+    let Some(home) = paths::home_dir() else { return Vec::new() };
+    let candidates = if cfg!(target_os = "macos") {
+        vec![home.join("Library/DBeaverData")]
+    } else if cfg!(windows) {
+        paths::app_data_dir().map(|d| d.join("DBeaverData")).into_iter().collect()
+    } else {
+        vec![
+            paths::xdg_data_dir().unwrap_or_else(|| home.join(".local/share")).join("DBeaverData"),
+            home.join(".var/app/io.dbeaver.DBeaverCommunity/data/DBeaverData"), // Flatpak
+            home.join("snap/dbeaver-ce/current/.local/share/DBeaverData"),      // Snap
+        ]
+    };
+    candidates.into_iter().filter(|p| p.is_dir()).collect()
 }
 
 /// Scans DBeaver's default locations.

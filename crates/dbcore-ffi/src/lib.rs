@@ -517,7 +517,16 @@ pub struct HighlightSpan {
 /// Highlight spans for a SQL script, sorted by location (later spans are more specific).
 #[uniffi::export]
 pub fn highlight_sql(text: String) -> Vec<HighlightSpan> {
-    let spans = dbcore::highlight::highlight_sql(&text);
+    utf16_spans(&text, dbcore::highlight::highlight_sql(&text))
+}
+
+/// Highlight spans for a JSON value (keys are `Field`), sorted by location.
+#[uniffi::export]
+pub fn highlight_json(text: String) -> Vec<HighlightSpan> {
+    utf16_spans(&text, dbcore::highlight::highlight_json(&text))
+}
+
+fn utf16_spans(text: &str, spans: Vec<dbcore::highlight::HighlightSpan>) -> Vec<HighlightSpan> {
     if spans.is_empty() {
         return Vec::new();
     }

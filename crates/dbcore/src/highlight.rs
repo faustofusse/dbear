@@ -1,4 +1,5 @@
-//! SQL syntax highlighting with tree-sitter (grammar: github.com/DerekStride/tree-sitter-sql).
+//! Syntax highlighting with tree-sitter: SQL (grammar: github.com/DerekStride/tree-sitter-sql)
+//! for the editor, JSON for the value inspector.
 //!
 //! Frontends get flat, sorted spans and only decide colors. Offsets are UTF-8 byte offsets;
 //! the FFI layer converts them to UTF-16 for AppKit.
@@ -37,6 +38,7 @@ pub struct HighlightSpan {
 }
 
 struct Highlighter {
+    language: tree_sitter::Language,
     query: Query,
     /// Capture index -> kind (`None` for captures we ignore, like `@spell`).
     kinds: Vec<Option<HighlightKind>>,
@@ -51,15 +53,37 @@ const EXTRA_QUERY: &str = r#"
 (interval) @string
 "#;
 
-fn highlighter() -> &'static Highlighter {
+/// JSON captures: our own query rather than the grammar's, so keys and punctuation get kinds too.
+/// The key pattern comes after `(string)`, so it wins on the key's range.
+const JSON_QUERY: &str = r#"
+(string) @string
+(pair key: (string) @field)
+(number) @number
+[(true) (false) (null)] @boolean
+(comment) @comment
+["{" "}" "[" "]"] @punctuation.bracket
+[":" ","] @punctuation.delimiter
+"#;
+
+impl Highlighter {
+    fn new(language: tree_sitter::Language, source: &str) -> Self {
+        let query = Query::new(&language, source).expect("bundled highlight query must compile");
+        let kinds = query.capture_names().iter().map(|name| kind_for_capture(name)).collect();
+        Highlighter { language, query, kinds }
+    }
+}
+
+fn sql_highlighter() -> &'static Highlighter {
     static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
     HIGHLIGHTER.get_or_init(|| {
-        let language = tree_sitter::Language::new(tree_sitter_sequel::LANGUAGE);
         let source = format!("{}\n{EXTRA_QUERY}", tree_sitter_sequel::HIGHLIGHTS_QUERY);
-        let query = Query::new(&language, &source).expect("bundled highlights.scm must compile");
-        let kinds = query.capture_names().iter().map(|name| kind_for_capture(name)).collect();
-        Highlighter { query, kinds }
+        Highlighter::new(tree_sitter_sequel::LANGUAGE.into(), &source)
     })
+}
+
+fn json_highlighter() -> &'static Highlighter {
+    static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
+    HIGHLIGHTER.get_or_init(|| Highlighter::new(tree_sitter_json::LANGUAGE.into(), JSON_QUERY))
 }
 
 fn kind_for_capture(name: &str) -> Option<HighlightKind> {
@@ -72,9 +96,10 @@ fn kind_for_capture(name: &str) -> Option<HighlightKind> {
         "field" => Field,
         "variable" => Variable,
         "parameter" => Parameter,
-        // The grammar's number patterns use Lua-style `%d` (Neovim) and never match here,
-        // so literals are classified from their text instead (see `classify_literal`).
-        "string" | "number" | "float" => String,
+        // The SQL grammar's number patterns use Lua-style `%d` (Neovim) and never match here,
+        // so SQL literals are classified from their text instead (see `classify_literal`).
+        "string" => String,
+        "number" | "float" => Number,
         "boolean" => Constant,
         "comment" => Comment,
         "operator" => Operator,
@@ -92,19 +117,24 @@ fn classify_literal(text: &str) -> HighlightKind {
 }
 
 thread_local! {
-    static PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+    static PARSER: RefCell<Parser> = RefCell::new(Parser::new());
 }
 
-/// Highlight spans for `source`, sorted by start. Nested spans come after their parent,
+/// Highlight spans for a SQL script, sorted by start. Nested spans come after their parent,
 /// so applying them in order lets the most specific one win.
 pub fn highlight_sql(source: &str) -> Vec<HighlightSpan> {
-    let hl = highlighter();
+    highlight(sql_highlighter(), source)
+}
+
+/// Highlight spans for a JSON value: keys are `Field`, `true`/`false`/`null` are `Constant`.
+/// Invalid JSON (e.g. while editing) still highlights the parts that parse.
+pub fn highlight_json(source: &str) -> Vec<HighlightSpan> {
+    highlight(json_highlighter(), source)
+}
+
+fn highlight(hl: &Highlighter, source: &str) -> Vec<HighlightSpan> {
     let Some(tree) = PARSER.with_borrow_mut(|parser| {
-        let parser = parser.get_or_insert_with(|| {
-            let mut p = Parser::new();
-            p.set_language(&tree_sitter_sequel::LANGUAGE.into()).expect("tree-sitter-sql ABI must be supported");
-            p
-        });
+        parser.set_language(&hl.language).expect("tree-sitter grammar ABI must be supported");
         parser.parse(source, None)
     }) else {
         return Vec::new();
@@ -194,6 +224,38 @@ mod tests {
         assert!(spans.windows(2).all(|w| w[0].start <= w[1].start));
         assert!(spans.iter().all(|s| sql.is_char_boundary(s.start) && sql.is_char_boundary(s.end)));
         assert!(kinds(sql).contains(&("3.14", Number)));
+    }
+
+    fn json_kinds(json: &str) -> Vec<(&str, HighlightKind)> {
+        highlight_json(json).into_iter().map(|s| (&json[s.start..s.end], s.kind)).collect()
+    }
+
+    #[test]
+    fn highlights_json_keys_and_values() {
+        let k = json_kinds(r#"{"id": "21", "n": -1.5e3, "ok": true, "x": null, "tags": ["ñandú 🐻"]}"#);
+        assert!(k.contains(&(r#""id""#, Field)), "{k:?}");
+        assert!(!k.contains(&(r#""id""#, String)));
+        assert!(k.contains(&(r#""21""#, String)));
+        assert!(k.contains(&("-1.5e3", Number)));
+        assert!(k.contains(&("true", Constant)));
+        assert!(k.contains(&("null", Constant)));
+        assert!(k.contains(&(r#""ñandú 🐻""#, String)));
+        assert!(k.contains(&("{", Punctuation)));
+        assert!(k.contains(&(":", Punctuation)));
+    }
+
+    #[test]
+    fn broken_json_still_highlights() {
+        let k = json_kinds(r#"{"a": 1, "b": "#);
+        assert!(k.contains(&(r#""a""#, Field)), "{k:?}");
+        assert!(k.contains(&("1", Number)));
+    }
+
+    #[test]
+    fn sql_and_json_share_a_thread() {
+        assert!(kinds("select 1").contains(&("select", Keyword)));
+        assert!(json_kinds("[1]").contains(&("1", Number)));
+        assert!(kinds("select 1").contains(&("select", Keyword)));
     }
 
     #[test]

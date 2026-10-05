@@ -47,9 +47,10 @@ base64 = "0.22"
 # Dumps: gzip with the pure-Rust miniz_oxide backend (no zlib/cmake); `Bytes` for Postgres COPY FROM
 flate2 = "1.1"
 bytes = "1"
-# SQL syntax highlighting (grammar: github.com/DerekStride/tree-sitter-sql)
+# SQL syntax highlighting (grammar: github.com/DerekStride/tree-sitter-sql) and JSON for the inspector
 tree-sitter = "0.27"
 tree-sitter-sequel = "0.3"
+tree-sitter-json = "0.24"
 
 [profile.release]
 lto = "thin"

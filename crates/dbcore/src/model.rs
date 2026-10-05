@@ -121,7 +121,7 @@ impl ConnectionConfig {
         let database = self.database.trim();
         let host = self.host.trim();
         match self.kind {
-            DatabaseKind::Sqlite => database.rsplit('/').next().unwrap_or_default().to_string(),
+            DatabaseKind::Sqlite => crate::paths::file_name(database).to_string(),
             // `mydb-org.aws-us-east-1.turso.io` → `mydb-org`.
             DatabaseKind::Libsql => host.split('.').next().unwrap_or_default().to_string(),
             _ if !database.is_empty() => database.to_string(),

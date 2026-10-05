@@ -49,7 +49,7 @@ fn storage(path: &Path, e: impl std::fmt::Display) -> Error {
     Error::Storage(format!("{}: {e}", path.display()))
 }
 
-/// `~/Library/Application Support/dbear/dbear.db` on macOS,
+/// `~/Library/Application Support/dbear/dbear.db` on macOS, `%APPDATA%\dbear\dbear.db` on Windows,
 /// `$XDG_CONFIG_HOME/dbear/dbear.db` (or `~/.config/…`) elsewhere.
 pub fn default_path() -> Option<PathBuf> {
     Some(config_dir("dbear")?.join(DATABASE_FILE))
@@ -59,16 +59,7 @@ pub fn default_path() -> Option<PathBuf> {
 const LEGACY_DIR_NAME: &str = if cfg!(target_os = "macos") { "DBGui" } else { "dbgui" };
 
 fn config_dir(name: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let base = if cfg!(target_os = "macos") {
-        home?.join("Library/Application Support")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| home.map(|h| h.join(".config")))?
-    };
-    Some(base.join(name))
+    Some(crate::paths::app_data_dir()?.join(name))
 }
 
 /// Moves `legacy` to `current` when only the legacy folder exists. Best effort: on failure the
@@ -562,6 +553,7 @@ mod tests {
     fn default_path_is_platform_specific() {
         let p = default_path().unwrap();
         assert!(p.ends_with(DATABASE_FILE));
+        assert!(p.parent().unwrap().ends_with("dbear"));
         if cfg!(target_os = "macos") {
             assert!(p.to_string_lossy().contains("Library/Application Support/dbear"));
         }
