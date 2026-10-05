@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+use crate::access::{Grant, Role, RoleRef};
+
 use crate::edit::EditStatement;
 use crate::keyset::{PageCursor, RowPage};
 use crate::model::{ConnectionConfig, QueryResult, RowQuery, Schema, TableColumns, TableInfo, TableStructure};
@@ -73,5 +75,14 @@ pub trait Driver: Send + Sync + 'static {
     async fn apply(&self, statements: &[EditStatement]) -> Result<u64> {
         let _ = statements;
         Err(Error::Unsupported("this connection is read-only".into()))
+    }
+    /// Users and roles on the server, system ones included (`Role::is_system`). See [`crate::access`].
+    async fn list_roles(&self) -> Result<Vec<Role>> {
+        Err(Error::Unsupported(format!("{} has no users to manage here", self.config().kind.display_name())))
+    }
+    /// Privileges granted directly to `role` (not inherited). Postgres: in the current database.
+    async fn list_grants(&self, role: &RoleRef) -> Result<Vec<Grant>> {
+        let _ = role;
+        Err(Error::Unsupported(format!("{} has no users to manage here", self.config().kind.display_name())))
     }
 }

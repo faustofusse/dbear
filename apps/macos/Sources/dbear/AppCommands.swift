@@ -42,6 +42,9 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("e", modifiers: [.command, .shift])
             .disabled(model.selectedConnection == nil)
+            Button("Users & Roles") { model.openUsers() }
+                .keyboardShortcut("u", modifiers: [.command, .shift])
+                .disabled(!(model.selectedConnection.map(model.canManageUsers) ?? false))
             #if DEBUG
             Button("Add Sample Connections") { model.addSampleConnections() }
             #endif

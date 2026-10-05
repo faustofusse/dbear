@@ -192,11 +192,13 @@ final class ScriptTab: Identifiable {
 enum WorkspaceTab: Identifiable {
     case table(TableTab)
     case script(ScriptTab)
+    case users(UsersTab)
 
     nonisolated var id: UUID {
         switch self {
         case .table(let t): t.id
         case .script(let s): s.id
+        case .users(let u): u.id
         }
     }
 
@@ -204,6 +206,7 @@ enum WorkspaceTab: Identifiable {
         switch self {
         case .table(let t): t.connection
         case .script(let s): s.connection
+        case .users(let u): u.connection
         }
     }
 
@@ -211,6 +214,7 @@ enum WorkspaceTab: Identifiable {
         switch self {
         case .table(let t): t.filterLabel.map { "\(t.table.name) \u{B7} \($0)" } ?? t.table.name
         case .script(let s): s.title
+        case .users: "Users & Roles"
         }
     }
 
@@ -219,6 +223,7 @@ enum WorkspaceTab: Identifiable {
         case .table(let t) where t.filter != nil: "line.3.horizontal.decrease"
         case .table(let t): t.table.kind == .view ? "eye" : "tablecells"
         case .script: "chevron.left.forwardslash.chevron.right"
+        case .users: "person.2"
         }
     }
 
@@ -427,7 +432,7 @@ final class AppModel {
     /// The driver for a connection, created on first use with the latest saved settings
     /// and the password from the Keychain (read only now, so browsing never prompts).
     /// `config.database` picks which database on the server (each gets its own driver).
-    private func driver(for config: ConnectionConfig) -> any DatabaseDriver {
+    func driver(for config: ConnectionConfig) -> any DatabaseDriver {
         if let d = drivers[config.driverKey] { return d }
         var current = connections.first { $0.id == config.id }.map { $0.withDatabase(config.database) } ?? config
         if current.password == nil { current.password = secrets.password(for: config.id) }
@@ -825,6 +830,7 @@ final class AppModel {
             guard confirmDiscardingEdits(in: t) else { return }
             await load(t)
         case .script(let s): await run(s)
+        case .users(let u): await loadRoles(u)
         case nil: break
         }
     }

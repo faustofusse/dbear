@@ -553,3 +553,64 @@ fn follows_a_foreign_key_to_its_row() {
     assert!(!their_orders.rows.is_empty());
     assert!(column(&their_orders, "user_id").iter().all(|v| **v == user_id));
 }
+
+#[test]
+fn creates_grants_and_drops_a_role() {
+    use dbcore::access::{AccessChange, GrantObject, PrivilegeSet, RoleRef, RoleSpec};
+    if !enabled() {
+        return;
+    }
+    let conn = dev();
+    let name = "dbear_test_access";
+    let me = RoleRef::new(name, None);
+    block_on(conn.execute(format!("drop role if exists {name}"))).unwrap();
+    block_on(conn.execute("drop role if exists dbear_test_readers; create role dbear_test_readers".into())).unwrap();
+
+    let spec = RoleSpec {
+        name: name.into(),
+        password: Some("s3cret pass".into()),
+        can_login: true,
+        connection_limit: Some(4),
+        member_of: vec![RoleRef::new("dbear_test_readers", None)],
+        ..Default::default()
+    };
+    block_on(conn.apply_access(AccessChange::CreateRole(spec.clone()))).unwrap();
+    let roles = block_on(conn.list_roles()).unwrap();
+    let role = roles.iter().find(|r| r.name == name).expect("created").clone();
+    assert!(role.can_login && !role.is_superuser && !role.is_system);
+    assert_eq!(role.connection_limit, Some(4));
+    assert_eq!(role.member_of, vec![RoleRef::new("dbear_test_readers", None)]);
+    assert!(roles.iter().any(|r| r.name == "pg_read_all_data" && r.is_system));
+
+    let set = |p: &[&str], g: bool| PrivilegeSet { privileges: p.iter().map(|s| s.to_string()).collect(), grantable: g };
+    let grant = |object: GrantObject, before: PrivilegeSet, after: PrivilegeSet| {
+        block_on(conn.apply_access(AccessChange::SetPrivileges { role: me.clone(), object, before, after })).unwrap()
+    };
+    grant(GrantObject::Database { name: "app_dev".into() }, set(&[], false), set(&["CONNECT"], false));
+    grant(GrantObject::Schema { name: "public".into() }, set(&[], false), set(&["USAGE"], false));
+    let users = GrantObject::Table { schema: "public".into(), name: "users".into() };
+    grant(users.clone(), set(&[], false), set(&["SELECT", "UPDATE"], true));
+    let grants = block_on(conn.list_grants(me.clone())).unwrap();
+    let grouped = dbcore::access::group_grants(&grants);
+    assert!(grouped.contains(&(GrantObject::Database { name: "app_dev".into() }, set(&["CONNECT"], false))), "{grouped:?}");
+    assert!(grouped.contains(&(users.clone(), set(&["SELECT", "UPDATE"], true))), "{grouped:?}");
+
+    // The new login works and sees what it was granted.
+    let mut login = dev_config();
+    login.user = Some(name.into());
+    login.password = Some("s3cret pass".into());
+    let result = block_on(Connection::new(login).execute("select count(*) > 0 from public.users".into())).unwrap();
+    assert_eq!(result.rows[0][0], Value::Bool(true));
+
+    // Revoke one, rename, then drop (privileges must go first).
+    grant(users.clone(), set(&["SELECT", "UPDATE"], true), set(&["SELECT"], false));
+    let grouped = dbcore::access::group_grants(&block_on(conn.list_grants(me.clone())).unwrap());
+    assert!(grouped.contains(&(users.clone(), set(&["SELECT"], false))), "{grouped:?}");
+    let renamed = RoleSpec { name: format!("{name}_2"), member_of: vec![], ..spec };
+    block_on(conn.apply_access(AccessChange::AlterRole { role, spec: renamed })).unwrap();
+    let role = block_on(conn.list_roles()).unwrap().into_iter().find(|r| r.name == format!("{name}_2")).expect("renamed");
+    assert!(role.member_of.is_empty());
+    let err = block_on(conn.apply_access(AccessChange::DropRole(role.reference()))).unwrap_err();
+    assert!(err.to_string().contains("depend"), "{err}");
+    block_on(conn.execute(format!("drop owned by {name}_2; drop role {name}_2; drop role dbear_test_readers"))).unwrap();
+}

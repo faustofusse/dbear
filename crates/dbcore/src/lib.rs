@@ -4,6 +4,7 @@
 //! - The GPUI (Linux) app depends on this crate directly.
 //! - The SwiftUI (macOS) app uses it through `dbcore-ffi` (UniFFI).
 
+pub mod access;
 mod config;
 mod connection;
 pub mod complete;

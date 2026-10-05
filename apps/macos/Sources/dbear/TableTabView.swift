@@ -551,7 +551,7 @@ private struct Code: View {
 // MARK: - DDL
 
 /// The table's CREATE statement, highlighted like the editor, with a copy button.
-private struct DDLView: View {
+struct DDLView: View {
     let sql: String
     let fontSize: CGFloat
     @State private var copied = false

@@ -103,6 +103,12 @@ cargo test -p dbcore              # core (Postgres tests skip without a database
   table or `INSERT`s (`dbcore::export::format_rows`). The inspector (⌥⌘I) shows the focused value in
   full, with JSON pretty-printed (`export::pretty_json` keeps key order and digits), and edits it
   for editable tables.
+- **Users & Roles** (⇧⌘U, or the connection's context menu), for Postgres and MySQL: list roles and
+  accounts, create, edit (password, login, superuser, limits, memberships) and drop them, and grant or
+  revoke privileges on databases, schemas, tables, sequences and `ALL TABLES IN SCHEMA` (MySQL:
+  `*.*`, `db.*`, tables). `dbcore::access` generates the SQL, shown with passwords masked before it
+  runs; it runs in one transaction where the database allows (Postgres). Postgres privileges are
+  listed for the connection's current database. Only direct grants are listed; inherited ones aren't.
 - Turso / libSQL connections (`libsql://db-org.turso.io?authToken=…`) speak Hrana 3 over HTTP
   (`dbcore::libsql`, reqwest + rustls/ring, no libSQL C library). The auth token is stored in the
   keychain like a password. Each call runs on its own short-lived stream, so a transaction a script

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 uniffi::setup_scaffolding!();
 
+mod access;
 mod dump;
 mod import;
 

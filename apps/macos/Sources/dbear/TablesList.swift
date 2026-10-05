@@ -53,6 +53,10 @@ struct TablesList: View {
                             Divider()
                             Button("Dump Database…") { model.requestDump(of: connection) }
                             Button("Restore from File…") { model.requestRestore(into: connection) }
+                            if model.canManageUsers(connection) {
+                                Divider()
+                                Button("Users & Roles") { model.openUsers() }
+                            }
                         }
                         // A single MySQL database has no sections to fold.
                         if singleDatabase(in: model.schemas.value ?? []) == nil {

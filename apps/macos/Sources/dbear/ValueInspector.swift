@@ -24,7 +24,7 @@ extension AppModel {
         switch activeTab {
         case .table(let tab): inspected(tab)
         case .script(let tab): inspected(tab)
-        case nil: nil
+        case .users, nil: nil
         }
     }
 

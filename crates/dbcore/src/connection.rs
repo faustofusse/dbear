@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+use crate::access::{self, AccessChange, AccessStatement, Grant, Role, RoleRef};
 use crate::driver::{Driver, Error, Result};
 use crate::dialect::normalize_filter;
 use crate::edit::{self, EditStatement, RowChange};
@@ -170,6 +171,46 @@ impl Connection {
     pub async fn execute_limited(&self, sql: String, max_rows: Option<u32>) -> Result<QueryResult> {
         let d = self.driver.clone();
         on_runtime(async move { d.execute(&sql, max_rows).await }).await
+    }
+
+    /// Users and roles on the server (see [`crate::access`]).
+    pub async fn list_roles(&self) -> Result<Vec<Role>> {
+        let d = self.driver.clone();
+        on_runtime(async move { d.list_roles().await }).await
+    }
+
+    /// Privileges granted directly to `role` (Postgres: in this connection's database).
+    pub async fn list_grants(&self, role: RoleRef) -> Result<Vec<Grant>> {
+        let d = self.driver.clone();
+        on_runtime(async move { d.list_grants(&role).await }).await
+    }
+
+    /// The statements `apply_access` would run (passwords masked in `display`).
+    pub fn preview_access(&self, change: &AccessChange) -> Result<Vec<AccessStatement>> {
+        access::statements(self.config().kind, change)
+    }
+
+    /// Creates, changes or drops a role, or changes its privileges. Runs in one transaction where the
+    /// database allows it (Postgres); MySQL commits each account statement as it goes.
+    pub async fn apply_access(&self, change: AccessChange) -> Result<()> {
+        let kind = self.config().kind;
+        let statements: Vec<EditStatement> = self
+            .preview_access(&change)?
+            .into_iter()
+            .map(|s| EditStatement { sql: s.sql, expect_one_row: false, target: s.display })
+            .collect();
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let d = self.driver.clone();
+        on_runtime(async move { d.apply(&statements).await }).await.map(|_| ()).map_err(|e| match e {
+            // Account statements commit implicitly in MySQL: earlier ones stay applied.
+            Error::Query(m) if kind == DatabaseKind::Mysql => Error::Query(m.replace(
+                "Nothing was saved.",
+                "Statements before it were applied (MySQL commits account changes immediately).",
+            )),
+            other => other,
+        })
     }
 
     /// Cancels the running [`Connection::execute`], which then fails with [`Error::Cancelled`].

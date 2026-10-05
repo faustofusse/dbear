@@ -19,6 +19,7 @@ use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::dialect::{error_chain, line_column, Dialect};
+use crate::access::{self, Grant, Role, RoleRef};
 use crate::driver::{Driver, Error, Result};
 use crate::edit::{self, EditStatement};
 use crate::keyset::{page_sql, CursorValue, Keyset, PageCursor, RowPage, SeekColumn, Start};
@@ -355,6 +356,86 @@ impl Driver for PostgresDriver {
         if let Some(token) = self.query.cancel_token().await {
             let _ = send_cancel(token, self.config.ssl_mode).await;
         }
+    }
+
+    async fn list_roles(&self) -> Result<Vec<Role>> {
+        let client = self.browse_client().await?;
+        let rows = client
+            .query(
+                r"
+                select r.rolname::text, r.rolcanlogin, r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolconnlimit,
+                       case when r.rolvaliduntil is null or r.rolvaliduntil = 'infinity' then null else r.rolvaliduntil::text end,
+                       r.rolname ~ '^pg_',
+                       array(select b.rolname::text from pg_auth_members m join pg_roles b on b.oid = m.roleid
+                             where m.member = r.oid order by 1),
+                       shobj_description(r.oid, 'pg_authid')
+                from pg_roles r
+                order by r.rolname
+                ",
+                &[],
+            )
+            .await
+            .map_err(|e| query_error(&e, None))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let limit: i32 = r.get(5);
+                let member_of: Vec<String> = r.get(8);
+                Role {
+                    name: r.get(0),
+                    host: None,
+                    can_login: r.get(1),
+                    is_superuser: r.get(2),
+                    can_create_db: r.get(3),
+                    can_create_role: r.get(4),
+                    connection_limit: u32::try_from(limit).ok(),
+                    valid_until: r.get(6),
+                    is_system: r.get(7),
+                    member_of: member_of.into_iter().map(|m| RoleRef::new(m, None)).collect(),
+                    comment: r.get(9),
+                }
+            })
+            .collect())
+    }
+
+    async fn list_grants(&self, role: &RoleRef) -> Result<Vec<Grant>> {
+        let client = self.browse_client().await?;
+        // Explicit ACL entries only: an object nobody granted anything on has a NULL ACL (owner's defaults).
+        let rows = client
+            .query(
+                r"
+                with acl as (
+                    select 'database' as kind, null::text as schema, d.datname::text as name, a.privilege_type, a.is_grantable, a.grantee
+                    from pg_database d, aclexplode(d.datacl) a
+                    where d.datname = current_database()
+                    union all
+                    select 'schema', null, n.nspname::text, a.privilege_type, a.is_grantable, a.grantee
+                    from pg_namespace n, aclexplode(n.nspacl) a
+                    where n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+                    union all
+                    select case c.relkind when 'S' then 'sequence' else 'table' end, n.nspname::text, c.relname::text,
+                           a.privilege_type, a.is_grantable, a.grantee
+                    from pg_class c join pg_namespace n on n.oid = c.relnamespace, aclexplode(c.relacl) a
+                    where c.relkind in ('r', 'p', 'v', 'm', 'f', 'S')
+                      and n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+                )
+                select kind, schema, name, privilege_type::text, bool_or(is_grantable)
+                from acl
+                where grantee = (select oid from pg_roles where rolname = $1)
+                group by 1, 2, 3, 4
+                order by 1, 2, 3, 4
+                ",
+                &[&role.name],
+            )
+            .await
+            .map_err(|e| query_error(&e, None))?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let object = access::object_from_catalog(r.get(0), r.get(1), r.get(2))?;
+                Some(Grant { object, privilege: r.get(3), grantable: r.get(4) })
+            })
+            .collect())
     }
 }
 

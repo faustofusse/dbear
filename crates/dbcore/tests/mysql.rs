@@ -366,3 +366,51 @@ fn browses_one_database_and_lists_the_others() {
     assert_eq!(count.rows[0][0], Value::Int(250));
     assert!(dev_config().supports_multiple_databases());
 }
+
+#[test]
+fn creates_grants_and_drops_an_account() {
+    use dbcore::access::{AccessChange, GrantObject, PrivilegeSet, RoleRef, RoleSpec};
+    if !enabled() {
+        return;
+    }
+    let conn = dev();
+    let me = RoleRef::new("dbear_test_access", Some("%".into()));
+    let reader = RoleRef::new("dbear_test_reader", Some("%".into()));
+    block_on(conn.execute("drop user if exists 'dbear_test_access'@'%', 'dbear_test_reader'@'%'".into())).unwrap();
+    let group = RoleSpec { name: reader.name.clone(), can_login: false, ..Default::default() };
+    block_on(conn.apply_access(AccessChange::CreateRole(group))).unwrap();
+    let spec = RoleSpec {
+        name: me.name.clone(),
+        host: me.host.clone(),
+        password: Some("s3cret".into()),
+        can_login: true,
+        connection_limit: Some(7),
+        member_of: vec![reader.clone()],
+        ..Default::default()
+    };
+    block_on(conn.apply_access(AccessChange::CreateRole(spec))).unwrap();
+    let roles = block_on(conn.list_roles()).unwrap();
+    let role = roles.iter().find(|r| r.reference() == me).expect("created").clone();
+    assert!(role.can_login);
+    assert_eq!(role.connection_limit, Some(7));
+    assert_eq!(role.member_of, vec![reader.clone()]);
+    assert!(!roles.iter().find(|r| r.reference() == reader).unwrap().can_login);
+    assert!(roles.iter().any(|r| r.is_system));
+
+    let set = |p: &[&str], g: bool| PrivilegeSet { privileges: p.iter().map(|s| s.to_string()).collect(), grantable: g };
+    let change = |object: GrantObject, before, after| {
+        block_on(conn.apply_access(AccessChange::SetPrivileges { role: me.clone(), object, before, after })).unwrap()
+    };
+    change(GrantObject::Database { name: "shop".into() }, set(&[], false), set(&["SELECT", "INSERT"], true));
+    change(GrantObject::Server, set(&[], false), set(&["PROCESS"], false));
+    let grouped = dbcore::access::group_grants(&block_on(conn.list_grants(me.clone())).unwrap());
+    assert!(grouped.contains(&(GrantObject::Server, set(&["PROCESS"], false))), "{grouped:?}");
+    assert!(grouped.contains(&(GrantObject::Database { name: "shop".into() }, set(&["INSERT", "SELECT"], true))), "{grouped:?}");
+    change(GrantObject::Database { name: "shop".into() }, set(&["INSERT", "SELECT"], true), set(&["SELECT"], false));
+    let grouped = dbcore::access::group_grants(&block_on(conn.list_grants(me.clone())).unwrap());
+    assert!(grouped.contains(&(GrantObject::Database { name: "shop".into() }, set(&["SELECT"], false))), "{grouped:?}");
+
+    block_on(conn.apply_access(AccessChange::DropRole(me.clone()))).unwrap();
+    block_on(conn.apply_access(AccessChange::DropRole(reader))).unwrap();
+    assert!(!block_on(conn.list_roles()).unwrap().iter().any(|r| r.reference() == me));
+}

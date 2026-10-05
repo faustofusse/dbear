@@ -92,6 +92,12 @@ struct ConnectionsSidebar: View {
         Divider()
         Button("Dump Database…") { model.requestDump(of: connection) }
         Button("Restore from File…") { model.requestRestore(into: connection) }
+        if model.canManageUsers(connection) {
+            Button("Users & Roles") {
+                model.select(connection.id)
+                model.openUsers()
+            }
+        }
         Divider()
         Button("Edit…") { model.edit(connection) }
         Button("Duplicate") { model.duplicate(connection) }

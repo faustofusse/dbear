@@ -53,6 +53,14 @@ public protocol DatabaseDriver: Sendable {
     func execute(_ sql: String, maxRows: Int?) async throws -> QueryResult
     /// Stops the running `execute`, which then throws `DatabaseError.cancelled`.
     func cancel() async
+    /// Users and roles on the server, system ones included (see `Access.features`).
+    func listRoles() async throws -> [Role]
+    /// Privileges granted directly to `role`, grouped by object (Postgres: in this database).
+    func listGrants(of role: RoleRef) async throws -> [ObjectPrivileges]
+    /// The SQL `applyAccess` would run (passwords masked in `display`).
+    func previewAccess(_ change: AccessChange) throws -> [AccessStatement]
+    /// Creates, changes or drops a role, or changes its privileges.
+    func applyAccess(_ change: AccessChange) async throws
 }
 
 extension DatabaseDriver {

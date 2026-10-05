@@ -19,6 +19,7 @@ use mysql_async::{Column, Conn, Opts, OptsBuilder, SslOpts};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::dialect::{error_chain, hex_preview, Dialect};
+use crate::access::{self, Grant, Role, RoleRef};
 use crate::driver::{Driver, Error, Result};
 use crate::edit::{self, EditStatement};
 use crate::keyset::{page_sql, CursorValue, Keyset, PageCursor, RowPage, SeekColumn, Start};
@@ -389,6 +390,85 @@ impl Driver for MysqlDriver {
         }
         self.cancelled.store(true, Ordering::SeqCst);
         let _ = kill_query(&self.config, thread_id).await;
+    }
+
+    async fn list_roles(&self) -> Result<Vec<Role>> {
+        let mut lease = self.browse.lease(&self.config).await?;
+        // MariaDB's `mysql.user` has no `account_locked` before 10.4: fall back to "not locked".
+        let queries = [
+            "select User, Host, account_locked, Super_priv, max_user_connections from mysql.user order by User, Host",
+            "select User, Host, 'N', Super_priv, max_user_connections from mysql.user order by User, Host",
+        ];
+        let mut accounts = Vec::new();
+        for (i, sql) in queries.iter().enumerate() {
+            let result = lease.conn().query::<(String, String, String, String, u64), _>(*sql).await;
+            match lease.check(result) {
+                Ok(rows) => {
+                    accounts = rows;
+                    break;
+                }
+                Err(e) if i == queries.len() - 1 => return Err(query_error(&e)),
+                Err(_) => {}
+            }
+        }
+        // Role grants (MySQL 8); missing elsewhere, then nobody is a member of anything.
+        let result = lease
+            .conn()
+            .query::<(String, String, String, String), _>("select FROM_USER, FROM_HOST, TO_USER, TO_HOST from mysql.role_edges")
+            .await;
+        let edges = lease.check(result).unwrap_or_default();
+        Ok(accounts
+            .into_iter()
+            .map(|(name, host, locked, super_priv, max_connections)| {
+                let member_of = edges
+                    .iter()
+                    .filter(|(_, _, to_user, to_host)| *to_user == name && *to_host == host)
+                    .map(|(user, host, _, _)| RoleRef::new(user, Some(host.clone())))
+                    .collect();
+                Role {
+                    is_system: name.starts_with("mysql."),
+                    can_login: !locked.eq_ignore_ascii_case("Y"),
+                    is_superuser: super_priv.eq_ignore_ascii_case("Y"),
+                    can_create_db: false,
+                    can_create_role: false,
+                    connection_limit: u32::try_from(max_connections).ok().filter(|&n| n > 0),
+                    valid_until: None,
+                    member_of,
+                    comment: None,
+                    name,
+                    host: Some(host),
+                }
+            })
+            .collect())
+    }
+
+    async fn list_grants(&self, role: &RoleRef) -> Result<Vec<Grant>> {
+        // information_schema spells grantees `'user'@'host'`.
+        let account = format!("'{}'@'{}'", role.name.replace('\'', "''"), role.host.as_deref().unwrap_or("%").replace('\'', "''"));
+        let grantee = MYSQL.quote_literal(&account);
+        // `USAGE` means "no privileges" and isn't a grant to show.
+        let sql = format!(
+            "select 'server', null, null, privilege_type, is_grantable from information_schema.user_privileges
+               where grantee = {grantee} and privilege_type <> 'USAGE'
+             union all
+             select 'database', null, table_schema, privilege_type, is_grantable from information_schema.schema_privileges
+               where grantee = {grantee}
+             union all
+             select 'table', table_schema, table_name, privilege_type, is_grantable from information_schema.table_privileges
+               where grantee = {grantee}"
+        );
+        let mut lease = self.browse.lease(&self.config).await?;
+        let result = lease.conn().query::<(String, Option<String>, Option<String>, String, String), _>(sql).await;
+        let rows = lease.check(result).map_err(|e| query_error(&e))?;
+        let mut grants: Vec<Grant> = rows
+            .into_iter()
+            .filter_map(|(kind, schema, name, privilege, grantable)| {
+                let object = access::object_from_catalog(&kind, schema, name)?;
+                Some(Grant { object, privilege, grantable: grantable.eq_ignore_ascii_case("YES") })
+            })
+            .collect();
+        grants.sort();
+        Ok(grants)
     }
 }
 

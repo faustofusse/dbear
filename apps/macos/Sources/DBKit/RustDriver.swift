@@ -94,6 +94,30 @@ final class RustDriver: DatabaseDriver {
         await connection.cancel()
     }
 
+    func listRoles() async throws -> [Role] {
+        try await bridged { try await connection.listRoles() }.map(Role.init)
+    }
+
+    func listGrants(of role: RoleRef) async throws -> [ObjectPrivileges] {
+        let grants = try await bridged { try await connection.listGrants(role: DBCoreFFI.RoleRef(role)) }
+        return DBCoreFFI.groupGrants(grants: grants).map {
+            ObjectPrivileges(object: GrantObject($0.object), privileges: PrivilegeSet($0.privileges))
+        }
+    }
+
+    func previewAccess(_ change: AccessChange) throws -> [AccessStatement] {
+        do {
+            return try connection.previewAccess(change: DBCoreFFI.AccessChange(change))
+                .map { AccessStatement(sql: $0.sql, display: $0.display) }
+        } catch let error as DBCoreFFI.DbError {
+            throw DatabaseError(error)
+        }
+    }
+
+    func applyAccess(_ change: AccessChange) async throws {
+        try await bridged { try await connection.applyAccess(change: DBCoreFFI.AccessChange(change)) }
+    }
+
     /// Rethrows core errors as `DatabaseError`.
     private func bridged<T>(_ body: () async throws -> T) async throws -> T {
         do {
@@ -521,5 +545,138 @@ public enum RowFormatter {
     /// A JSON object or array re-indented for reading (key order and digits kept), else `nil`.
     public static func prettyJSON(_ text: String) -> String? {
         DBCoreFFI.prettyJson(text: text)
+    }
+}
+
+// MARK: - Users & privileges
+
+extension Access {
+    /// What can be managed on `kind`; `nil` if users can't be managed there.
+    public static func features(_ kind: DatabaseKind) -> AccessFeatures? {
+        DBCoreFFI.accessFeatures(kind: DBCoreFFI.DatabaseKind(kind)).map {
+            AccessFeatures(
+                hosts: $0.hosts, superuser: $0.superuser, createDB: $0.createDb, createRole: $0.createRole,
+                validUntil: $0.validUntil, connectionLimit: $0.connectionLimit, membership: $0.membership,
+                grantsPerDatabase: $0.grantsPerDatabase, objectKinds: $0.objectKinds.map(GrantObjectKind.init))
+        }
+    }
+
+    /// The privileges that exist on `object` in `kind`, in display order.
+    public static func privileges(_ kind: DatabaseKind, on object: GrantObjectKind) -> [String] {
+        DBCoreFFI.accessPrivileges(kind: DBCoreFFI.DatabaseKind(kind), object: DBCoreFFI.GrantObjectKind(object))
+    }
+}
+
+extension RoleRef {
+    init(_ r: DBCoreFFI.RoleRef) { self.init(name: r.name, host: r.host) }
+}
+
+extension DBCoreFFI.RoleRef {
+    init(_ r: RoleRef) { self.init(name: r.name, host: r.host) }
+}
+
+extension Role {
+    init(_ r: DBCoreFFI.Role) {
+        self.init(
+            name: r.name, host: r.host, canLogin: r.canLogin, isSuperuser: r.isSuperuser, canCreateDB: r.canCreateDb,
+            canCreateRole: r.canCreateRole, isSystem: r.isSystem, connectionLimit: r.connectionLimit.map(Int.init),
+            validUntil: r.validUntil, memberOf: r.memberOf.map(RoleRef.init), comment: r.comment)
+    }
+}
+
+extension DBCoreFFI.Role {
+    init(_ r: Role) {
+        self.init(
+            name: r.name, host: r.host, canLogin: r.canLogin, isSuperuser: r.isSuperuser, canCreateDb: r.canCreateDB,
+            canCreateRole: r.canCreateRole, isSystem: r.isSystem, connectionLimit: r.connectionLimit.map { UInt32(clamping: $0) },
+            validUntil: r.validUntil, memberOf: r.memberOf.map(DBCoreFFI.RoleRef.init), comment: r.comment)
+    }
+}
+
+extension DBCoreFFI.RoleSpec {
+    init(_ s: RoleSpec) {
+        self.init(
+            name: s.name, host: s.host, password: s.password.isEmpty ? nil : s.password, canLogin: s.canLogin,
+            isSuperuser: s.isSuperuser, canCreateDb: s.canCreateDB, canCreateRole: s.canCreateRole,
+            connectionLimit: s.connectionLimit.map { UInt32(clamping: $0) }, validUntil: s.validUntil,
+            memberOf: s.memberOf.map(DBCoreFFI.RoleRef.init))
+    }
+}
+
+extension GrantObjectKind {
+    init(_ k: DBCoreFFI.GrantObjectKind) {
+        self = switch k {
+        case .server: .server
+        case .database: .database
+        case .schema: .schema
+        case .table: .table
+        case .sequence: .sequence
+        case .allTables: .allTables
+        case .allSequences: .allSequences
+        }
+    }
+}
+
+extension DBCoreFFI.GrantObjectKind {
+    init(_ k: GrantObjectKind) {
+        self = switch k {
+        case .server: .server
+        case .database: .database
+        case .schema: .schema
+        case .table: .table
+        case .sequence: .sequence
+        case .allTables: .allTables
+        case .allSequences: .allSequences
+        }
+    }
+}
+
+extension GrantObject {
+    init(_ o: DBCoreFFI.GrantObject) {
+        self = switch o {
+        case .server: .server
+        case .database(let name): .database(name)
+        case .schema(let name): .schema(name)
+        case .table(let schema, let name): .table(schema: schema, name: name)
+        case .sequence(let schema, let name): .sequence(schema: schema, name: name)
+        case .allTables(let schema): .allTables(schema: schema)
+        case .allSequences(let schema): .allSequences(schema: schema)
+        }
+    }
+}
+
+extension DBCoreFFI.GrantObject {
+    init(_ o: GrantObject) {
+        self = switch o {
+        case .server: .server
+        case .database(let name): .database(name: name)
+        case .schema(let name): .schema(name: name)
+        case .table(let schema, let name): .table(schema: schema, name: name)
+        case .sequence(let schema, let name): .sequence(schema: schema, name: name)
+        case .allTables(let schema): .allTables(schema: schema)
+        case .allSequences(let schema): .allSequences(schema: schema)
+        }
+    }
+}
+
+extension PrivilegeSet {
+    init(_ s: DBCoreFFI.PrivilegeSet) { self.init(privileges: s.privileges, grantable: s.grantable) }
+}
+
+extension DBCoreFFI.PrivilegeSet {
+    init(_ s: PrivilegeSet) { self.init(privileges: s.privileges, grantable: s.grantable) }
+}
+
+extension DBCoreFFI.AccessChange {
+    init(_ c: AccessChange) {
+        self = switch c {
+        case .createRole(let spec): .createRole(spec: DBCoreFFI.RoleSpec(spec))
+        case .alterRole(let role, let spec): .alterRole(role: DBCoreFFI.Role(role), spec: DBCoreFFI.RoleSpec(spec))
+        case .dropRole(let role): .dropRole(role: DBCoreFFI.RoleRef(role))
+        case .setPrivileges(let role, let object, let before, let after):
+            .setPrivileges(
+                role: DBCoreFFI.RoleRef(role), object: DBCoreFFI.GrantObject(object),
+                before: DBCoreFFI.PrivilegeSet(before), after: DBCoreFFI.PrivilegeSet(after))
+        }
     }
 }
