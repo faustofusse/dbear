@@ -3,6 +3,8 @@
 - Database logic (drivers, decoding, SQL, connection storage, URL parsing) belongs in `crates/dbcore`. It has no FFI or UI deps.
 - `crates/dbcore-ffi` is the only FFI surface. Only `apps/macos/Sources/DBKit/RustDriver.swift` imports `DBCoreFFI`.
 - Rows cross the FFI boundary in pages (`QueryResult`), never one cell at a time.
+- Passwords never touch disk. `dbcore::secrets` keeps them in the OS store (feature `os-keyring`: Keychain, Secret Service, Credential Manager), using service `ar.fausto.dbear.connection` and the connection id as the account. The macOS app has its own Swift Keychain code with the same service and account, so the two share entries.
+- Platform folders come from `dbcore::paths`. Don't read `HOME` directly; the core also builds for Windows.
 - After changing `crates/`, run `./scripts/build-core.sh` (`bundle-mac.sh` runs it for you). `Sources/DBCoreFFI` and `Frameworks/` are generated.
 - Check work with `cargo test -p dbcore`, `./scripts/test-postgres.sh` and `(cd apps/macos && swift test)`.
 - Dev DB: `./scripts/dev-db.sh up|down|reset|psql`. Seed is in `dev/postgres/init.sql`.

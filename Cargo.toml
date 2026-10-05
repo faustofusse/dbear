@@ -51,6 +51,11 @@ bytes = "1"
 tree-sitter = "0.27"
 tree-sitter-sequel = "0.3"
 tree-sitter-json = "0.24"
+# OS credential stores (dbcore's `os-keyring` feature; the macOS app uses its own Swift Keychain code).
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+windows-native-keyring-store = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [profile.release]
 lto = "thin"

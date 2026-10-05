@@ -34,6 +34,25 @@ reqwest.workspace = true
 base64.workspace = true
 flate2.workspace = true
 bytes.workspace = true
+keyring-core = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { workspace = true, optional = true }
+
+[features]
+# `secrets::KeyringSecretStore`: Keychain (macOS), Secret Service (Linux), Credential Manager (Windows).
+os-keyring = [
+    "dep:keyring-core",
+    "dep:apple-native-keyring-store",
+    "dep:windows-native-keyring-store",
+    "dep:zbus-secret-service-keyring-store",
+]
 
 [dev-dependencies]
 tempfile.workspace = true

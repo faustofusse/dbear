@@ -6,7 +6,7 @@
 #
 # Tests the working tree (tracked + untracked, not ignored files). Dev databases that are running
 # (`./scripts/dev-db.sh up …`) are forwarded into the container on their usual ports and their
-# integration tests are switched on.
+# integration tests are switched on. The OS keyring test runs against a throwaway GNOME Keyring.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,6 +15,13 @@ NAME=dbear-linux-test
 WORK="${TMPDIR:-/tmp}/dbear-linux"
 WINDOWS=0
 [[ "${1:-}" == "--windows" ]] && WINDOWS=1
+
+# The container's disk lives on this Mac's disk until the container is removed (~6 GB with --windows).
+free_gb=$(df -g / | awk 'NR==2 {print $4}')
+if (( free_gb < 8 )); then
+    echo "Only ${free_gb} GB free; the Linux build needs about 8 GB while it runs." >&2
+    exit 1
+fi
 
 rm -rf "$WORK" && mkdir -p "$WORK/src"
 git ls-files -z --cached --others --exclude-standard | while IFS= read -r -d '' f; do
@@ -47,20 +54,22 @@ cat >"$WORK/run.sh" <<EOF
 set -e
 cd /src
 export RUSTUP_TOOLCHAIN="\$(rustup default | cut -d' ' -f1)" CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
-packages="socat"; [ $WINDOWS = 1 ] && packages="\$packages gcc-mingw-w64-x86-64"
+packages="socat gnome-keyring dbus"; [ $WINDOWS = 1 ] && packages="\$packages gcc-mingw-w64-x86-64"
 apt-get update -qq >/dev/null && apt-get install -y -qq \$packages >/dev/null 2>&1
 rustup component add clippy >/dev/null 2>&1
 $forwards
 sleep 1
-echo "=== linux \$(uname -m): cargo test"
-env $envs CARGO_TARGET_DIR=/t/linux cargo test -p dbcore --locked
+echo "=== linux \$(uname -m): cargo test (Secret Service via gnome-keyring)"
+export XDG_RUNTIME_DIR=/tmp/xdg && mkdir -p -m 700 \$XDG_RUNTIME_DIR
+dbus-run-session -- sh -c 'printf dbear | gnome-keyring-daemon --unlock --components=secrets >/dev/null &&
+    env $envs DBEAR_TEST_KEYRING=1 CARGO_TARGET_DIR=/t/linux cargo test -p dbcore --features os-keyring --locked'
 echo "=== linux: clippy"
-CARGO_TARGET_DIR=/t/linux cargo clippy -p dbcore --all-targets --locked
+CARGO_TARGET_DIR=/t/linux cargo clippy -p dbcore --all-targets --features os-keyring --locked
 if [ $WINDOWS = 1 ]; then
     rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1
     echo "=== windows x86_64: clippy + link tests"
-    CARGO_TARGET_DIR=/t/win cargo clippy -p dbcore --all-targets --locked --target x86_64-pc-windows-gnu
-    CARGO_TARGET_DIR=/t/win cargo test -p dbcore --no-run --locked --target x86_64-pc-windows-gnu
+    CARGO_TARGET_DIR=/t/win cargo clippy -p dbcore --all-targets --features os-keyring --locked --target x86_64-pc-windows-gnu
+    CARGO_TARGET_DIR=/t/win cargo test -p dbcore --features os-keyring --no-run --locked --target x86_64-pc-windows-gnu
 fi
 EOF
 chmod +x "$WORK/run.sh"
