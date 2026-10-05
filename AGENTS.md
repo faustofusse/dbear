@@ -4,6 +4,10 @@
 - `crates/dbcore-ffi` is the only FFI surface. Only `apps/macos/Sources/DBKit/RustDriver.swift` imports `DBCoreFFI`.
 - Rows cross the FFI boundary in pages (`QueryResult`), never one cell at a time.
 - Passwords never touch disk. `dbcore::secrets` keeps them in the OS store (feature `os-keyring`: Keychain, Secret Service, Credential Manager), using service `ar.fausto.dbear.connection` and the connection id as the account. The macOS app has its own Swift Keychain code with the same service and account, so the two share entries.
+- `apps/gpui` uses `dbcore` directly (no FFI). It reads the same connection store and keyring entries as the macOS app.
+  - GPUI is pre-1.0. `gpui-kit` is pinned to an exact version and pins GPUI (`gpui-pre`) itself; upgrade both together.
+  - On macOS, GPUI stops drawing windows that other windows cover. For screenshots in tests, use a window that floats above the others.
+  - `RUST_LOG=info` shows the renderer GPUI picked and what it's doing.
 - Platform folders come from `dbcore::paths`. Don't read `HOME` directly; the core also builds for Windows.
 - After changing `crates/`, run `./scripts/build-core.sh` (`bundle-mac.sh` runs it for you). `Sources/DBCoreFFI` and `Frameworks/` are generated.
 - Check work with `cargo test -p dbcore`, `./scripts/test-postgres.sh` and `(cd apps/macos && swift test)`.
@@ -16,6 +20,7 @@
 nix develop                                       # Rust toolchain (Xcode provides Swift on macOS)
 ./scripts/dev-db.sh up                            # dev Postgres at localhost:54329/app_dev
 ./scripts/bundle-mac.sh && open build/dbear.app   # build and run
+./scripts/run-gpui.sh [--samples] [--release]      # the GPUI app (Linux; runs on macOS for testing). --help for options
 ```
 
 In debug builds, **File ▸ Add Sample Connections** adds `app_dev` plus some mock connections.
@@ -38,7 +43,7 @@ Without Nix (it only pins the toolchain):
 crates/dbcore/      Rust core: models, drivers (Postgres, MySQL, SQLite, SQL Server, libSQL, mock), connection store, SQL highlighting
 crates/dbcore-ffi/  UniFFI bindings for Swift
 apps/macos/         SwiftUI app
-apps/gpui/          GPUI app for Linux (also builds on macOS/Windows; todo)
+apps/gpui/          GPUI app for Linux (gpui-kit pinned; also runs on macOS for development)
 scripts/            build, bundle, dev database, tests, release
 vendor/             third-party crates patched for dbear (tiberius; see vendor/README.md)
 ```
@@ -48,7 +53,7 @@ vendor/             third-party crates patched for dbear (tiberius; see vendor/R
 ```sh
 cargo test -p dbcore              # core (Postgres tests skip without a database)
 ./scripts/test-postgres.sh        # core against the dev database
-./scripts/test-linux.sh [--windows] # core on Linux in an Apple container (running dev DBs forwarded); --windows also cross-checks x86_64-pc-windows-gnu
+./scripts/test-linux.sh [--windows] [--gpui] # core on Linux in an Apple container (running dev DBs forwarded); --windows cross-checks x86_64-pc-windows-gnu, --gpui builds apps/gpui
 ./scripts/test-libsql.sh          # core against the dev libSQL server (container dbear-libsql)
 ./scripts/test-sqlserver.sh       # core against the dev SQL Server (amd64 image under Rosetta, 4 GB)
 (cd apps/macos && swift test)     # Swift ⇄ Rust bridge

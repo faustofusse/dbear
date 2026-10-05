@@ -1,0 +1,18 @@
+[package]
+name = "dbear-gpui"
+description = "dbear's GPUI frontend: the Linux app (also runs on macOS and Windows for development)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "dbear"
+path = "src/main.rs"
+
+[dependencies]
+dbcore = { workspace = true, features = ["os-keyring"] }
+# GPUI is pre-1.0: pin exact versions. gpui-kit 0.7.1 pins GPUI itself (gpui-pre 0.3.8).
+gpui-kit = "=0.7.1"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+log = "0.4"

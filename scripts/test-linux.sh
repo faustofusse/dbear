@@ -3,6 +3,7 @@
 #
 #   ./scripts/test-linux.sh            # Linux (arm64) tests + clippy
 #   ./scripts/test-linux.sh --windows  # also clippy + link the tests for x86_64-pc-windows-gnu
+#   ./scripts/test-linux.sh --gpui     # also build + clippy the GPUI app (apps/gpui)
 #
 # Tests the working tree (tracked + untracked, not ignored files). Dev databases that are running
 # (`./scripts/dev-db.sh up …`) are forwarded into the container on their usual ports and their
@@ -14,7 +15,14 @@ IMAGE=docker.io/library/rust:1-bookworm
 NAME=dbear-linux-test
 WORK="${TMPDIR:-/tmp}/dbear-linux"
 WINDOWS=0
-[[ "${1:-}" == "--windows" ]] && WINDOWS=1
+GPUI=0
+for arg in "$@"; do
+    case "$arg" in
+        --windows) WINDOWS=1 ;;
+        --gpui) GPUI=1 ;;
+        *) echo "usage: $0 [--windows] [--gpui]" >&2; exit 2 ;;
+    esac
+done
 
 # The container's disk lives on this Mac's disk until the container is removed (~6 GB with --windows).
 free_gb=$(df -g / | awk 'NR==2 {print $4}')
@@ -55,6 +63,8 @@ set -e
 cd /src
 export RUSTUP_TOOLCHAIN="\$(rustup default | cut -d' ' -f1)" CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 packages="socat gnome-keyring dbus"; [ $WINDOWS = 1 ] && packages="\$packages gcc-mingw-w64-x86-64"
+[ $GPUI = 1 ] && packages="\$packages pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-dev \
+    libx11-xcb-dev libxcb1-dev libxcursor-dev libxi-dev libxrandr-dev libfontconfig-dev libfreetype-dev libasound2-dev libzstd-dev"
 apt-get update -qq >/dev/null && apt-get install -y -qq \$packages >/dev/null 2>&1
 rustup component add clippy >/dev/null 2>&1
 $forwards
@@ -65,6 +75,11 @@ dbus-run-session -- sh -c 'printf dbear | gnome-keyring-daemon --unlock --compon
     env $envs DBEAR_TEST_KEYRING=1 CARGO_TARGET_DIR=/t/linux cargo test -p dbcore --features os-keyring --locked'
 echo "=== linux: clippy"
 CARGO_TARGET_DIR=/t/linux cargo clippy -p dbcore --all-targets --features os-keyring --locked
+if [ $GPUI = 1 ]; then
+    echo "=== linux: build + clippy the GPUI app"
+    CARGO_TARGET_DIR=/t/linux cargo clippy -p dbear-gpui --locked
+    CARGO_TARGET_DIR=/t/linux cargo build -p dbear-gpui --locked
+fi
 if [ $WINDOWS = 1 ]; then
     rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1
     echo "=== windows x86_64: clippy + link tests"
