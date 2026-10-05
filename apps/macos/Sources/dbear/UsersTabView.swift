@@ -1,170 +1,178 @@
 import DBKit
 import SwiftUI
 
-/// "Users & Roles": roles on the left, the selected role's attributes, memberships and
-/// privileges on the right. Changes go through sheets that show the SQL before running it.
+/// The users tab: the role selected in the middle column (users mode), with its attributes,
+/// memberships and privileges. Changes go through sheets that show the SQL before running it.
 struct UsersTabView: View {
     @Environment(AppModel.self) private var model
     let tab: UsersTab
 
     var body: some View {
-        Group {
-            switch tab.roles {
-            case .idle, .loading:
-                ProgressView().controlSize(.small)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .failed(let message):
-                ContentUnavailableView {
-                    Label("Couldn’t List Users", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(message).textSelection(.enabled)
-                } actions: {
-                    Button("Try Again") { Task { await model.loadRoles(tab) } }
-                }
+        switch tab.roles {
+        case .idle, .loading:
+            ProgressView().controlSize(.small)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .loaded:
-                HStack(spacing: 0) {
-                    RoleList(tab: tab)
-                        .frame(width: 250)
-                    Divider()
-                    if let role = tab.selected {
-                        RoleDetail(tab: tab, role: role)
-                    } else {
-                        EmptyPlaceholder(text: "No User Selected")
-                    }
-                }
+        case .failed(let message):
+            ContentUnavailableView {
+                Label("Couldn’t List Users", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(message).textSelection(.enabled)
+            } actions: {
+                Button("Try Again") { Task { await model.loadRoles(tab) } }
             }
-        }
-        .sheet(item: Binding(get: { tab.roleEditor }, set: { tab.roleEditor = $0 })) { request in
-            RoleEditorSheet(tab: tab, original: request.original)
-        }
-        .sheet(item: Binding(get: { tab.privilegeEditor }, set: { tab.privilegeEditor = $0 })) { request in
-            PrivilegeEditorSheet(tab: tab, role: request.role, initialObject: request.object)
-        }
-        .alert(
-            "Drop “\(tab.pendingDrop?.reference.title ?? "")”?",
-            isPresented: Binding(get: { tab.pendingDrop != nil }, set: { if !$0 { tab.pendingDrop = nil } }),
-            presenting: tab.pendingDrop
-        ) { role in
-            Button("Drop", role: .destructive) { model.confirmAccess(.dropRole(role.reference), in: tab) }
-            Button("Cancel", role: .cancel) {}
-        } message: { role in
-            Text(dropMessage(role))
-        }
-        .alert(
-            "Revoke All Privileges?",
-            isPresented: Binding(get: { tab.pendingRevoke != nil }, set: { if !$0 { tab.pendingRevoke = nil } }),
-            presenting: tab.pendingRevoke
-        ) { grant in
-            Button("Revoke", role: .destructive) {
-                guard let role = tab.selectedRole else { return }
-                model.confirmAccess(.setPrivileges(role: role, object: grant.object, before: grant.privileges, after: PrivilegeSet()), in: tab)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .loaded:
+            if let role = tab.selected {
+                RoleDetail(tab: tab, role: role)
+            } else {
+                EmptyPlaceholder(text: "No User Selected")
             }
-            Button("Cancel", role: .cancel) {}
-        } message: { grant in
-            Text("\(tab.selectedRole?.title ?? "The role") loses \(grant.privileges.privileges.joined(separator: ", ")) on \(grant.object.title).")
-        }
-        .alert(
-            "Couldn’t Change Privileges",
-            isPresented: Binding(get: { tab.actionError != nil }, set: { if !$0 { tab.actionError = nil } })
-        ) {
-            Button("OK") {}
-        } message: {
-            Text(tab.actionError ?? "")
         }
     }
+}
 
-    private func dropMessage(_ role: Role) -> String {
-        let sql = (try? model.previewAccess(.dropRole(role.reference), in: tab))?.map(\.display).joined(separator: "\n") ?? ""
-        let note = tab.connection.kind == .postgres
+// MARK: - Sheets & confirmations
+
+extension View {
+    /// Role and privilege sheets, drop / revoke confirmations: on the window, so they open from
+    /// the middle column's list as well as from the users tab.
+    func usersSheets(_ model: AppModel) -> some View {
+        modifier(UsersSheets(model: model))
+    }
+}
+
+private struct UsersSheets: ViewModifier {
+    @Bindable var model: AppModel
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(item: $model.roleEditor) { request in
+                RoleEditorSheet(tab: request.state, original: request.original)
+            }
+            .sheet(item: $model.privilegeEditor) { request in
+                PrivilegeEditorSheet(tab: request.state, role: request.role, initialObject: request.object)
+            }
+            .alert(
+                "Drop “\(model.pendingRoleDrop?.role.reference.title ?? "")”?",
+                isPresented: Binding(get: { model.pendingRoleDrop != nil }, set: { if !$0 { model.pendingRoleDrop = nil } }),
+                presenting: model.pendingRoleDrop
+            ) { pending in
+                Button("Drop", role: .destructive) { model.confirmAccess(.dropRole(pending.role.reference), in: pending.state) }
+                Button("Cancel", role: .cancel) {}
+            } message: { pending in
+                Text(dropMessage(pending))
+            }
+            .alert(
+                "Revoke All Privileges?",
+                isPresented: Binding(get: { model.pendingRevoke != nil }, set: { if !$0 { model.pendingRevoke = nil } }),
+                presenting: model.pendingRevoke
+            ) { pending in
+                Button("Revoke", role: .destructive) {
+                    let change = AccessChange.setPrivileges(
+                        role: pending.role, object: pending.grant.object, before: pending.grant.privileges, after: PrivilegeSet())
+                    model.confirmAccess(change, in: pending.state)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { pending in
+                Text("\(pending.role.title) loses \(pending.grant.privileges.privileges.joined(separator: ", ")) on \(pending.grant.object.title).")
+            }
+            .alert(
+                "Couldn’t Change Privileges",
+                isPresented: Binding(get: { model.accessError != nil }, set: { if !$0 { model.accessError = nil } })
+            ) {
+                Button("OK") {}
+            } message: {
+                Text(model.accessError ?? "")
+            }
+    }
+
+    private func dropMessage(_ pending: PendingRoleDrop) -> String {
+        let sql = (try? model.previewAccess(.dropRole(pending.role.reference), in: pending.state))?
+            .map(\.display).joined(separator: "\n") ?? ""
+        let note = pending.state.connection.kind == .postgres
             ? "\n\nA role that owns objects or holds privileges can’t be dropped until they’re reassigned or revoked."
             : ""
         return sql + note
     }
 }
 
-// MARK: - Role list
+// MARK: - Role list (middle column, users mode)
 
-private struct RoleList: View {
+struct UsersList: View {
     @Environment(AppModel.self) private var model
-    let tab: UsersTab
+    let state: UsersTab
     @FocusState private var focused: Bool
 
     var body: some View {
-        @Bindable var tab = tab
-        VStack(spacing: 0) {
-            SearchField(text: $tab.search, prompt: "Filter")
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-            List {
-                ForEach(tab.visibleRoles) { role in
-                    RoleRow(role: role, showsHost: tab.features.hosts)
-                        .mailSelection(role.reference == tab.selectedRole) {
-                            focused = true
-                            model.selectRole(role.reference, in: tab)
-                        }
-                        .contextMenu { menu(for: role) }
-                }
+        @Bindable var state = state
+        switch state.roles {
+        case .idle, .loading:
+            ProgressView().controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .failed(let message):
+            ContentUnavailableView {
+                Label("Couldn’t List Users", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(message).textSelection(.enabled)
+            } actions: {
+                Button("Try Again") { Task { await model.loadRoles(state) } }
             }
-            .listStyle(.sidebar)
-            .scrollContentBackground(.hidden)
-            .arrowKeySelection(ids: tab.visibleRoles.map(\.reference), selected: tab.selectedRole, focus: $focused) {
-                model.selectRole($0, in: tab)
+        case .loaded:
+            VStack(spacing: 0) {
+                SearchField(text: $state.search, prompt: "Filter")
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                List {
+                    ForEach(state.visibleRoles) { role in
+                        RoleRow(role: role, showsHost: state.features.hosts)
+                            .mailSelection(isShown(role)) {
+                                focused = true
+                                model.showRole(role.reference, in: state)
+                            }
+                            .contextMenu { menu(for: role) }
+                    }
+                }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+                .arrowKeySelection(ids: state.visibleRoles.map(\.reference), selected: state.selectedRole, focus: $focused) {
+                    model.showRole($0, in: state)
+                }
+                .overlay {
+                    if state.visibleRoles.isEmpty {
+                        Text(state.search.isEmpty ? "No Users" : "No Matches")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .contextMenu { newRoleButton }
             }
-            .overlay {
-                if tab.visibleRoles.isEmpty {
-                    Text(tab.search.isEmpty ? "No Users" : "No Matches")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            BottomBar {
-                Button {
-                    tab.roleEditor = RoleEditorRequest(original: nil)
-                } label: {
-                    Image(systemName: "plus").frame(width: 20, height: 20)
-                }
-                .help(tab.connection.kind == .mysql ? "New User" : "New Role")
-                Button {
-                    tab.pendingDrop = tab.selected
-                } label: {
-                    Image(systemName: "minus").frame(width: 20, height: 20)
-                }
-                .disabled(tab.selected == nil || tab.selected?.isSystem == true)
-                .help("Drop the selected role")
-                Spacer()
-                Text(countText)
-                Menu {
-                    Toggle("Show Built-in Roles", isOn: $tab.showsSystemRoles)
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("List options")
-            }
-            .buttonStyle(.borderless)
         }
     }
 
-    private var countText: String {
-        let n = tab.visibleRoles.count
-        return n == 1 ? "1 role" : "\(n.formatted()) roles"
+    /// Highlighted like a table: the role the users tab shows, while that tab is the active one.
+    private func isShown(_ role: Role) -> Bool {
+        role.reference == state.selectedRole && model.activeTabID == state.id
+    }
+
+    private var newRoleButton: some View {
+        Button(state.connection.kind == .mysql ? "New User…" : "New Role…") {
+            model.roleEditor = RoleEditorRequest(state: state, original: nil)
+        }
     }
 
     @ViewBuilder
     private func menu(for role: Role) -> some View {
-        Button("Edit…") { tab.roleEditor = RoleEditorRequest(original: role) }
+        Button("Edit…") { model.roleEditor = RoleEditorRequest(state: state, original: role) }
         Button("Grant Privileges…") {
-            model.selectRole(role.reference, in: tab)
-            tab.privilegeEditor = PrivilegeEditorRequest(role: role.reference, object: nil)
+            model.showRole(role.reference, in: state)
+            model.privilegeEditor = PrivilegeEditorRequest(state: state, role: role.reference, object: nil)
         }
         Button("Copy Name") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(role.name, forType: .string)
         }
         Divider()
-        Button("Drop…", role: .destructive) { tab.pendingDrop = role }
+        newRoleButton
+        Button("Drop…", role: .destructive) { model.pendingRoleDrop = PendingRoleDrop(state: state, role: role) }
             .disabled(role.isSystem)
     }
 }
@@ -248,15 +256,16 @@ private struct RoleDetail: View {
                 section("Attributes") { attributes }
                 if tab.features.membership {
                     section("Member Of", count: role.memberOf.count) {
-                        RoleChips(roles: role.memberOf, empty: "Not a member of any role") { model.selectRole($0, in: tab) }
+                        RoleChips(roles: role.memberOf, empty: "Not a member of any role") { model.showRole($0, in: tab) }
                     }
                     let members = tab.members(of: role)
                     if !members.isEmpty {
                         section("Members", count: members.count) {
-                            RoleChips(roles: members.map(\.reference), empty: "") { model.selectRole($0, in: tab) }
+                            RoleChips(roles: members.map(\.reference), empty: "") { model.showRole($0, in: tab) }
                         }
                     }
                 }
+                if tab.connection.kind == .postgres || tab.connection.kind == .mysql { databaseAccess }
                 privileges
             }
             .padding(.horizontal, 20)
@@ -279,7 +288,7 @@ private struct RoleDetail: View {
                 Text(role.kindDescription).foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Edit…") { tab.roleEditor = RoleEditorRequest(original: role) }
+            Button("Edit…") { model.roleEditor = RoleEditorRequest(state: tab, original: role) }
                 .help("Change name, password, attributes and memberships")
         }
     }
@@ -323,7 +332,7 @@ private struct RoleDetail: View {
                     Text("in \(tab.connection.defaultDatabase)").foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Grant…") { tab.privilegeEditor = PrivilegeEditorRequest(role: role.reference, object: nil) }
+                Button("Grant…") { model.privilegeEditor = PrivilegeEditorRequest(state: tab, role: role.reference, object: nil) }
                     .help("Grant privileges on a database, schema or table")
             }
             if role.isSuperuser && tab.connection.kind == .postgres {
@@ -342,12 +351,55 @@ private struct RoleDetail: View {
                     .foregroundStyle(.secondary)
             case .loaded(let grants):
                 PrivilegesGrid(grants: grants) { grant in
-                    tab.privilegeEditor = PrivilegeEditorRequest(role: role.reference, object: grant.object)
+                    model.privilegeEditor = PrivilegeEditorRequest(state: tab, role: role.reference, object: grant.object)
                 } revoke: { grant in
-                    tab.pendingRevoke = grant
+                    model.pendingRevoke = PendingRevoke(state: tab, role: role.reference, grant: grant)
                 }
             }
         }
+    }
+
+    // MARK: Database access
+
+    /// Databases of the server this role has privileges on (or owns). Edited in the role sheet.
+    @ViewBuilder
+    private var databaseAccess: some View {
+        let databases = tab.databaseAccess.value ?? []
+        let granted = databases.filter { $0.isOwner || !$0.privileges.isEmpty }
+        section("Database Access", count: tab.databaseAccess.value == nil ? nil : granted.count) {
+            switch tab.databaseAccess {
+            case .idle, .loading:
+                ProgressView().controlSize(.small)
+            case .failed(let message):
+                Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.secondary)
+            case .loaded:
+                VStack(alignment: .leading, spacing: 8) {
+                    if granted.isEmpty {
+                        Text("No privileges granted on any database directly.").foregroundStyle(.secondary)
+                    } else {
+                        InfoGrid {
+                            ForEach(granted) { database in
+                                InfoRow(database.database) { Text(accessDescription(database)) }
+                            }
+                        }
+                    }
+                    let open = databases.filter(\.everyoneCanConnect).map(\.database)
+                    if !open.isEmpty {
+                        Text("Any role can connect to \(open.formatted(.list(type: .and))) (granted to PUBLIC).")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func accessDescription(_ database: DatabaseAccess) -> String {
+        if database.isOwner { return "Owner" }
+        let level = tab.databaseLevels[database.database] ?? database.level
+        guard level == .custom else { return level.title }
+        let privileges = database.privileges.privileges.joined(separator: ", ")
+        return "Custom: \(privileges) on the database" + (database.privileges.grantable ? " (with grant option)" : "")
     }
 
     private var emptyPrivilegesText: String {

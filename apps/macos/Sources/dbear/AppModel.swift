@@ -214,7 +214,7 @@ enum WorkspaceTab: Identifiable {
         switch self {
         case .table(let t): t.filterLabel.map { "\(t.table.name) \u{B7} \($0)" } ?? t.table.name
         case .script(let s): s.title
-        case .users: "Users & Roles"
+        case .users(let u): u.selected?.reference.title ?? "Users & Roles"
         }
     }
 
@@ -223,7 +223,7 @@ enum WorkspaceTab: Identifiable {
         case .table(let t) where t.filter != nil: "line.3.horizontal.decrease"
         case .table(let t): t.table.kind == .view ? "eye" : "tablecells"
         case .script: "chevron.left.forwardslash.chevron.right"
-        case .users: "person.2"
+        case .users(let u): u.selected.map(\.roleSymbol) ?? "person.2"
         }
     }
 
@@ -326,6 +326,19 @@ final class AppModel {
 
     var tabs: [WorkspaceTab] = []
     var activeTabID: UUID?
+
+    /// What the middle column lists: tables, or users and roles (toolbar switch).
+    var browseMode = BrowseMode.tables
+    /// Users & roles per connection, shared by the middle column's list and the users tab.
+    /// Kept while the tab is closed; dropped with the schemas (disconnect, edits).
+    var usersStates: [ConnectionConfig.ID: UsersTab] = [:]
+    /// Users & roles sheets and confirmations (from the middle column's list or the users tab).
+    var roleEditor: RoleEditorRequest?
+    var privilegeEditor: PrivilegeEditorRequest?
+    var pendingRoleDrop: PendingRoleDrop?
+    var pendingRevoke: PendingRevoke?
+    /// A drop or revoke failed (shown in an alert).
+    var accessError: String?
 
     /// Rows per table page (loaded as you scroll).
     let pageSize = 500
@@ -648,6 +661,7 @@ final class AppModel {
 
     private func forgetSchemas(of id: ConnectionConfig.ID) {
         schemaCache = schemaCache.filter { $0.key.connectionID != id }
+        usersStates[id] = nil
     }
 
     /// After a script that may have created, dropped or renamed tables: forget that database's
@@ -731,8 +745,17 @@ final class AppModel {
     func activate(_ id: UUID) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         activeTabID = id
-        if tab.connection.driverKey != selectedTarget?.driverKey {
+        if case .users = tab {
+            // Roles are server-wide: keep the database being browsed (the privileges follow it).
+            if tab.connection.id != selectedConnectionID { select(tab.connection.id) }
+        } else if tab.connection.driverKey != selectedTarget?.driverKey {
             select(tab.connection.id, database: tab.connection.database)
+        }
+        // The middle column follows the tab: its table, or its role.
+        switch tab {
+        case .table: browseMode = .tables
+        case .users: browseMode = .users
+        case .script: break
         }
     }
 

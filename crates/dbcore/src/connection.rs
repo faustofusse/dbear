@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
-use crate::access::{self, AccessChange, AccessStatement, Grant, Role, RoleRef};
+use crate::access::{self, AccessChange, AccessStatement, DatabaseAccess, DatabaseLevelContext, Grant, Role, RoleRef};
 use crate::driver::{Driver, Error, Result};
 use crate::dialect::normalize_filter;
 use crate::edit::{self, EditStatement, RowChange};
@@ -185,17 +185,69 @@ impl Connection {
         on_runtime(async move { d.list_grants(&role).await }).await
     }
 
-    /// The statements `apply_access` would run (passwords masked in `display`).
-    pub fn preview_access(&self, change: &AccessChange) -> Result<Vec<AccessStatement>> {
-        access::statements(self.config().kind, change)
+    /// `role`'s privileges on every database of the server.
+    pub async fn list_database_access(&self, role: RoleRef) -> Result<Vec<DatabaseAccess>> {
+        let d = self.driver.clone();
+        on_runtime(async move { d.list_database_access(&role).await }).await
     }
 
-    /// Creates, changes or drops a role, or changes its privileges. Runs in one transaction where the
-    /// database allows it (Postgres); MySQL commits each account statement as it goes.
-    pub async fn apply_access(&self, change: AccessChange) -> Result<()> {
+    /// `role`'s level in `database` (and what's needed to change it). Postgres reads it in that database,
+    /// over a short-lived connection of its own when it isn't this one's.
+    pub async fn database_level(&self, role: RoleRef, database: String) -> Result<DatabaseLevelContext> {
+        let routed = (self.config().kind == crate::model::DatabaseKind::Postgres).then_some(database.as_str());
+        let target = self.in_database(routed);
+        let d = target.driver.clone();
+        let result = on_runtime(async move { d.database_level(&role, &database).await }).await;
+        if !Arc::ptr_eq(&target.driver, &self.driver) {
+            target.disconnect().await;
+        }
+        result
+    }
+
+    /// This connection, or a new one to `database` on the same server (Postgres levels run there).
+    fn in_database(&self, database: Option<&str>) -> Connection {
+        match database {
+            Some(db) if db != self.config().default_database() => Connection::new(self.config().with_database(db)),
+            _ => self.clone(),
+        }
+    }
+
+    /// The statements `apply_access` would run (passwords masked in `display`).
+    pub fn preview_access(&self, changes: &[AccessChange]) -> Result<Vec<AccessStatement>> {
+        access::statements_for(self.config().kind, changes)
+    }
+
+    /// Creates, changes or drops roles, or changes their privileges, in order. Runs in one transaction
+    /// where the database allows it (Postgres); MySQL commits each account statement as it goes.
+    ///
+    /// Postgres database levels run in their own database: consecutive changes for the same database
+    /// run together, one transaction per database, in order. A later failure leaves earlier ones applied.
+    pub async fn apply_access(&self, changes: Vec<AccessChange>) -> Result<()> {
+        let kind = self.config().kind;
+        self.preview_access(&changes)?; // Nothing runs if any change is invalid.
+        let mut batches: Vec<(Option<String>, Vec<AccessChange>)> = Vec::new();
+        for change in changes {
+            let database = change.database(kind).map(str::to_string);
+            match batches.last_mut() {
+                Some((db, batch)) if *db == database => batch.push(change),
+                _ => batches.push((database, vec![change])),
+            }
+        }
+        for (database, batch) in batches {
+            let target = self.in_database(database.as_deref());
+            let result = target.apply_batch(&batch).await;
+            if !Arc::ptr_eq(&target.driver, &self.driver) {
+                target.disconnect().await;
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    async fn apply_batch(&self, changes: &[AccessChange]) -> Result<()> {
         let kind = self.config().kind;
         let statements: Vec<EditStatement> = self
-            .preview_access(&change)?
+            .preview_access(changes)?
             .into_iter()
             .map(|s| EditStatement { sql: s.sql, expect_one_row: false, target: s.display })
             .collect();

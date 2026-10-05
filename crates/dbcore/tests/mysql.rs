@@ -378,7 +378,7 @@ fn creates_grants_and_drops_an_account() {
     let reader = RoleRef::new("dbear_test_reader", Some("%".into()));
     block_on(conn.execute("drop user if exists 'dbear_test_access'@'%', 'dbear_test_reader'@'%'".into())).unwrap();
     let group = RoleSpec { name: reader.name.clone(), can_login: false, ..Default::default() };
-    block_on(conn.apply_access(AccessChange::CreateRole(group))).unwrap();
+    block_on(conn.apply_access(vec![AccessChange::CreateRole(group)])).unwrap();
     let spec = RoleSpec {
         name: me.name.clone(),
         host: me.host.clone(),
@@ -388,7 +388,7 @@ fn creates_grants_and_drops_an_account() {
         member_of: vec![reader.clone()],
         ..Default::default()
     };
-    block_on(conn.apply_access(AccessChange::CreateRole(spec))).unwrap();
+    block_on(conn.apply_access(vec![AccessChange::CreateRole(spec)])).unwrap();
     let roles = block_on(conn.list_roles()).unwrap();
     let role = roles.iter().find(|r| r.reference() == me).expect("created").clone();
     assert!(role.can_login);
@@ -399,18 +399,33 @@ fn creates_grants_and_drops_an_account() {
 
     let set = |p: &[&str], g: bool| PrivilegeSet { privileges: p.iter().map(|s| s.to_string()).collect(), grantable: g };
     let change = |object: GrantObject, before, after| {
-        block_on(conn.apply_access(AccessChange::SetPrivileges { role: me.clone(), object, before, after })).unwrap()
+        block_on(conn.apply_access(vec![AccessChange::SetPrivileges { role: me.clone(), object, before, after }])).unwrap()
     };
     change(GrantObject::Database { name: "shop".into() }, set(&[], false), set(&["SELECT", "INSERT"], true));
     change(GrantObject::Server, set(&[], false), set(&["PROCESS"], false));
     let grouped = dbcore::access::group_grants(&block_on(conn.list_grants(me.clone())).unwrap());
     assert!(grouped.contains(&(GrantObject::Server, set(&["PROCESS"], false))), "{grouped:?}");
     assert!(grouped.contains(&(GrantObject::Database { name: "shop".into() }, set(&["INSERT", "SELECT"], true))), "{grouped:?}");
+    let access = block_on(conn.list_database_access(me.clone())).unwrap();
+    let shop = access.iter().find(|a| a.database == "shop").expect("shop listed");
+    assert_eq!(shop.privileges, set(&["INSERT", "SELECT"], true));
+    assert!(access.iter().any(|a| a.database == "blog" && a.privileges.privileges.is_empty()));
+    assert_eq!(shop.level, dbcore::access::DatabaseLevel::Custom);
+
+    // Levels: read only on blog, then read and write.
+    use dbcore::access::DatabaseLevel;
+    let ctx = block_on(conn.database_level(me.clone(), "blog".into())).unwrap();
+    assert_eq!(ctx.level, DatabaseLevel::NoAccess);
+    block_on(conn.apply_access(vec![AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::ReadOnly }])).unwrap();
+    let ctx = block_on(conn.database_level(me.clone(), "blog".into())).unwrap();
+    assert_eq!(ctx.level, DatabaseLevel::ReadOnly);
+    block_on(conn.apply_access(vec![AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::ReadWrite }])).unwrap();
+    assert_eq!(block_on(conn.database_level(me.clone(), "blog".into())).unwrap().level, DatabaseLevel::ReadWrite);
     change(GrantObject::Database { name: "shop".into() }, set(&["INSERT", "SELECT"], true), set(&["SELECT"], false));
     let grouped = dbcore::access::group_grants(&block_on(conn.list_grants(me.clone())).unwrap());
     assert!(grouped.contains(&(GrantObject::Database { name: "shop".into() }, set(&["SELECT"], false))), "{grouped:?}");
 
-    block_on(conn.apply_access(AccessChange::DropRole(me.clone()))).unwrap();
-    block_on(conn.apply_access(AccessChange::DropRole(reader))).unwrap();
+    block_on(conn.apply_access(vec![AccessChange::DropRole(me.clone())])).unwrap();
+    block_on(conn.apply_access(vec![AccessChange::DropRole(reader)])).unwrap();
     assert!(!block_on(conn.list_roles()).unwrap().iter().any(|r| r.reference() == me));
 }

@@ -80,6 +80,63 @@ pub enum AccessChange {
     AlterRole { role: Role, spec: RoleSpec },
     DropRole { role: RoleRef },
     SetPrivileges { role: RoleRef, object: GrantObject, before: PrivilegeSet, after: PrivilegeSet },
+    SetDatabaseLevel { role: RoleRef, context: DatabaseLevelContext, level: DatabaseLevel },
+}
+
+/// A role's privileges on one database of the server.
+#[derive(uniffi::Record)]
+pub struct DatabaseAccess {
+    pub database: String,
+    pub privileges: PrivilegeSet,
+    /// Postgres: PUBLIC may connect, so any role can.
+    pub everyone_can_connect: bool,
+    pub is_owner: bool,
+    /// From the database-level privileges only; Postgres: probe with `database_level`.
+    pub level: DatabaseLevel,
+}
+
+/// How much a role may do in one database.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DatabaseLevel {
+    NoAccess,
+    Connect,
+    ReadOnly,
+    ReadWrite,
+    SchemaChanges,
+    Custom,
+}
+
+/// A role's level in one database, and what's needed to change it.
+#[derive(uniffi::Record, Clone)]
+pub struct DatabaseLevelContext {
+    pub database: String,
+    pub level: DatabaseLevel,
+    pub privileges: PrivilegeSet,
+    pub schemas: Vec<String>,
+    pub owners: Vec<String>,
+}
+
+/// Levels to offer for databases on `kind`, from least to most.
+#[uniffi::export]
+pub fn database_levels(kind: DatabaseKind) -> Vec<DatabaseLevel> {
+    core::database_levels(kind.into()).into_iter().map(Into::into).collect()
+}
+
+#[uniffi::export]
+pub fn database_level_title(level: DatabaseLevel) -> String {
+    core::DatabaseLevel::from(level).title().into()
+}
+
+/// What a level allows on `kind`, in a sentence.
+#[uniffi::export]
+pub fn database_level_summary(level: DatabaseLevel, kind: DatabaseKind) -> String {
+    core::DatabaseLevel::from(level).summary(kind.into()).into()
+}
+
+/// A random password with letters, digits and URL-safe symbols.
+#[uniffi::export]
+pub fn generate_password(length: u32) -> Result<String, DbError> {
+    Ok(core::generate_password(length as usize)?)
 }
 
 #[derive(uniffi::Record)]
@@ -150,19 +207,42 @@ impl Connection {
         Ok(self.inner.list_grants(role.into()).await?.into_iter().map(Into::into).collect())
     }
 
-    /// The statements `apply_access` would run.
-    pub fn preview_access(&self, change: AccessChange) -> Result<Vec<AccessStatement>, DbError> {
+    /// `role`'s privileges on every database of the server.
+    pub async fn list_database_access(&self, role: RoleRef) -> Result<Vec<DatabaseAccess>, DbError> {
         Ok(self
             .inner
-            .preview_access(&change.into())?
+            .list_database_access(role.into())
+            .await?
+            .into_iter()
+            .map(|a| DatabaseAccess {
+                database: a.database,
+                privileges: a.privileges.into(),
+                everyone_can_connect: a.everyone_can_connect,
+                is_owner: a.is_owner,
+                level: a.level.into(),
+            })
+            .collect())
+    }
+
+    /// `role`'s level in `database` (Postgres: read in that database, over a connection of its own).
+    pub async fn database_level(&self, role: RoleRef, database: String) -> Result<DatabaseLevelContext, DbError> {
+        Ok(self.inner.database_level(role.into(), database).await?.into())
+    }
+
+    /// The statements `apply_access` would run, in order.
+    pub fn preview_access(&self, changes: Vec<AccessChange>) -> Result<Vec<AccessStatement>, DbError> {
+        let changes: Vec<core::AccessChange> = changes.into_iter().map(Into::into).collect();
+        Ok(self
+            .inner
+            .preview_access(&changes)?
             .into_iter()
             .map(|s| AccessStatement { sql: s.sql, display: s.display })
             .collect())
     }
 
-    /// Creates, changes or drops a role, or changes its privileges.
-    pub async fn apply_access(&self, change: AccessChange) -> Result<(), DbError> {
-        Ok(self.inner.apply_access(change.into()).await?)
+    /// Creates, changes or drops roles, or changes their privileges: all in one transaction where possible.
+    pub async fn apply_access(&self, changes: Vec<AccessChange>) -> Result<(), DbError> {
+        Ok(self.inner.apply_access(changes.into_iter().map(Into::into).collect()).await?)
     }
 }
 
@@ -322,6 +402,47 @@ impl From<AccessChange> for core::AccessChange {
             AccessChange::SetPrivileges { role, object, before, after } => {
                 Self::SetPrivileges { role: role.into(), object: object.into(), before: before.into(), after: after.into() }
             }
+            AccessChange::SetDatabaseLevel { role, context, level } => {
+                Self::SetDatabaseLevel { role: role.into(), context: context.into(), level: level.into() }
+            }
         }
+    }
+}
+
+impl From<DatabaseLevel> for core::DatabaseLevel {
+    fn from(l: DatabaseLevel) -> Self {
+        match l {
+            DatabaseLevel::NoAccess => Self::NoAccess,
+            DatabaseLevel::Connect => Self::Connect,
+            DatabaseLevel::ReadOnly => Self::ReadOnly,
+            DatabaseLevel::ReadWrite => Self::ReadWrite,
+            DatabaseLevel::SchemaChanges => Self::SchemaChanges,
+            DatabaseLevel::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<core::DatabaseLevel> for DatabaseLevel {
+    fn from(l: core::DatabaseLevel) -> Self {
+        match l {
+            core::DatabaseLevel::NoAccess => Self::NoAccess,
+            core::DatabaseLevel::Connect => Self::Connect,
+            core::DatabaseLevel::ReadOnly => Self::ReadOnly,
+            core::DatabaseLevel::ReadWrite => Self::ReadWrite,
+            core::DatabaseLevel::SchemaChanges => Self::SchemaChanges,
+            core::DatabaseLevel::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<DatabaseLevelContext> for core::DatabaseLevelContext {
+    fn from(c: DatabaseLevelContext) -> Self {
+        Self { database: c.database, level: c.level.into(), privileges: c.privileges.into(), schemas: c.schemas, owners: c.owners }
+    }
+}
+
+impl From<core::DatabaseLevelContext> for DatabaseLevelContext {
+    fn from(c: core::DatabaseLevelContext) -> Self {
+        Self { database: c.database, level: c.level.into(), privileges: c.privileges.into(), schemas: c.schemas, owners: c.owners }
     }
 }

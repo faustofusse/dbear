@@ -180,6 +180,55 @@ public enum AccessChange: Hashable, Sendable {
     case alterRole(Role, RoleSpec)
     case dropRole(RoleRef)
     case setPrivileges(role: RoleRef, object: GrantObject, before: PrivilegeSet, after: PrivilegeSet)
+    /// Replaces `role`'s privileges in `context.database` with `level`.
+    case setDatabaseLevel(role: RoleRef, context: DatabaseLevelContext, level: DatabaseLevel)
+}
+
+/// A role's privileges on one database of the server.
+public struct DatabaseAccess: Identifiable, Hashable, Sendable {
+    public var database: String
+    /// Granted on the database itself (Postgres `CONNECT`…, MySQL `db.*`).
+    public var privileges: PrivilegeSet
+    /// Postgres: PUBLIC may connect, so any role can.
+    public var everyoneCanConnect: Bool
+    /// Owners have every privilege on their database.
+    public var isOwner: Bool
+    /// From the database-level privileges only: exact for MySQL; Postgres roles with privileges there
+    /// show `.custom` until `databaseLevel(of:in:)` reads the database.
+    public var level: DatabaseLevel
+    public var id: String { database }
+
+    public init(database: String, privileges: PrivilegeSet, everyoneCanConnect: Bool = false, isOwner: Bool = false, level: DatabaseLevel = .noAccess) {
+        self.database = database
+        self.privileges = privileges
+        self.everyoneCanConnect = everyoneCanConnect
+        self.isOwner = isOwner
+        self.level = level
+    }
+}
+
+/// How much a role may do in one database (see `Access.levels`). Titles come from the core.
+public enum DatabaseLevel: Hashable, Sendable {
+    case noAccess, connect, readOnly, readWrite, schemaChanges, custom
+}
+
+/// A role's level in one database, and what's needed to change it (read in that database).
+public struct DatabaseLevelContext: Hashable, Sendable {
+    public var database: String
+    public var level: DatabaseLevel
+    public var privileges: PrivilegeSet
+    /// Postgres: the schemas a level applies to.
+    public var schemas: [String]
+    /// Postgres: roles whose future objects get default privileges.
+    public var owners: [String]
+
+    public init(database: String, level: DatabaseLevel, privileges: PrivilegeSet, schemas: [String] = [], owners: [String] = []) {
+        self.database = database
+        self.level = level
+        self.privileges = privileges
+        self.schemas = schemas
+        self.owners = owners
+    }
 }
 
 public struct AccessStatement: Hashable, Sendable {

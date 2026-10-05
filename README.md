@@ -103,12 +103,17 @@ cargo test -p dbcore              # core (Postgres tests skip without a database
   table or `INSERT`s (`dbcore::export::format_rows`). The inspector (⌥⌘I) shows the focused value in
   full, with JSON pretty-printed (`export::pretty_json` keeps key order and digits), and edits it
   for editable tables.
-- **Users & Roles** (⇧⌘U, or the connection's context menu), for Postgres and MySQL: list roles and
-  accounts, create, edit (password, login, superuser, limits, memberships) and drop them, and grant or
+- **Users & Roles**, for Postgres and MySQL: the Tables | Users switch in the middle column's toolbar
+  (or ⇧⌘U) lists roles and accounts there; selecting one shows it on the right. Create, edit (password, login, superuser, limits, memberships) and drop them, and grant or
   revoke privileges on databases, schemas, tables, sequences and `ALL TABLES IN SCHEMA` (MySQL:
   `*.*`, `db.*`, tables). `dbcore::access` generates the SQL, shown with passwords masked before it
   runs; it runs in one transaction where the database allows (Postgres). Postgres privileges are
   listed for the connection's current database. Only direct grants are listed; inherited ones aren't.
+  The role sheet sets an access level per database (`access::DatabaseLevel`: connect only, read only,
+  read and write, schema changes) and can generate a password (`access::generate_password`). Postgres
+  levels cover every schema, all tables and sequences, and those created later (default privileges for
+  the roles that own objects there); they run in their database over a connection of their own. MySQL
+  levels are privileges on `db.*`.
 - Turso / libSQL connections (`libsql://db-org.turso.io?authToken=…`) speak Hrana 3 over HTTP
   (`dbcore::libsql`, reqwest + rustls/ring, no libSQL C library). The auth token is stored in the
   keychain like a password. Each call runs on its own short-lived stream, so a transaction a script

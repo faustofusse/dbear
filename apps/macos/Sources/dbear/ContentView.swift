@@ -24,6 +24,7 @@ struct ContentView: View {
         }
         .sheet(item: $model.dumpRequest) { DumpSheet(request: $0) }
         .sheet(item: $model.restoreRequest) { RestoreSheet(request: $0) }
+        .usersSheets(model)
         .overlay(alignment: .bottomTrailing) { BackupJobsPanel() }
         .confirmationDialog(
             "Delete “\(model.pendingDeletion?.name ?? "")”?",

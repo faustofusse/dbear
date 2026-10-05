@@ -26,9 +26,11 @@ struct TablesList: View {
                 if hasDatabaseMenu {
                     ToolbarItem(placement: .navigation) {
                         DatabaseTitle(
-                            title: title, subtitle: subtitle, help: model.selectedTarget?.summary,
-                            // What the filter and ••• buttons leave free, as the native title gets.
-                            maxWidth: max(80, width - 110),
+                            title: title, subtitle: subtitle,
+                            help: model.showsUsers
+                                ? "Roles are the server\u{2019}s; privileges are per database. Pick whose privileges to show."
+                                : model.selectedTarget?.summary,
+                            maxWidth: titleWidth,
                             popUpRequested: model.databaseMenuRequest != nil
                                 && model.databaseMenuRequest == model.selectedConnectionID,
                             popUpItems: databaseMenuItems,
@@ -41,30 +43,28 @@ struct TablesList: View {
                         ToolbarSpacer(.flexible)
                     }
                 }
+                if canShowUsers {
+                    ToolbarItem { BrowseModePicker() }
+                }
                 ToolbarItemGroup {
-                    Toggle(isOn: $tablesOnly) {
-                        Label("Filter", systemImage: "line.3.horizontal.decrease")
+                    if model.showsUsers, let state = model.currentUsers {
+                        @Bindable var state = state
+                        Toggle(isOn: $state.showsSystemRoles) {
+                            Label("Built-in Roles", systemImage: "line.3.horizontal.decrease")
+                        }
+                        .help(state.showsSystemRoles ? "Hide built-in roles" : "Show built-in roles")
+                    } else {
+                        Toggle(isOn: $tablesOnly) {
+                            Label("Filter", systemImage: "line.3.horizontal.decrease")
+                        }
+                        .help(tablesOnly ? "Showing tables only" : "Filter: tables only")
                     }
-                    .help(tablesOnly ? "Showing tables only" : "Filter: tables only")
 
                     Menu {
-                        Button("Refresh") { Task { await model.loadSchemas(refresh: true) } }
-                        if let connection = model.selectedConnection {
-                            Divider()
-                            Button("Dump Database…") { model.requestDump(of: connection) }
-                            Button("Restore from File…") { model.requestRestore(into: connection) }
-                            if model.canManageUsers(connection) {
-                                Divider()
-                                Button("Users & Roles") { model.openUsers() }
-                            }
-                        }
-                        // A single MySQL database has no sections to fold.
-                        if singleDatabase(in: model.schemas.value ?? []) == nil {
-                            Divider()
-                            Button("Expand All") { collapsed.removeAll() }
-                            Button("Collapse All") {
-                                collapsed = Set(model.schemas.value?.map(\.name) ?? [])
-                            }
+                        if model.showsUsers {
+                            usersMenu
+                        } else {
+                            tablesMenu
                         }
                     } label: {
                         Label("More", systemImage: "ellipsis")
@@ -75,19 +75,64 @@ struct TablesList: View {
             .task(id: model.selectedTarget?.driverKey) {
                 await model.loadSchemas()
             }
+            .task(id: UsersTaskID(target: model.selectedTarget?.driverKey, shown: model.showsUsers)) {
+                if model.showsUsers { await model.prepareUsers() }
+            }
+    }
+
+    /// What the filter and ••• buttons (and Tables | Users) leave free, as the native title gets.
+    private var titleWidth: CGFloat {
+        max(80, width - 110 - (canShowUsers ? 76 : 0))
+    }
+
+    /// The connection can list users: the middle column offers Tables | Users.
+    private var canShowUsers: Bool {
+        model.selectedConnection.map(model.canManageUsers) ?? false
+    }
+
+    @ViewBuilder
+    private var usersMenu: some View {
+        if let state = model.currentUsers {
+            Button(state.connection.kind == .mysql ? "New User…" : "New Role…") {
+                model.roleEditor = RoleEditorRequest(state: state, original: nil)
+            }
+            Divider()
+            Button("Refresh") { Task { await model.loadRoles(state) } }
+        }
+    }
+
+    @ViewBuilder
+    private var tablesMenu: some View {
+                        Button("Refresh") { Task { await model.loadSchemas(refresh: true) } }
+                        if let connection = model.selectedConnection {
+                            Divider()
+                            Button("Dump Database…") { model.requestDump(of: connection) }
+                            Button("Restore from File…") { model.requestRestore(into: connection) }
+                        }
+                        // A single MySQL database has no sections to fold.
+                        if singleDatabase(in: model.schemas.value ?? []) == nil {
+                            Divider()
+                            Button("Expand All") { collapsed.removeAll() }
+                            Button("Collapse All") {
+                                collapsed = Set(model.schemas.value?.map(\.name) ?? [])
+                            }
+                        }
     }
 
     /// The database when the title is a database menu, else the connection's name.
     private var title: String {
         guard let target = model.selectedTarget else { return "Tables" }
+        if model.showsUsers && !hasDatabaseMenu, let connection = model.selectedConnection { return connection.name }
         if let connection = model.selectedConnection, model.databases(of: connection) != nil {
             return target.defaultDatabase
         }
         return model.displayName(of: target)
     }
 
+    /// MySQL accounts and grants are server-wide: no database to pick while listing users.
     private var hasDatabaseMenu: Bool {
-        model.selectedConnection.flatMap { model.databases(of: $0) } != nil
+        if model.showsUsers && model.currentUsers?.features.grantsPerDatabase != true { return false }
+        return model.selectedConnection.flatMap { model.databases(of: $0) } != nil
     }
 
     /// Title menu of a connection that lists its server's databases: pick the one to browse.
@@ -148,6 +193,17 @@ struct TablesList: View {
     }
 
     private var subtitle: String {
+        if model.showsUsers {
+            guard let roles = model.currentUsers?.roles.value else { return "Loading…" }
+            let n = model.currentUsers?.visibleRoles.count ?? roles.count
+            let count = "\(n) \(model.selectedTarget?.kind == .mysql ? "user" : "role")\(n == 1 ? "" : "s")"
+            // Postgres: the roles are the server's, the privileges shown this database's.
+            guard model.currentUsers?.features.grantsPerDatabase == true, let target = model.selectedTarget else { return count }
+            let full = "\(count) · privileges in \(target.defaultDatabase)"
+            // Never cut short ("2 roles · pri…"): the title menu's tooltip and the detail say it too.
+            let fits = (full as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width <= titleWidth - 16
+            return fits ? full : count
+        }
         guard let schemas = model.schemas.value else {
             // Not the connection summary: host names are long, and the title jumped while loading.
             return model.schemas.isLoading ? "Loading…" : model.selectedTarget?.summary ?? ""
@@ -166,6 +222,13 @@ struct TablesList: View {
     private var content: some View {
         if model.selectedConnection == nil {
             Color.clear
+        } else if model.showsUsers {
+            if let state = model.currentUsers {
+                UsersList(state: state)
+            } else {
+                ProgressView().controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         } else {
             switch model.schemas {
             case .idle, .loading:
@@ -380,6 +443,32 @@ private struct PopUpMenuAnchor: NSViewRepresentable {
         override var isFlipped: Bool { true }
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
+}
+
+/// Tables | Users, like Mail's mailbox switcher: what the middle column lists.
+private struct BrowseModePicker: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Picker("Show", selection: Binding(get: { model.browseMode }, set: { model.browseMode = $0 })) {
+            Label("Tables", systemImage: "tablecells")
+                .help("Tables")
+                .tag(BrowseMode.tables)
+            Label("Users & Roles", systemImage: "person.2")
+                .help("Users & Roles (\u{21E7}\u{2318}U)")
+                .tag(BrowseMode.users)
+        }
+        .pickerStyle(.segmented)
+        .labelStyle(.iconOnly)
+        .fixedSize()
+        .help("Show tables or users")
+    }
+}
+
+/// Reloads the users list when the database changes or users mode is switched on.
+private struct UsersTaskID: Hashable {
+    let target: DriverKey?
+    let shown: Bool
 }
 
 /// What the tables column's rows depend on: when it changes, the List's rows are prepared again.

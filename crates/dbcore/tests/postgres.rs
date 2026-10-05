@@ -574,7 +574,7 @@ fn creates_grants_and_drops_a_role() {
         member_of: vec![RoleRef::new("dbear_test_readers", None)],
         ..Default::default()
     };
-    block_on(conn.apply_access(AccessChange::CreateRole(spec.clone()))).unwrap();
+    block_on(conn.apply_access(vec![AccessChange::CreateRole(spec.clone())])).unwrap();
     let roles = block_on(conn.list_roles()).unwrap();
     let role = roles.iter().find(|r| r.name == name).expect("created").clone();
     assert!(role.can_login && !role.is_superuser && !role.is_system);
@@ -584,7 +584,7 @@ fn creates_grants_and_drops_a_role() {
 
     let set = |p: &[&str], g: bool| PrivilegeSet { privileges: p.iter().map(|s| s.to_string()).collect(), grantable: g };
     let grant = |object: GrantObject, before: PrivilegeSet, after: PrivilegeSet| {
-        block_on(conn.apply_access(AccessChange::SetPrivileges { role: me.clone(), object, before, after })).unwrap()
+        block_on(conn.apply_access(vec![AccessChange::SetPrivileges { role: me.clone(), object, before, after }])).unwrap()
     };
     grant(GrantObject::Database { name: "app_dev".into() }, set(&[], false), set(&["CONNECT"], false));
     grant(GrantObject::Schema { name: "public".into() }, set(&[], false), set(&["USAGE"], false));
@@ -594,6 +594,19 @@ fn creates_grants_and_drops_a_role() {
     let grouped = dbcore::access::group_grants(&grants);
     assert!(grouped.contains(&(GrantObject::Database { name: "app_dev".into() }, set(&["CONNECT"], false))), "{grouped:?}");
     assert!(grouped.contains(&(users.clone(), set(&["SELECT", "UPDATE"], true))), "{grouped:?}");
+
+    // Database access: every database is listed; CONNECT on another one is granted from here.
+    grant(GrantObject::Database { name: "postgres".into() }, set(&[], false), set(&["CONNECT"], false));
+    let access = block_on(conn.list_database_access(me.clone())).unwrap();
+    let db = |name: &str| access.iter().find(|a| a.database == name).unwrap_or_else(|| panic!("{name} listed"));
+    assert_eq!(db("app_dev").privileges, set(&["CONNECT"], false));
+    assert_eq!(db("postgres").privileges, set(&["CONNECT"], false));
+    assert!(db("postgres").everyone_can_connect && !db("postgres").is_owner);
+    // A role that doesn't exist yet: databases listed, nothing granted.
+    let nobody = block_on(conn.list_database_access(RoleRef::new("dbear_no_such_role", None))).unwrap();
+    assert!(nobody.len() >= 2 && nobody.iter().all(|a| a.privileges.privileges.is_empty() && !a.is_owner));
+    let postgres_owner = block_on(conn.list_database_access(RoleRef::new("postgres", None))).unwrap();
+    assert!(postgres_owner.iter().any(|a| a.database == "app_dev" && a.is_owner));
 
     // The new login works and sees what it was granted.
     let mut login = dev_config();
@@ -607,10 +620,70 @@ fn creates_grants_and_drops_a_role() {
     let grouped = dbcore::access::group_grants(&block_on(conn.list_grants(me.clone())).unwrap());
     assert!(grouped.contains(&(users.clone(), set(&["SELECT"], false))), "{grouped:?}");
     let renamed = RoleSpec { name: format!("{name}_2"), member_of: vec![], ..spec };
-    block_on(conn.apply_access(AccessChange::AlterRole { role, spec: renamed })).unwrap();
+    block_on(conn.apply_access(vec![AccessChange::AlterRole { role, spec: renamed }])).unwrap();
     let role = block_on(conn.list_roles()).unwrap().into_iter().find(|r| r.name == format!("{name}_2")).expect("renamed");
     assert!(role.member_of.is_empty());
-    let err = block_on(conn.apply_access(AccessChange::DropRole(role.reference()))).unwrap_err();
+    let err = block_on(conn.apply_access(vec![AccessChange::DropRole(role.reference())])).unwrap_err();
     assert!(err.to_string().contains("depend"), "{err}");
     block_on(conn.execute(format!("drop owned by {name}_2; drop role {name}_2; drop role dbear_test_readers"))).unwrap();
+}
+
+#[test]
+fn sets_database_levels_in_another_database() {
+    use dbcore::access::{AccessChange, DatabaseLevel, RoleRef, RoleSpec};
+    if !enabled() {
+        return;
+    }
+    let conn = dev(); // app_dev; the levels are set in `postgres`
+    let other = Connection::new(dev_config().with_database("postgres"));
+    let name = "dbear_test_level";
+    let me = RoleRef::new(name, None);
+    let cleanup = || {
+        for c in [&conn, &other] {
+            let _ = block_on(c.execute(format!("do $$ begin if exists (select from pg_roles where rolname = '{name}') then execute 'drop owned by {name}'; end if; end $$")));
+        }
+        let _ = block_on(other.execute("drop table if exists public.dbear_level_a, public.dbear_level_b".into()));
+        let _ = block_on(conn.execute(format!("drop role if exists {name}")));
+    };
+    cleanup();
+    block_on(other.execute("create table public.dbear_level_a (id int); insert into public.dbear_level_a values (1)".into())).unwrap();
+
+    // Create the role and give it read-only access to `postgres`, in one call (two databases).
+    let ctx = block_on(conn.database_level(me.clone(), "postgres".into())).unwrap();
+    assert_eq!(ctx.level, DatabaseLevel::NoAccess);
+    assert!(ctx.schemas.contains(&"public".to_string()) && ctx.owners.contains(&"postgres".to_string()), "{ctx:?}");
+    assert!(!ctx.owners.iter().any(|o| o.starts_with("pg_")), "{ctx:?}");
+    let spec = RoleSpec { name: name.into(), password: Some("pw".into()), can_login: true, ..Default::default() };
+    block_on(conn.apply_access(vec![
+        AccessChange::CreateRole(spec),
+        AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::ReadOnly },
+    ]))
+    .unwrap();
+    let ctx = block_on(conn.database_level(me.clone(), "postgres".into())).unwrap();
+    assert_eq!(ctx.level, DatabaseLevel::ReadOnly);
+
+    // A table created afterwards is readable too (default privileges); writing isn't allowed.
+    block_on(other.execute("create table public.dbear_level_b (id int); insert into public.dbear_level_b values (2)".into())).unwrap();
+    let mut login = dev_config().with_database("postgres");
+    login.user = Some(name.into());
+    login.password = Some("pw".into());
+    let as_role = Connection::new(login.clone());
+    let read = block_on(as_role.execute("select (select count(*) from public.dbear_level_a) + (select count(*) from public.dbear_level_b)".into())).unwrap();
+    assert_eq!(read.rows[0][0], Value::Int(2));
+    assert!(block_on(as_role.execute("insert into public.dbear_level_a values (3)".into())).is_err());
+    block_on(as_role.disconnect());
+
+    // Up to read and write, then down to no access.
+    block_on(conn.apply_access(vec![AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::ReadWrite }])).unwrap();
+    let ctx = block_on(conn.database_level(me.clone(), "postgres".into())).unwrap();
+    assert_eq!(ctx.level, DatabaseLevel::ReadWrite);
+    let as_role = Connection::new(login);
+    block_on(as_role.execute("insert into public.dbear_level_b values (3)".into())).unwrap();
+    block_on(as_role.disconnect());
+    block_on(conn.apply_access(vec![AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::NoAccess }])).unwrap();
+    assert_eq!(block_on(conn.database_level(me.clone(), "postgres".into())).unwrap().level, DatabaseLevel::NoAccess);
+    let access = block_on(conn.list_database_access(me)).unwrap();
+    assert!(access.iter().all(|a| a.privileges.privileges.is_empty()));
+
+    cleanup();
 }

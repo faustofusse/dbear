@@ -105,17 +105,29 @@ final class RustDriver: DatabaseDriver {
         }
     }
 
-    func previewAccess(_ change: AccessChange) throws -> [AccessStatement] {
+    func listDatabaseAccess(of role: RoleRef) async throws -> [DatabaseAccess] {
+        try await bridged { try await connection.listDatabaseAccess(role: DBCoreFFI.RoleRef(role)) }.map {
+            DatabaseAccess(
+                database: $0.database, privileges: PrivilegeSet($0.privileges),
+                everyoneCanConnect: $0.everyoneCanConnect, isOwner: $0.isOwner, level: DatabaseLevel($0.level))
+        }
+    }
+
+    func databaseLevel(of role: RoleRef, in database: String) async throws -> DatabaseLevelContext {
+        DatabaseLevelContext(try await bridged { try await connection.databaseLevel(role: DBCoreFFI.RoleRef(role), database: database) })
+    }
+
+    func previewAccess(_ changes: [AccessChange]) throws -> [AccessStatement] {
         do {
-            return try connection.previewAccess(change: DBCoreFFI.AccessChange(change))
+            return try connection.previewAccess(changes: changes.map(DBCoreFFI.AccessChange.init))
                 .map { AccessStatement(sql: $0.sql, display: $0.display) }
         } catch let error as DBCoreFFI.DbError {
             throw DatabaseError(error)
         }
     }
 
-    func applyAccess(_ change: AccessChange) async throws {
-        try await bridged { try await connection.applyAccess(change: DBCoreFFI.AccessChange(change)) }
+    func applyAccess(_ changes: [AccessChange]) async throws {
+        try await bridged { try await connection.applyAccess(changes: changes.map(DBCoreFFI.AccessChange.init)) }
     }
 
     /// Rethrows core errors as `DatabaseError`.
@@ -561,6 +573,20 @@ extension Access {
         }
     }
 
+    /// Database access levels to offer on `kind`, from least to most.
+    public static func levels(_ kind: DatabaseKind) -> [DatabaseLevel] {
+        DBCoreFFI.databaseLevels(kind: DBCoreFFI.DatabaseKind(kind)).map(DatabaseLevel.init)
+    }
+
+    /// A random password (letters, digits and URL-safe symbols).
+    public static func generatePassword(length: Int = 24) throws -> String {
+        do {
+            return try DBCoreFFI.generatePassword(length: UInt32(clamping: length))
+        } catch let error as DBCoreFFI.DbError {
+            throw DatabaseError(error)
+        }
+    }
+
     /// The privileges that exist on `object` in `kind`, in display order.
     public static func privileges(_ kind: DatabaseKind, on object: GrantObjectKind) -> [String] {
         DBCoreFFI.accessPrivileges(kind: DBCoreFFI.DatabaseKind(kind), object: DBCoreFFI.GrantObjectKind(object))
@@ -677,6 +703,54 @@ extension DBCoreFFI.AccessChange {
             .setPrivileges(
                 role: DBCoreFFI.RoleRef(role), object: DBCoreFFI.GrantObject(object),
                 before: DBCoreFFI.PrivilegeSet(before), after: DBCoreFFI.PrivilegeSet(after))
+        case .setDatabaseLevel(let role, let context, let level):
+            .setDatabaseLevel(role: DBCoreFFI.RoleRef(role), context: DBCoreFFI.DatabaseLevelContext(context), level: DBCoreFFI.DatabaseLevel(level))
         }
+    }
+}
+
+extension DatabaseLevel {
+    init(_ l: DBCoreFFI.DatabaseLevel) {
+        self = switch l {
+        case .noAccess: .noAccess
+        case .connect: .connect
+        case .readOnly: .readOnly
+        case .readWrite: .readWrite
+        case .schemaChanges: .schemaChanges
+        case .custom: .custom
+        }
+    }
+
+    /// "Read only"…
+    public var title: String { DBCoreFFI.databaseLevelTitle(level: DBCoreFFI.DatabaseLevel(self)) }
+
+    /// What the level allows on `kind`, in a sentence.
+    public func summary(_ kind: DatabaseKind) -> String {
+        DBCoreFFI.databaseLevelSummary(level: DBCoreFFI.DatabaseLevel(self), kind: DBCoreFFI.DatabaseKind(kind))
+    }
+}
+
+extension DBCoreFFI.DatabaseLevel {
+    init(_ l: DatabaseLevel) {
+        self = switch l {
+        case .noAccess: .noAccess
+        case .connect: .connect
+        case .readOnly: .readOnly
+        case .readWrite: .readWrite
+        case .schemaChanges: .schemaChanges
+        case .custom: .custom
+        }
+    }
+}
+
+extension DatabaseLevelContext {
+    init(_ c: DBCoreFFI.DatabaseLevelContext) {
+        self.init(database: c.database, level: DatabaseLevel(c.level), privileges: PrivilegeSet(c.privileges), schemas: c.schemas, owners: c.owners)
+    }
+}
+
+extension DBCoreFFI.DatabaseLevelContext {
+    init(_ c: DatabaseLevelContext) {
+        self.init(database: c.database, level: DBCoreFFI.DatabaseLevel(c.level), privileges: DBCoreFFI.PrivilegeSet(c.privileges), schemas: c.schemas, owners: c.owners)
     }
 }

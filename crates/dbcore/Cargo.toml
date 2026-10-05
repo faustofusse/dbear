@@ -24,6 +24,7 @@ futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+getrandom.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 tree-sitter.workspace = true

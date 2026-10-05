@@ -19,7 +19,7 @@ use tokio_postgres::{CancelToken, Client, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::dialect::{error_chain, line_column, Dialect};
-use crate::access::{self, Grant, Role, RoleRef};
+use crate::access::{self, DatabaseAccess, DatabaseLevel, DatabaseLevelContext, Grant, PgLevelFacts, PrivilegeSet, Role, RoleRef};
 use crate::driver::{Driver, Error, Result};
 use crate::edit::{self, EditStatement};
 use crate::keyset::{page_sql, CursorValue, Keyset, PageCursor, RowPage, SeekColumn, Start};
@@ -436,6 +436,129 @@ impl Driver for PostgresDriver {
                 Some(Grant { object, privilege: r.get(3), grantable: r.get(4) })
             })
             .collect())
+    }
+
+    async fn list_database_access(&self, role: &RoleRef) -> Result<Vec<DatabaseAccess>> {
+        let client = self.browse_client().await?;
+        // `pg_database` is shared by the whole server: every database is visible (and grantable) from here.
+        // A NULL ACL means the defaults: the owner has everything, PUBLIC may connect and create temp tables.
+        let rows = client
+            .query(
+                r"
+                select d.datname::text,
+                       array(select a.privilege_type::text from aclexplode(d.datacl) a
+                             where a.grantee = r.oid and a.grantee <> d.datdba order by 1),
+                       coalesce((select bool_and(a.is_grantable) from aclexplode(d.datacl) a
+                                 where a.grantee = r.oid and a.grantee <> d.datdba), false),
+                       exists(select 1 from aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
+                              where a.grantee = 0 and a.privilege_type = 'CONNECT'),
+                       coalesce(d.datdba = r.oid, false)
+                from pg_database d
+                left join (select oid from pg_roles where rolname = $1) r on true
+                where d.datallowconn and not d.datistemplate
+                order by 1
+                ",
+                &[&role.name],
+            )
+            .await
+            .map_err(|e| query_error(&e, None))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let privileges: Vec<String> = r.get(1);
+                let is_owner: bool = r.get(4);
+                // What the role has inside the database needs a connection there: `database_level`.
+                let level = if privileges.is_empty() && !is_owner { DatabaseLevel::NoAccess } else { DatabaseLevel::Custom };
+                DatabaseAccess {
+                    database: r.get(0),
+                    privileges: PrivilegeSet { privileges, grantable: r.get(2) },
+                    everyone_can_connect: r.get(3),
+                    is_owner,
+                    level,
+                }
+            })
+            .collect())
+    }
+
+    async fn database_level(&self, role: &RoleRef, database: &str) -> Result<DatabaseLevelContext> {
+        let client = self.browse_client().await?;
+        // Direct grants only (not PUBLIC's or inherited ones), counted over the user schemas.
+        let row = client
+            .query_one(
+                r"
+                with r as (select oid from pg_roles where rolname = $1),
+                s as (
+                    select n.oid, n.nspname, n.nspowner, n.nspacl from pg_namespace n
+                    where n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+                ),
+                t as (
+                    select c.relkind, c.relowner, c.relacl from pg_class c join s on s.oid = c.relnamespace
+                    where c.relkind in ('r', 'p', 'v', 'm', 'f')
+                ),
+                sp as (
+                    select array(select a.privilege_type::text from aclexplode(s.nspacl) a where a.grantee = (select oid from r)) as p
+                    from s
+                ),
+                tp as (
+                    select t.relkind in ('r', 'p', 'f') as writable,
+                           array(select a.privilege_type::text from aclexplode(t.relacl) a where a.grantee = (select oid from r)) as p
+                    from t
+                ),
+                d as (select datname, datdba, datacl from pg_database where datname = current_database())
+                select
+                    (select datname::text from d),
+                    coalesce((select array_agg(s.nspname::text order by s.nspname) from s), '{}'),
+                    array(select o.rolname::text from pg_roles o
+                          where (o.oid in (select nspowner from s) or o.oid in (select relowner from t)
+                                 or o.oid = (select datdba from d) or o.rolname = current_user)
+                            and pg_has_role(current_user, o.oid, 'MEMBER')
+                            -- pg_database_owner (owner of `public`) never creates anything itself.
+                            and o.rolname !~ '^pg_'
+                          order by 1),
+                    array(select a.privilege_type::text from d, aclexplode(d.datacl) a
+                          where a.grantee = (select oid from r) and a.grantee <> d.datdba order by 1),
+                    (select count(*) from sp),
+                    (select count(*) from sp where 'USAGE' = any(p)),
+                    (select count(*) from sp where 'CREATE' = any(p)),
+                    (select count(*) from tp),
+                    (select count(*) from tp where 'SELECT' = any(p)),
+                    (select count(*) from tp where writable),
+                    (select count(*) from tp where writable and p @> array['INSERT', 'UPDATE', 'DELETE']),
+                    (select count(*) from tp where writable and p @> array['TRUNCATE', 'REFERENCES', 'TRIGGER']),
+                    (select count(*) from tp where p && array['INSERT', 'UPDATE', 'DELETE']),
+                    (select count(*) from tp where p && array['TRUNCATE', 'REFERENCES', 'TRIGGER']),
+                    array(select distinct a.privilege_type::text from pg_default_acl da, aclexplode(da.defaclacl) a
+                          where da.defaclobjtype = 'r' and a.grantee = (select oid from r) order by 1)
+                ",
+                &[&role.name],
+            )
+            .await
+            .map_err(|e| query_error(&e, None))?;
+        let current: String = row.get(0);
+        if current != database {
+            return Err(Error::Internal(format!("asked for “{database}” while connected to “{current}”")));
+        }
+        let facts = PgLevelFacts {
+            database: row.get(3),
+            schemas: row.get(4),
+            schemas_usage: row.get(5),
+            schemas_create: row.get(6),
+            relations: row.get(7),
+            relations_select: row.get(8),
+            writable: row.get(9),
+            writable_write: row.get(10),
+            writable_ddl: row.get(11),
+            any_write: row.get(12),
+            any_ddl: row.get(13),
+            default_table: row.get(14),
+        };
+        Ok(DatabaseLevelContext {
+            database: current,
+            level: access::pg_level(&facts),
+            privileges: PrivilegeSet { privileges: facts.database.clone(), grantable: false },
+            schemas: row.get(1),
+            owners: row.get(2),
+        })
     }
 }
 

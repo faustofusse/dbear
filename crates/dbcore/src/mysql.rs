@@ -19,7 +19,7 @@ use mysql_async::{Column, Conn, Opts, OptsBuilder, SslOpts};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::dialect::{error_chain, hex_preview, Dialect};
-use crate::access::{self, Grant, Role, RoleRef};
+use crate::access::{self, DatabaseAccess, DatabaseLevelContext, Grant, PrivilegeSet, Role, RoleRef};
 use crate::driver::{Driver, Error, Result};
 use crate::edit::{self, EditStatement};
 use crate::keyset::{page_sql, CursorValue, Keyset, PageCursor, RowPage, SeekColumn, Start};
@@ -469,6 +469,47 @@ impl Driver for MysqlDriver {
             .collect();
         grants.sort();
         Ok(grants)
+    }
+
+    async fn list_database_access(&self, role: &RoleRef) -> Result<Vec<DatabaseAccess>> {
+        let account = format!("'{}'@'{}'", role.name.replace('\'', "''"), role.host.as_deref().unwrap_or("%").replace('\'', "''"));
+        let grantee = MYSQL.quote_literal(&account);
+        let sql = format!(
+            "select s.schema_name,
+                    group_concat(p.privilege_type order by p.privilege_type separator ','),
+                    coalesce(min(p.is_grantable = 'YES'), 0)
+             from information_schema.schemata s
+             left join information_schema.schema_privileges p on p.table_schema = s.schema_name and p.grantee = {grantee}
+             where {}
+             group by s.schema_name
+             order by s.schema_name",
+            Self::user_databases("s.schema_name")
+        );
+        let mut lease = self.browse.lease(&self.config).await?;
+        let result = lease.conn().query::<(String, Option<String>, i64), _>(sql).await;
+        let rows = lease.check(result).map_err(|e| query_error(&e))?;
+        Ok(rows
+            .into_iter()
+            .map(|(database, privileges, grantable)| {
+                let privileges: Vec<String> = privileges.map(|p| p.split(',').map(str::to_string).collect()).unwrap_or_default();
+                DatabaseAccess {
+                    database,
+                    level: access::mysql_level(&privileges),
+                    privileges: PrivilegeSet { grantable: grantable != 0 && !privileges.is_empty(), privileges },
+                    everyone_can_connect: false,
+                    is_owner: false,
+                }
+            })
+            .collect())
+    }
+
+    async fn database_level(&self, role: &RoleRef, database: &str) -> Result<DatabaseLevelContext> {
+        let access = self.list_database_access(role).await?;
+        let found = access
+            .into_iter()
+            .find(|a| a.database == database)
+            .ok_or_else(|| Error::Query(format!("No database “{database}”")))?;
+        Ok(DatabaseLevelContext { database: found.database, level: found.level, privileges: found.privileges, schemas: vec![], owners: vec![] })
     }
 }
 

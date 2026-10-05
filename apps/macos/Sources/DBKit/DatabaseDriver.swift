@@ -57,13 +57,25 @@ public protocol DatabaseDriver: Sendable {
     func listRoles() async throws -> [Role]
     /// Privileges granted directly to `role`, grouped by object (Postgres: in this database).
     func listGrants(of role: RoleRef) async throws -> [ObjectPrivileges]
-    /// The SQL `applyAccess` would run (passwords masked in `display`).
-    func previewAccess(_ change: AccessChange) throws -> [AccessStatement]
-    /// Creates, changes or drops a role, or changes its privileges.
-    func applyAccess(_ change: AccessChange) async throws
+    /// `role`'s privileges on every database of the server (none for a role not created yet).
+    func listDatabaseAccess(of role: RoleRef) async throws -> [DatabaseAccess]
+    /// `role`'s level in `database` and what's needed to change it (Postgres reads it in that database).
+    func databaseLevel(of role: RoleRef, in database: String) async throws -> DatabaseLevelContext
+    /// The SQL `applyAccess` would run, in order (passwords masked in `display`).
+    func previewAccess(_ changes: [AccessChange]) throws -> [AccessStatement]
+    /// Creates, changes or drops roles, or changes privileges: in one transaction where possible.
+    func applyAccess(_ changes: [AccessChange]) async throws
 }
 
 extension DatabaseDriver {
+    public func previewAccess(_ change: AccessChange) throws -> [AccessStatement] {
+        try previewAccess([change])
+    }
+
+    public func applyAccess(_ change: AccessChange) async throws {
+        try await applyAccess([change])
+    }
+
     /// One page of a table in its natural order, unfiltered.
     public func fetchRows(of table: TableInfo, limit: Int, offset: Int) async throws -> QueryResult {
         try await fetchRows(of: table, query: RowQuery(), limit: limit, offset: offset)

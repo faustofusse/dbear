@@ -64,7 +64,7 @@ struct WorkspaceView: View {
     @ViewBuilder
     private var content: some View {
         if model.tabs.isEmpty {
-            EmptyPlaceholder(text: "No Table Selected")
+            EmptyPlaceholder(text: model.showsUsers ? "No User Selected" : "No Table Selected")
         } else {
             VStack(spacing: 0) {
                 // Like Safari: no tab bar for a single tab (the toolbar still has New SQL Script, ⌘T).

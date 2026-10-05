@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::access::{Grant, Role, RoleRef};
+use crate::access::{DatabaseAccess, DatabaseLevelContext, Grant, Role, RoleRef};
 
 use crate::edit::EditStatement;
 use crate::keyset::{PageCursor, RowPage};
@@ -82,6 +82,17 @@ pub trait Driver: Send + Sync + 'static {
     }
     /// Privileges granted directly to `role` (not inherited). Postgres: in the current database.
     async fn list_grants(&self, role: &RoleRef) -> Result<Vec<Grant>> {
+        let _ = role;
+        Err(Error::Unsupported(format!("{} has no users to manage here", self.config().kind.display_name())))
+    }
+    /// `role`'s level in `database`, with what's needed to change it. Postgres drivers must be
+    /// connected to `database` (see `Connection::database_level`).
+    async fn database_level(&self, role: &RoleRef, database: &str) -> Result<DatabaseLevelContext> {
+        let _ = (role, database);
+        Err(Error::Unsupported(format!("{} has no users to manage here", self.config().kind.display_name())))
+    }
+    /// `role`'s privileges on every database of the server (also for a role not created yet: none).
+    async fn list_database_access(&self, role: &RoleRef) -> Result<Vec<DatabaseAccess>> {
         let _ = role;
         Err(Error::Unsupported(format!("{} has no users to manage here", self.config().kind.display_name())))
     }
