@@ -20,6 +20,12 @@ fn main() {
     gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(|cx| {
         gpui_kit::init(cx);
         Theme::sync_system_appearance(None, cx);
+        // Selected cells and rows: a soft neutral highlight, like the macOS app (not the theme's blue).
+        Theme::update(cx, |theme| {
+            let fg = theme.colors.foreground;
+            theme.colors.table_active = fg.opacity(0.10);
+            theme.colors.table_active_border = fg.opacity(0.25);
+        });
         Theme::sync_scrollbar_appearance(cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());

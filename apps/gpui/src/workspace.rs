@@ -447,6 +447,32 @@ impl Workspace {
     }
 
     fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let unsaved = match self.tabs.get(ix).map(|t| &t.view) {
+            Some(TabView::Table(tab)) => tab.read(cx).has_unsaved_edits(cx),
+            Some(TabView::Script(_)) => false,
+            None => return,
+        };
+        if unsaved {
+            let workspace = cx.entity().downgrade();
+            let title = self.tabs[ix].title(cx);
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let workspace = workspace.clone();
+                alert
+                    .title(format!("Discard unsaved changes to “{title}”?"))
+                    .description("Your edits haven’t been saved.")
+                    .show_cancel(true)
+                    .button_props(DialogButtonProps::default().ok_text("Discard"))
+                    .on_ok(move |_, window, cx| {
+                        workspace.update(cx, |w, cx| w.remove_tab(ix, window, cx)).ok();
+                        true
+                    })
+            });
+            return;
+        }
+        self.remove_tab(ix, window, cx);
+    }
+
+    fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
         }
