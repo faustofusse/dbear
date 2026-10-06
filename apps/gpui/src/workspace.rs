@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use dbcore::secrets::{self, KeyringSecretStore};
+use dbcore::dialect::Dialect;
+use dbcore::secrets::{self, KeyringSecretStore, SecretStore as _};
 use dbcore::state::StateStore;
 use dbcore::{Connection, ConnectionConfig, ConnectionStore, Schema, TableInfo, TableKind};
 use serde::{Deserialize, Serialize};
@@ -18,11 +19,14 @@ use gpui_kit::component::tab::{Tab as TabItem, TabBar};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::connection_editor::ConnectionEditor;
-use crate::tabs::{History, ScriptTab, TableTab, count, plural};
+use crate::import_dialog::ImportDialog;
+use crate::grid::{RelatedRows, copy};
+use crate::tabs::{History, ScriptTab, TabEvent, TableTab, count, plural};
 
 enum Load<T> {
     Idle,
@@ -50,7 +54,16 @@ struct Session {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum SavedTab {
-    Table { connection: String, database: String, schema: String, table: String, view: bool },
+    Table {
+        connection: String,
+        database: String,
+        schema: String,
+        table: String,
+        view: bool,
+        /// Rows opened through a foreign key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
+    },
     Script { connection: String, database: String, name: String, sql: String },
 }
 
@@ -87,6 +100,7 @@ struct OpenTab {
     /// The connection and database it uses.
     key: TargetKey,
     view: TabView,
+    _events: Subscription,
 }
 
 impl OpenTab {
@@ -103,6 +117,13 @@ impl OpenTab {
             TabView::Script(_) => None,
         }
     }
+
+    fn filter(&self, cx: &App) -> Option<String> {
+        match &self.view {
+            TabView::Table(tab) => tab.read(cx).applied_filter(cx),
+            TabView::Script(_) => None,
+        }
+    }
 }
 
 pub struct Workspace {
@@ -113,6 +134,7 @@ pub struct Workspace {
     restoring: bool,
     restore_task: Option<Task<()>>,
     _quit: Option<Subscription>,
+    _focus_lost: Subscription,
     connections: Vec<ConnectionConfig>,
     /// Why the saved connections or passwords aren't available, shown under the list.
     notice: Option<String>,
@@ -152,6 +174,9 @@ impl Workspace {
         };
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // When the focused element goes away (e.g. the grid, on switching to Structure), nothing would
+        // have focus and the window's shortcuts (new script, close tab) would stop working.
+        let focus_lost = cx.on_focus_lost(window, |this, window, cx| window.focus(&this.focus, cx));
         let state = store.as_ref().and_then(|s| match StateStore::open_beside(s.path()) {
             Ok(state) => Some(Rc::new(RefCell::new(state))),
             Err(e) => {
@@ -170,6 +195,7 @@ impl Workspace {
             restoring: false,
             restore_task: None,
             _quit: Some(quit),
+            _focus_lost: focus_lost,
             connections,
             showing_samples,
             notice: (!notices.is_empty()).then(|| notices.join("\n")),
@@ -195,6 +221,25 @@ impl Workspace {
             Some(connections) => (connections, false),
             None => (dbcore::mock::connections(), true),
         }
+    }
+
+    /// Lists the saved connections again. When the first ones replace the samples, whatever was
+    /// open on a sample (tabs, connections, the selection) goes with them.
+    fn reload_connections(&mut self) {
+        let (connections, showing_samples) = Self::listed_connections(self.store.as_ref());
+        if self.showing_samples && !showing_samples {
+            let samples: Vec<String> = self.connections.iter().map(|c| c.id.clone()).collect();
+            for id in &samples {
+                self.forget(id);
+            }
+            if self.selected.as_ref().is_some_and(|id| samples.contains(id)) {
+                self.selected = None;
+                self.schemas = Load::Idle;
+                self.schemas_task = None;
+            }
+        }
+        self.connections = connections;
+        self.showing_samples = showing_samples;
     }
 
     /// Drops everything opened or cached for connection `id` (it was edited or deleted), its tabs too.
@@ -269,15 +314,248 @@ impl Workspace {
                 None => log::warn!("no keyring: the password for {} isn’t saved", saved.name),
             }
         }
-        let (connections, showing_samples) = Self::listed_connections(self.store.as_ref());
-        self.connections = connections;
-        self.showing_samples = showing_samples;
+        self.reload_connections();
         self.forget(&saved.id);
         // Reopen it with the new settings (or open the new one).
         if is_new || self.selected.as_deref() == Some(saved.id.as_str()) {
             self.selected = None;
             self.select_connection(saved.id, cx);
         }
+        cx.notify();
+        true
+    }
+
+    // MARK: connection actions
+
+    /// Opens the connection (or tries again, when it's selected but failed).
+    fn connect(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(id.as_str()) {
+            self.load_schemas_with(true, false, cx);
+        } else {
+            self.select_connection(id, cx);
+        }
+    }
+
+    /// Closes the connection and its tabs; when it's selected, the window goes back to how it
+    /// looks at launch (like the macOS app).
+    fn disconnect(&mut self, id: &str, cx: &mut Context<Self>) {
+        let open: Vec<Arc<Connection>> = self.open.iter().filter(|((c, _), _)| c == id).map(|(_, c)| c.clone()).collect();
+        self.forget(id);
+        if self.selected.as_deref() == Some(id) {
+            self.selected = None;
+            self.schemas = Load::Idle;
+            self.schemas_task = None;
+        }
+        for connection in open {
+            cx.background_executor().spawn(async move { connection.disconnect().await }).detach();
+        }
+        self.save_session(cx);
+        cx.notify();
+    }
+
+    /// Adds a copy named "… copy", with the same password, and selects it.
+    fn duplicate(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+        let Some(store) = self.store.as_mut() else { return };
+        let mut copy = config.clone();
+        copy.id = String::new();
+        copy.name = format!("{} copy", config.name);
+        copy.password = None;
+        let saved = match store.upsert(copy) {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.notice = Some(format!("Couldn’t duplicate “{}”: {e}", config.name));
+                cx.notify();
+                return;
+            }
+        };
+        self.reload_connections();
+        let (secrets, from, to) = (self.secrets.clone(), config.id.clone(), saved.id.clone());
+        cx.spawn(async move |this, cx| {
+            // The keyring can block (or prompt), so off the UI thread; selected once it's copied.
+            if let Some(secrets) = secrets {
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Ok(Some(password)) = secrets.password(&from) {
+                            if let Err(e) = secrets::save_password(secrets.as_ref(), &to, Some(&password)) {
+                                log::warn!("the copy’s password wasn’t saved: {e}");
+                            }
+                        }
+                    })
+                    .await;
+            }
+            this.update(cx, |this, cx| this.select_connection(saved.id, cx)).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Copies the connection's URL, its saved password included (like the macOS app).
+    fn copy_url(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+        let secrets = self.secrets.clone();
+        cx.spawn(async move |_, cx| {
+            let config = cx
+                .background_executor()
+                .spawn(async move {
+                    match secrets {
+                        Some(store) => secrets::with_password(store.as_ref(), config.clone()).unwrap_or(config),
+                        None => config,
+                    }
+                })
+                .await;
+            cx.update(|cx| copy(config.to_url(true), cx));
+        })
+        .detach();
+    }
+
+    // MARK: related rows
+
+    /// Opens the rows a foreign key leads to, in a tab of their own after the current one.
+    fn open_related(&mut self, key: TargetKey, related: RelatedRows, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connection) = self.open.get(&key).cloned() else { return };
+        let table = self
+            .schema_cache
+            .get(&key)
+            .and_then(|schemas| schemas.iter().find(|s| s.name == related.schema))
+            .and_then(|schema| schema.tables.iter().find(|t| t.name == related.table))
+            .cloned()
+            .unwrap_or_else(|| TableInfo::new(related.schema.clone(), related.table.clone()));
+        let dialect = Dialect(connection.config().kind);
+        if !related.columns.is_empty() {
+            let filter = dialect.match_filter(&related.columns, &related.values);
+            return self.open_filtered(key, connection, table, filter, window, cx);
+        }
+        // SQLite can reference a primary key without naming its columns: look them up.
+        cx.spawn_in(window, async move |this, cx| {
+            let columns: Vec<String> = match connection.describe_table(table.clone()).await {
+                Ok(structure) => structure.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect(),
+                Err(e) => return log::warn!("couldn’t find {}’s primary key: {e}", table.name),
+            };
+            if columns.len() != related.values.len() {
+                return log::warn!("{}’s primary key doesn’t match the foreign key", table.name);
+            }
+            let filter = dialect.match_filter(&columns, &related.values);
+            this.update_in(cx, |w, window, cx| w.open_filtered(key, connection, table, filter, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn open_filtered(
+        &mut self,
+        key: TargetKey,
+        connection: Arc<Connection>,
+        table: TableInfo,
+        filter: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let same = |t: &TableInfo| t.schema == table.schema && t.name == table.name;
+        let existing = self.tabs.iter().position(|tab| {
+            tab.key == key && tab.table(cx).as_ref().is_some_and(same) && tab.filter(cx).as_deref() == Some(filter.as_str())
+        });
+        if let Some(ix) = existing {
+            return self.activate(ix, window, cx);
+        }
+        let view = TabView::Table(cx.new(|cx| {
+            let mut tab = TableTab::new(connection, table, Some(filter), window, cx);
+            tab.preview = false;
+            tab
+        }));
+        let events = self.tab_events(&key, &view, window, cx);
+        let ix = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(ix, OpenTab { key, view, _events: events });
+        self.activate(ix, window, cx);
+    }
+
+    /// A script ran DDL on `key`: its tables are listed again, in the background when shown.
+    fn schema_changed(&mut self, key: &TargetKey, cx: &mut Context<Self>) {
+        self.schema_cache.remove(key);
+        if self.target().is_some_and(|(_, current)| current == *key) {
+            self.load_schemas_with(true, true, cx);
+        }
+    }
+
+    // MARK: importing
+
+    fn open_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.store.as_ref().map(|s| s.connections().to_vec()).unwrap_or_default();
+        let import = cx.new(|cx| ImportDialog::new(existing, cx));
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (import, workspace) = (import.clone(), workspace.clone());
+            let (has_connections, all_selected, count) = {
+                let state = import.read(cx);
+                (state.has_connections(), state.all_selected(), state.selected_count())
+            };
+            let footer = h_flex()
+                .w_full()
+                .gap_2()
+                .child(Button::new("choose").outline().label("Choose…").tooltip("Another data-sources.json, or a DBeaver workspace folder").on_click({
+                    let import = import.clone();
+                    move |_, _, cx| import.update(cx, |d, cx| d.choose_source(cx))
+                }))
+                .when(has_connections, |footer| {
+                    footer.child(Button::new("select-all").ghost().label(if all_selected { "Select None" } else { "Select All" }).on_click({
+                        let import = import.clone();
+                        move |_, _, cx| import.update(cx, |d, cx| d.toggle_all(cx))
+                    }))
+                })
+                .child(div().flex_1())
+                .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(
+                    Button::new("import")
+                        .primary()
+                        .label(if count > 0 { format!("Import {}", count) } else { "Import".to_string() })
+                        .disabled(count == 0)
+                        .on_click({
+                            let import = import.clone();
+                            move |_, window, cx| {
+                            let done = workspace.update(cx, |w, cx| w.import_connections(&import, cx)).unwrap_or(false);
+                            if done {
+                                window.close_dialog(cx);
+                            }
+                        }}),
+                );
+            dialog.title("Import from DBeaver").w(px(600.)).child(import.clone()).footer(footer)
+        });
+    }
+
+    /// Saves the dialog's checked connections, their passwords in the keyring. Returns whether to close it.
+    fn import_connections(&mut self, dialog: &Entity<ImportDialog>, cx: &mut Context<Self>) -> bool {
+        let configs = dialog.read(cx).selected_configs();
+        let Some(store) = self.store.as_mut() else {
+            dialog.update(cx, |d, cx| d.show_error("The connection store isn’t available.".into(), cx));
+            return false;
+        };
+        let mut problems = Vec::new();
+        let mut imported = 0;
+        for mut config in configs {
+            // Imported connections have no id yet, so each one is added (never replaces another).
+            let password = config.password.take().filter(|p| !p.is_empty());
+            let name = config.name.clone();
+            match store.upsert(config) {
+                Ok(saved) => {
+                    imported += 1;
+                    let Some(password) = password else { continue };
+                    match &self.secrets {
+                        Some(secrets) => {
+                            if let Err(e) = secrets::save_password(secrets.as_ref(), &saved.id, Some(&password)) {
+                                problems.push(format!("{name}: the password wasn’t saved ({e})"));
+                            }
+                        }
+                        None => problems.push(format!("{name}: the password wasn’t saved (no keyring)")),
+                    }
+                }
+                Err(e) => problems.push(format!("{name}: {e}")),
+            }
+        }
+        if imported == 0 {
+            dialog.update(cx, |d, cx| d.show_error(problems.join("\n"), cx));
+            return false;
+        }
+        self.reload_connections();
+        // Nothing is opened: imported connections often point at servers that shouldn't be hit unasked.
+        self.notice = (!problems.is_empty()).then(|| format!("Imported {imported}, with problems:\n{}", problems.join("\n")));
+        self.save_session(cx);
         cx.notify();
         true
     }
@@ -318,9 +596,7 @@ impl Workspace {
             self.schemas = Load::Idle;
             self.schemas_task = None;
         }
-        let (connections, showing_samples) = Self::listed_connections(self.store.as_ref());
-        self.connections = connections;
-        self.showing_samples = showing_samples;
+        self.reload_connections();
         cx.notify();
     }
 
@@ -381,17 +657,28 @@ impl Workspace {
     }
 
     fn load_schemas(&mut self, cx: &mut Context<Self>) {
+        self.load_schemas_with(false, false, cx);
+    }
+
+    /// Lists the selected target's tables. `refresh`: ignore what's cached (and list the databases
+    /// again too); `quiet`: keep showing the current list until the new one arrives.
+    fn load_schemas_with(&mut self, refresh: bool, quiet: bool, cx: &mut Context<Self>) {
         let Some((config, key)) = self.target() else { return };
+        if refresh {
+            self.schema_cache.remove(&key);
+        }
         if let Some(schemas) = self.schema_cache.get(&key) {
             self.schemas = Load::Loaded(schemas.clone());
             self.schemas_task = None;
             cx.notify();
             return;
         }
-        self.schemas = Load::Loading;
+        if !(quiet && matches!(self.schemas, Load::Loaded(_))) {
+            self.schemas = Load::Loading;
+        }
         let existing = self.open.get(&key).cloned();
         let secrets = self.secrets.clone();
-        let list_databases = Self::browses_databases(&config) && !self.databases.contains_key(&config.id);
+        let list_databases = Self::browses_databases(&config) && (refresh || !self.databases.contains_key(&config.id));
         self.schemas_task = Some(cx.spawn(async move |this, cx| {
             let connection = match existing {
                 Some(connection) => connection,
@@ -417,14 +704,16 @@ impl Workspace {
                 if current.as_ref() != Some(&key) {
                     return;
                 }
-                this.schemas = match result {
+                match result {
                     Ok(schemas) => {
                         this.open.insert(key.clone(), connection);
                         this.schema_cache.insert(key.clone(), schemas.clone());
-                        Load::Loaded(schemas)
+                        this.schemas = Load::Loaded(schemas);
                     }
-                    Err(e) => Load::Failed(e.to_string()),
-                };
+                    // A background refresh: keep the list it couldn't replace.
+                    Err(e) if quiet && matches!(this.schemas, Load::Loaded(_)) => log::warn!("couldn’t list the tables again: {e}"),
+                    Err(e) => this.schemas = Load::Failed(e.to_string()),
+                }
                 if let Some(databases) = databases {
                     let (id, database) = key;
                     let gone = !databases.contains(&database);
@@ -470,7 +759,9 @@ impl Workspace {
     /// Opens `table` in a tab. A single click reuses the preview tab; `pin` (double-click) keeps it.
     fn open_table(&mut self, table: TableInfo, pin: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some((key, connection)) = self.open_connection() else { return };
-        let existing = self.tabs.iter().position(|tab| tab.key == key && tab.table(cx).as_ref() == Some(&table));
+        let existing = self.tabs.iter().position(|tab| {
+            tab.key == key && tab.table(cx).as_ref() == Some(&table) && tab.filter(cx).is_none()
+        });
         if let Some(ix) = existing {
             if let (true, TabView::Table(tab)) = (pin, &self.tabs[ix].view) {
                 tab.update(cx, |tab, cx| {
@@ -481,12 +772,13 @@ impl Workspace {
             self.activate(ix, window, cx);
             return;
         }
-        let view = cx.new(|cx| {
-            let mut tab = TableTab::new(connection, table, window, cx);
+        let view = TabView::Table(cx.new(|cx| {
+            let mut tab = TableTab::new(connection, table, None, window, cx);
             tab.preview = !pin;
             tab
-        });
-        let tab = OpenTab { key, view: TabView::Table(view) };
+        }));
+        let events = self.tab_events(&key, &view, window, cx);
+        let tab = OpenTab { key, view, _events: events };
         let preview = self.tabs.iter().position(|tab| match &tab.view {
             TabView::Table(t) => t.read(cx).preview,
             TabView::Script(_) => false,
@@ -505,9 +797,26 @@ impl Workspace {
         let name = format!("SQL {}", self.scripts_made);
         let target = self.target_label(&key);
         let history = self.history_for(&key);
-        let view = cx.new(|cx| ScriptTab::new(connection, name, target, history, window, cx));
-        self.tabs.push(OpenTab { key, view: TabView::Script(view) });
+        let view = TabView::Script(cx.new(|cx| ScriptTab::new(connection, name, target, history, window, cx)));
+        let events = self.tab_events(&key, &view, window, cx);
+        self.tabs.push(OpenTab { key, view, _events: events });
         self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    /// Handles what a tab on `key` asks for (related rows, refreshing after DDL).
+    fn tab_events(&self, key: &TargetKey, view: &TabView, window: &Window, cx: &mut Context<Self>) -> Subscription {
+        let key = key.clone();
+        let handle = move |this: &mut Self, event: &TabEvent, window: &mut Window, cx: &mut Context<Self>| match event {
+            TabEvent::OpenRelated(related) => this.open_related(key.clone(), related.clone(), window, cx),
+            TabEvent::SchemaMayHaveChanged => this.schema_changed(&key, cx),
+        };
+        match view {
+            TabView::Table(tab) => {
+                let handle = handle.clone();
+                cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx))
+            }
+            TabView::Script(tab) => cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx)),
+        }
     }
 
     fn history_for(&self, key: &TargetKey) -> Option<History> {
@@ -537,13 +846,15 @@ impl Workspace {
                 let (connection, database) = tab.key.clone();
                 match &tab.view {
                     TabView::Table(t) => {
-                        let table = &t.read(cx).table;
+                        let tab = t.read(cx);
+                        let table = &tab.table;
                         SavedTab::Table {
                             connection,
                             database,
                             schema: table.schema.clone(),
                             table: table.name.clone(),
                             view: table.kind == TableKind::View,
+                            filter: tab.applied_filter(cx),
                         }
                     }
                     TabView::Script(s) => {
@@ -628,13 +939,13 @@ impl Workspace {
 
     fn push_restored(&mut self, key: TargetKey, saved: SavedTab, connection: Arc<Connection>, window: &mut Window, cx: &mut Context<Self>) {
         let view = match saved {
-            SavedTab::Table { schema, table, view, .. } => {
+            SavedTab::Table { schema, table, view, filter, .. } => {
                 let mut table = TableInfo::new(schema, table);
                 if view {
                     table.kind = TableKind::View;
                 }
                 TabView::Table(cx.new(|cx| {
-                    let mut tab = TableTab::new(connection, table, window, cx);
+                    let mut tab = TableTab::new(connection, table, filter, window, cx);
                     tab.preview = false;
                     tab
                 }))
@@ -652,7 +963,8 @@ impl Workspace {
                 }))
             }
         };
-        self.tabs.push(OpenTab { key, view });
+        let events = self.tab_events(&key, &view, window, cx);
+        self.tabs.push(OpenTab { key, view, _events: events });
         cx.notify();
     }
 
@@ -755,14 +1067,50 @@ impl Workspace {
                             let config = c.clone();
                             move |menu, _, _| {
                                 let (edit, delete) = (this.clone(), this.clone());
+                                let (connect, duplicate, copy_url, refresh) = (this.clone(), this.clone(), this.clone(), this.clone());
                                 let (config, id) = (config.clone(), config.id.clone());
-                                menu.item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
+                                let import = this.clone();
+                                let (connect_id, refresh_id) = (id.clone(), id.clone());
+                                let (duplicate_config, url_config) = (config.clone(), config.clone());
+                                let menu = if connected {
+                                    menu.item(PopupMenuItem::new("Disconnect").on_click(move |_, _, cx| {
+                                        connect.update(cx, |w, cx| w.disconnect(&connect_id, cx)).ok();
+                                    }))
+                                    .item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
+                                        let id = refresh_id.clone();
+                                        refresh.update(cx, |w, cx| {
+                                            w.select_connection(id, cx);
+                                            w.load_schemas_with(true, false, cx);
+                                        })
+                                        .ok();
+                                    }))
+                                } else {
+                                    menu.item(PopupMenuItem::new("Connect").on_click(move |_, _, cx| {
+                                        let id = connect_id.clone();
+                                        connect.update(cx, |w, cx| w.connect(id, cx)).ok();
+                                    }))
+                                };
+                                menu.separator()
+                                .item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
                                     let config = config.clone();
                                     edit.update(cx, |w, cx| w.open_editor(Some(config), window, cx)).ok();
                                 }))
+                                .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
+                                    let config = duplicate_config.clone();
+                                    duplicate.update(cx, |w, cx| w.duplicate(config, cx)).ok();
+                                }))
+                                .item(PopupMenuItem::new("Copy URL").on_click(move |_, _, cx| {
+                                    let config = url_config.clone();
+                                    copy_url.update(cx, |w, cx| w.copy_url(config, cx)).ok();
+                                }))
+                                .separator()
                                 .item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
                                     let id = id.clone();
                                     delete.update(cx, |w, cx| w.confirm_delete(id, window, cx)).ok();
+                                }))
+                                .separator()
+                                .item(PopupMenuItem::new("Import from DBeaver…").on_click(move |_, window, cx| {
+                                    import.update(cx, |w, cx| w.open_import(window, cx)).ok();
                                 }))
                             }
                         }),
@@ -777,6 +1125,17 @@ impl Workspace {
         for notice in notices {
             list = list.child(div().mt_4().px_2().text_xs().text_color(theme.muted_foreground).child(notice));
         }
+        if self.showing_samples {
+            list = list.child(
+                h_flex().mt_1().px_1().child(
+                    Button::new("import-samples")
+                        .link()
+                        .small()
+                        .label("Import from DBeaver…")
+                        .on_click(cx.listener(|this, _, window, cx| this.open_import(window, cx))),
+                ),
+            );
+        }
         v_flex().size_full().bg(theme.sidebar).child(div().flex_1().min_h_0().child(list)).child(
             h_flex().p_2().border_t_1().border_color(theme.sidebar_border).child(
                 Button::new("new-connection")
@@ -785,6 +1144,15 @@ impl Workspace {
                     .icon(IconName::Plus)
                     .label("New Connection")
                     .on_click(cx.listener(|this, _, window, cx| this.open_editor(None, window, cx))),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("import-connections")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(AssetIcon::Import))
+                    .tooltip("Import from DBeaver…")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_import(window, cx))),
             ),
         )
     }
@@ -839,13 +1207,21 @@ impl Workspace {
             .border_b_1()
             .border_color(theme.border)
             .child(
-                h_flex().gap_2().child(h_flex().flex_1().min_w_0().child(title)).child(
+                h_flex().gap_1().child(h_flex().flex_1().min_w_0().child(title)).child(
+                    Button::new("refresh-tables")
+                        .ghost()
+                        .small()
+                        .icon(IconName::RefreshCw)
+                        .disabled(matches!(self.schemas, Load::Loading))
+                        .tooltip("Refresh")
+                        .on_click(cx.listener(|this, _, _, cx| this.load_schemas_with(true, false, cx))),
+                ).child(
                     Button::new("new-script")
                         .ghost()
                         .small()
                         .icon(IconName::SquareTerminal)
                         .disabled(!connected)
-                        .tooltip("New SQL Script (⌘T)")
+                        .tooltip(format!("New SQL Script ({})", crate::keys::shortcut("secondary-t")))
                         .on_click(cx.listener(|this, _, window, cx| this.new_script(&NewScript, window, cx))),
                 ),
             )

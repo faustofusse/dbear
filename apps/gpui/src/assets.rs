@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::{AssetSource, Result, SharedString};
 
-icon_assets!(ExtraIcons, [TextWrap]);
+icon_assets!(ExtraIcons, [TextWrap, Import]);
 
 pub struct AppAssets;
 

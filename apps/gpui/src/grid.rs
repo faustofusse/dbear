@@ -12,11 +12,16 @@ use std::sync::Arc;
 
 use dbcore::export::{self, CopyFormat, Target};
 use dbcore::edit::{CellEdit, EditValue, KeyValue, RowChange, is_binary};
-use dbcore::{ColumnInfo, Connection, DatabaseKind, PageCursor, RowPage, RowQuery, SortKey, TableInfo, TableKind, Value};
+use dbcore::{
+    ColumnInfo, Connection, DatabaseKind, ForeignKeyInfo, PageCursor, ReferencingKey, RowPage, RowQuery, SortKey, TableInfo,
+    TableKind, Value,
+};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableSelection, TableState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::tabs::count;
@@ -68,12 +73,34 @@ impl PendingEdits {
 /// Starts editing a cell (the table tab owns the input). Set by the tab, called from the menu.
 pub type BeginEdit = Rc<dyn Fn(usize, usize, &mut Window, &mut App)>;
 
+/// The table's foreign keys and the keys in other tables that point at it (from `describe_table`).
+pub struct Relations {
+    pub foreign_keys: Vec<ForeignKeyInfo>,
+    pub referenced_by: Vec<ReferencingKey>,
+}
+
+/// Rows of another table to open: those whose `columns` equal `values`. Empty `columns`: the
+/// table's primary key (SQLite foreign keys can reference it implicitly).
+#[derive(Clone, Debug)]
+pub struct RelatedRows {
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub values: Vec<Value>,
+}
+
+/// Opens related rows in a tab. Set by the table tab.
+pub type OpenRelated = Rc<dyn Fn(RelatedRows, &mut Window, &mut App)>;
+
 #[derive(Default)]
 pub struct RowsDelegate {
     pub edits: PendingEdits,
     /// The cell being edited and its input.
     pub editing: Option<(usize, usize, Entity<InputState>)>,
     pub begin_edit: Option<BeginEdit>,
+    /// Foreign keys, for the links in their cells and the menu (loaded after the rows).
+    pub relations: Option<Relations>,
+    pub open_related: Option<OpenRelated>,
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Vec<Value>>,
     /// Table size when the driver knows it (first page only; with the filter applied).
@@ -123,9 +150,10 @@ impl RowsDelegate {
         self.total = result.total_count;
     }
 
-    /// Shows the first page of `table`; later pages load on scroll.
-    pub fn show(&mut self, connection: Arc<Connection>, table: TableInfo, page: RowPage) {
+    /// Shows the first page of `table`, read with `query`; later pages load on scroll.
+    pub fn show(&mut self, connection: Arc<Connection>, table: TableInfo, query: RowQuery, page: RowPage) {
         self.clear();
+        self.query = query;
         self.kind = Some(connection.config().kind);
         self.columns = page.result.columns;
         self.rows = page.result.rows;
@@ -343,6 +371,82 @@ impl RowsDelegate {
         }
     }
 
+    // MARK: foreign keys
+
+    /// The loaded values of `columns` in `row`; `None` when one is NULL (it points nowhere), a
+    /// column is missing, or the row is new.
+    fn key_values(&self, row: usize, columns: &[String]) -> Option<Vec<Value>> {
+        let values = self.rows.get(row)?;
+        columns
+            .iter()
+            .map(|name| {
+                let col = self.columns.iter().position(|c| c.name == *name)?;
+                values.get(col).filter(|v| !v.is_null()).cloned()
+            })
+            .collect()
+    }
+
+    /// The rows `row`'s foreign keys point at, with a menu label each.
+    pub fn outgoing(&self, row: usize) -> Vec<(String, RelatedRows)> {
+        let Some(relations) = &self.relations else { return Vec::new() };
+        let keys = &relations.foreign_keys;
+        keys.iter()
+            .filter_map(|fk| {
+                let values = self.key_values(row, &fk.columns)?;
+                // Two keys to the same table: say which columns each one follows.
+                let twice = keys.iter().filter(|k| k.referenced_table == fk.referenced_table).count() > 1;
+                let label = if twice {
+                    format!("Open {} Row ({})", fk.referenced_table, fk.columns.join(", "))
+                } else {
+                    format!("Open {} Row", fk.referenced_table)
+                };
+                let related = RelatedRows {
+                    schema: fk.referenced_schema.clone(),
+                    table: fk.referenced_table.clone(),
+                    columns: fk.referenced_columns.clone(),
+                    values,
+                };
+                Some((label, related))
+            })
+            .collect()
+    }
+
+    /// The link shown in a cell: the row its column's foreign key points at.
+    fn cell_link(&self, row: usize, col: usize) -> Option<RelatedRows> {
+        let name = &self.columns.get(col)?.name;
+        let fk = self.relations.as_ref()?.foreign_keys.iter().find(|fk| fk.columns.contains(name))?;
+        let values = self.key_values(row, &fk.columns)?;
+        Some(RelatedRows {
+            schema: fk.referenced_schema.clone(),
+            table: fk.referenced_table.clone(),
+            columns: fk.referenced_columns.clone(),
+            values,
+        })
+    }
+
+    /// The rows in other tables whose foreign keys point at `row`, with a menu label each.
+    pub fn incoming(&self, row: usize) -> Vec<(String, RelatedRows)> {
+        let Some(relations) = &self.relations else { return Vec::new() };
+        let own_schema = self.source.as_ref().map(|(_, t)| t.schema.as_str());
+        let primary_key: Vec<String> = self.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect();
+        relations
+            .referenced_by
+            .iter()
+            .filter_map(|key| {
+                // An implicit reference (SQLite) points at the primary key.
+                let own = if key.referenced_columns.is_empty() { &primary_key } else { &key.referenced_columns };
+                if own.is_empty() {
+                    return None;
+                }
+                let values = self.key_values(row, own)?;
+                let table =
+                    if Some(key.schema.as_str()) == own_schema { key.table.clone() } else { format!("{}.{}", key.schema, key.table) };
+                let label = format!("{table} ({})", key.columns.join(", "));
+                Some((label, RelatedRows { schema: key.schema.clone(), table: key.table.clone(), columns: key.columns.clone(), values }))
+            })
+            .collect()
+    }
+
     fn is_numeric(&self, col_ix: usize) -> bool {
         let numeric = |v: &Value| matches!(v, Value::Int(_) | Value::Float(_) | Value::Decimal(_));
         self.rows.iter().map(|row| &row[col_ix]).find(|v| !v.is_null()).is_some_and(numeric)
@@ -454,6 +558,33 @@ impl TableDelegate for RowsDelegate {
             .into_any_element();
         }
         let value = &self.rows[row_ix][col_ix];
+        let link = self.open_related.clone().zip(self.cell_link(row_ix, col_ix));
+        if let Some((open, related)) = link {
+            // A foreign key: the value, and an arrow to its row that shows on hover.
+            let numeric = matches!(value, Value::Int(_) | Value::Float(_) | Value::Decimal(_));
+            let text = div().flex_1().min_w_0().overflow_hidden().text_ellipsis().when(numeric, |d| d.text_right()).child(value.display());
+            let tip = SharedString::from(format!("Open the {} row", related.table));
+            let arrow = div()
+                .id(SharedString::from(format!("fk-{row_ix}-{col_ix}")))
+                .flex_shrink_0()
+                .ml_1()
+                .p_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(muted)
+                .opacity(0.)
+                .group_hover("fk-cell", |s| s.opacity(1.))
+                .hover(|s| s.bg(cx.theme().muted).text_color(cx.theme().foreground))
+                .child(Icon::new(IconName::ArrowRight).xsmall())
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                // Not a click on the cell: don't select it.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    open(related.clone(), window, cx);
+                });
+            return cell.group("fk-cell").child(text).child(arrow).into_any_element();
+        }
         match value {
             Value::Null => cell.text_color(muted).italic().child("NULL"),
             Value::Int(_) | Value::Float(_) | Value::Decimal(_) => cell.justify_end().child(value.display()),
@@ -465,87 +596,6 @@ impl TableDelegate for RowsDelegate {
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
         self.value_text(row_ix, col_ix).unwrap_or_default()
-    }
-
-    fn context_menu(
-        &mut self,
-        row_ix: usize,
-        menu: PopupMenu,
-        window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> PopupMenu {
-        let state = cx.entity().downgrade();
-        // The cell under the selection when it's on this row, else none.
-        let cell = match cx.entity().read(cx).selection() {
-            TableSelection::Cell(row, col) if row == row_ix => Some(col),
-            _ => None,
-        };
-        let read = move |cx: &mut App, f: &dyn Fn(&RowsDelegate) -> Option<String>| {
-            if let Some(text) = state.upgrade().and_then(|s| f(s.read(cx).delegate())) {
-                copy(text, cx);
-            }
-        };
-        let mut menu = menu;
-        if self.read_only_reason().is_none() {
-            let grid = cx.entity().downgrade();
-            let edit = move |cx: &mut App, f: &dyn Fn(&mut RowsDelegate)| {
-                grid.update(cx, |state, cx| {
-                    f(state.delegate_mut());
-                    cx.notify();
-                })
-                .ok();
-            };
-            if let Some(col) = cell.filter(|&c| self.is_editable(c)) {
-                if let Some(begin) = self.begin_edit.clone() {
-                    menu = menu.item(PopupMenuItem::new("Edit Value").on_click(move |_, window, cx| begin(row_ix, col, window, cx)));
-                }
-                let (null, default) = (edit.clone(), edit.clone());
-                menu = menu
-                    .item(PopupMenuItem::new("Set to NULL").on_click(move |_, _, cx| null(cx, &|g| g.set_cell(row_ix, col, EditValue::Null))))
-                    .item(PopupMenuItem::new("Set to DEFAULT").on_click(move |_, _, cx| {
-                        default(cx, &|g| g.set_cell(row_ix, col, EditValue::Default))
-                    }));
-            }
-            let label = if self.is_deleted(row_ix) { "Restore Row" } else { "Delete Row" };
-            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| edit(cx, &|g| g.toggle_delete(row_ix)))).separator();
-        }
-        if let Some(col) = cell {
-            let read = read.clone();
-            menu = menu.item(PopupMenuItem::new("Copy Value").on_click(move |_, _, cx| {
-                read(cx, &|grid| grid.value_text(row_ix, col))
-            }));
-        }
-        let (row_copy, headers_copy) = (read.clone(), read.clone());
-        menu = menu
-            .item(PopupMenuItem::new("Copy Row").on_click(move |_, _, cx| {
-                row_copy(cx, &|grid| Some(grid.format(&[row_ix], CopyFormat::Tsv, false)))
-            }))
-            .item(PopupMenuItem::new("Copy Row with Headers").on_click(move |_, _, cx| {
-                headers_copy(cx, &|grid| Some(grid.format(&[row_ix], CopyFormat::Tsv, true)))
-            }));
-        let row_as = read.clone();
-        let row_menu = PopupMenu::build(window, cx, move |mut sub, _, _| {
-            for (format, title) in COPY_FORMATS {
-                let read = row_as.clone();
-                sub = sub.item(PopupMenuItem::new(title).on_click(move |_, _, cx| {
-                    read(cx, &|grid| Some(grid.format(&[row_ix], format, true)))
-                }));
-            }
-            sub
-        });
-        let all_as = read.clone();
-        let all_menu = PopupMenu::build(window, cx, move |mut sub, _, _| {
-            for (format, title) in COPY_FORMATS {
-                let read = all_as.clone();
-                sub = sub.item(PopupMenuItem::new(title).on_click(move |_, _, cx| {
-                    read(cx, &|grid| Some(grid.format(&(0..grid.rows.len()).collect::<Vec<_>>(), format, true)))
-                }));
-            }
-            sub
-        });
-        let loaded = count(self.rows.len() as u64);
-        menu.item(PopupMenuItem::submenu("Copy Row As", row_menu))
-            .item(PopupMenuItem::submenu(format!("Copy All {loaded} Loaded Rows As"), all_menu))
     }
 
     fn has_more(&self, _: &App) -> bool {
@@ -586,4 +636,105 @@ impl TableDelegate for RowsDelegate {
         }));
         cx.notify();
     }
+}
+
+/// The right-click menu for `row_ix` (and the cell in column `cell`): editing, the rows its
+/// foreign keys lead to, and copying. Opened by the tabs (see `tabs::CellMenu`).
+pub fn row_menu(
+    grid: &Entity<TableState<RowsDelegate>>,
+    row_ix: usize,
+    cell: Option<usize>,
+    mut menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut App,
+) -> PopupMenu {
+    let rows = grid.read(cx).delegate();
+    let editable = rows.read_only_reason().is_none();
+    let editable_cell = cell.filter(|&c| rows.is_editable(c));
+    let begin_edit = rows.begin_edit.clone();
+    let deleted = rows.is_deleted(row_ix);
+    let open_related = rows.open_related.clone();
+    let (outgoing, incoming) = (rows.outgoing(row_ix), rows.incoming(row_ix));
+    let loaded = count(rows.rows.len() as u64);
+
+    let state = grid.downgrade();
+    let read = move |cx: &mut App, f: &dyn Fn(&RowsDelegate) -> Option<String>| {
+        if let Some(text) = state.upgrade().and_then(|s| f(s.read(cx).delegate())) {
+            copy(text, cx);
+        }
+    };
+    if editable {
+        let grid = grid.downgrade();
+        let edit = move |cx: &mut App, f: &dyn Fn(&mut RowsDelegate)| {
+            grid.update(cx, |state, cx| {
+                f(state.delegate_mut());
+                cx.notify();
+            })
+            .ok();
+        };
+        if let Some(col) = editable_cell {
+            if let Some(begin) = begin_edit {
+                menu = menu.item(PopupMenuItem::new("Edit Value").on_click(move |_, window, cx| begin(row_ix, col, window, cx)));
+            }
+            let (null, default) = (edit.clone(), edit.clone());
+            menu = menu
+                .item(PopupMenuItem::new("Set to NULL").on_click(move |_, _, cx| null(cx, &|g| g.set_cell(row_ix, col, EditValue::Null))))
+                .item(PopupMenuItem::new("Set to DEFAULT").on_click(move |_, _, cx| {
+                    default(cx, &|g| g.set_cell(row_ix, col, EditValue::Default))
+                }));
+        }
+        let label = if deleted { "Restore Row" } else { "Delete Row" };
+        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| edit(cx, &|g| g.toggle_delete(row_ix)))).separator();
+    }
+    if let Some(open) = open_related {
+        let related = !outgoing.is_empty() || !incoming.is_empty();
+        for (label, target) in outgoing {
+            let open = open.clone();
+            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| open(target.clone(), window, cx)));
+        }
+        if !incoming.is_empty() {
+            let referencing = PopupMenu::build(window, cx, move |mut sub, _, _| {
+                for (label, target) in incoming.iter().cloned() {
+                    let open = open.clone();
+                    sub = sub.item(PopupMenuItem::new(label).on_click(move |_, window, cx| open(target.clone(), window, cx)));
+                }
+                sub
+            });
+            menu = menu.item(PopupMenuItem::submenu("Referenced By", referencing));
+        }
+        if related {
+            menu = menu.separator();
+        }
+    }
+    if let Some(col) = cell {
+        let read = read.clone();
+        menu = menu.item(PopupMenuItem::new("Copy Value").on_click(move |_, _, cx| read(cx, &|grid| grid.value_text(row_ix, col))));
+    }
+    let (row_copy, headers_copy) = (read.clone(), read.clone());
+    menu = menu
+        .item(PopupMenuItem::new("Copy Row").on_click(move |_, _, cx| {
+            row_copy(cx, &|grid| Some(grid.format(&[row_ix], CopyFormat::Tsv, false)))
+        }))
+        .item(PopupMenuItem::new("Copy Row with Headers").on_click(move |_, _, cx| {
+            headers_copy(cx, &|grid| Some(grid.format(&[row_ix], CopyFormat::Tsv, true)))
+        }));
+    let row_as = read.clone();
+    let row_formats = PopupMenu::build(window, cx, move |mut sub, _, _| {
+        for (format, title) in COPY_FORMATS {
+            let read = row_as.clone();
+            sub = sub.item(PopupMenuItem::new(title).on_click(move |_, _, cx| read(cx, &|grid| Some(grid.format(&[row_ix], format, true)))));
+        }
+        sub
+    });
+    let all_formats = PopupMenu::build(window, cx, move |mut sub, _, _| {
+        for (format, title) in COPY_FORMATS {
+            let read = read.clone();
+            sub = sub.item(PopupMenuItem::new(title).on_click(move |_, _, cx| {
+                read(cx, &|grid| Some(grid.format(&(0..grid.rows.len()).collect::<Vec<_>>(), format, true)))
+            }));
+        }
+        sub
+    });
+    menu.item(PopupMenuItem::submenu("Copy Row As", row_formats))
+        .item(PopupMenuItem::submenu(format!("Copy All {loaded} Loaded Rows As"), all_formats))
 }

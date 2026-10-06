@@ -2,9 +2,13 @@
 //! Shown or hidden for every tab at once (⌥⌘I), like the macOS app. On an editable table it edits
 //! the value too: Apply stages it like an edit in the grid (saved with the others, ⌘S).
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use dbcore::edit::EditValue;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 use gpui_kit::component::table::{TableEvent, TableState};
 use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{
@@ -46,6 +50,39 @@ fn wraps_lines(cx: &App) -> bool {
     cx.try_global::<WrapLines>().is_none_or(|w| w.0)
 }
 
+/// The editor's horizontal scroll, for an always-visible scrollbar of our own (the editor's own
+/// follows the system setting, so it only shows while scrolling). The editor doesn't expose its
+/// scroll handle: this mirrors its offset each frame, and a drag is applied on the next render.
+#[derive(Clone, Default)]
+struct HorizontalScroll {
+    offset: Rc<Cell<Point<Pixels>>>,
+    dragged_to: Rc<Cell<Option<Point<Pixels>>>>,
+    viewport: Rc<Cell<Bounds<Pixels>>>,
+    content: Rc<Cell<Size<Pixels>>>,
+}
+
+impl ScrollbarHandle for HorizontalScroll {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.viewport.get()
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        self.offset.get()
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        self.offset.set(offset);
+        self.dragged_to.set(Some(offset));
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        self.content.get()
+    }
+}
+
+/// Space the editor leaves after the longest line (gpui-base's `RIGHT_MARGIN`).
+const EDITOR_RIGHT_MARGIN: Pixels = px(10.);
+
 pub struct Inspector {
     grid: Entity<TableState<RowsDelegate>>,
     /// The cell shown: (row, column).
@@ -55,6 +92,9 @@ pub struct Inspector {
     editor: Entity<EditorState>,
     /// What the editor was loaded with: Apply is enabled once the text differs.
     loaded: String,
+    horizontal: HorizontalScroll,
+    /// Width of the longest line, measured for the text of this length (re-measured when it changes).
+    longest_line: Option<(usize, Pixels)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -100,7 +140,16 @@ impl Inspector {
                 cx.notify();
             }),
         ];
-        Self { grid, focus: None, raw: false, editor, loaded: String::new(), _subscriptions: subscriptions }
+        Self {
+            grid,
+            focus: None,
+            raw: false,
+            editor,
+            loaded: String::new(),
+            horizontal: HorizontalScroll::default(),
+            longest_line: None,
+            _subscriptions: subscriptions,
+        }
     }
 
     /// The focused cell's value as the grid shows it (with pending edits).
@@ -145,6 +194,52 @@ impl Inspector {
         cx.notify();
     }
 
+    /// Our horizontal scrollbar for the editor when lines don't wrap; `None` while wrapping.
+    fn horizontal_scrollbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if wraps_lines(cx) {
+            return None;
+        }
+        if let Some(offset) = self.horizontal.dragged_to.take() {
+            self.editor.update(cx, |e, cx| e.set_scroll_offset(offset, cx));
+        } else {
+            self.horizontal.offset.set(self.editor.read(cx).scroll_offset());
+        }
+        let editor = self.editor.read(cx);
+        let viewport = editor.input_bounds();
+        let text = editor.value();
+        let width = match self.longest_line {
+            Some((len, width)) if len == text.len() => width,
+            _ => {
+                // Monospaced: the line with the most characters is the widest.
+                let longest = text.lines().max_by_key(|l| l.chars().count()).unwrap_or("").to_string();
+                let font_size = window.rem_size() * 0.875; // the editor's `text_sm`
+                let run = TextRun {
+                    len: longest.len(),
+                    font: font(cx.theme().mono_font_family.clone()),
+                    color: Hsla::default(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let width = window.text_system().shape_line(longest.into(), font_size, &[run], None).width;
+                self.longest_line = Some((text.len(), width));
+                width
+            }
+        };
+        self.horizontal.viewport.set(viewport);
+        self.horizontal.content.set(size(width + EDITOR_RIGHT_MARGIN, viewport.size.height));
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(Scrollbar::width())
+                .child(Scrollbar::horizontal(&self.horizontal).viewport_bounds(viewport).mode(ScrollbarMode::Always))
+                .into_any_element(),
+        )
+    }
+
     fn editable(&self, cx: &App) -> bool {
         let Some((row, col)) = self.focus else { return false };
         let grid = self.grid.read(cx).delegate();
@@ -184,7 +279,8 @@ impl Inspector {
 }
 
 impl Render for Inspector {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let horizontal_scrollbar = self.horizontal_scrollbar(window, cx);
         let theme = cx.theme();
         let panel = v_flex().size_full().border_l_1().border_color(theme.border).bg(theme.sidebar);
         let grid = self.grid.read(cx).delegate();
@@ -280,7 +376,7 @@ impl Render for Inspector {
                     Button::new("apply")
                         .primary()
                         .xsmall()
-                        .label("Apply (⌘↩)")
+                        .label(format!("Apply ({})", crate::keys::shortcut("secondary-enter")))
                         .disabled(!dirty)
                         .on_click(cx.listener(|this, _, window, cx| this.apply(&ApplyInspected, window, cx))),
                 )
@@ -291,13 +387,20 @@ impl Render for Inspector {
             .on_action(cx.listener(Self::apply))
             .child(header)
             .child(
-                div().flex_1().min_h_0().px_2().py_1().child(
-                    Editor::new(&self.editor)
-                        .size_full()
-                        .border_0()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_sm(),
-                ),
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        Editor::new(&self.editor)
+                            .size_full()
+                            .border_0()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_sm(),
+                    )
+                    .children(horizontal_scrollbar),
             )
             .children(footer)
     }

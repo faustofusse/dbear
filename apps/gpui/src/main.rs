@@ -5,13 +5,14 @@ mod assets;
 mod connection_editor;
 mod grid;
 mod inspector;
+mod keys;
 mod highlight;
+mod import_dialog;
 mod sql_complete;
 mod tabs;
 mod workspace;
 
 use gpui_kit::component::Theme;
-use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::*;
 
 actions!(dbear, [Quit]);
@@ -29,9 +30,9 @@ fn main() {
             theme.colors.table_active = fg.opacity(0.10);
             theme.colors.table_active_border = fg.opacity(0.25);
         });
-        // Always show scrollbars where there's more to scroll to, so wide tables and long values
-        // show it up front. (Following macOS's "when scrolling" setting hid them until you scrolled.)
-        Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
+        // Scrollbars follow the system setting (on macOS usually "when scrolling"). The grid and the
+        // inspector add an always-visible horizontal one of their own.
+        Theme::sync_scrollbar_appearance(cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_global(inspector::ShowInspector(false));

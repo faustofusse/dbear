@@ -1,6 +1,6 @@
 //! What the right pane shows: a table (rows or structure), or a SQL script with its results.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use dbcore::{Connection, QueryResult, RowQuery, TableInfo, TableStructure};
 use gpui_kit::base::SelectableText;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::{ScrollableElement as _, Scrollbar, ScrollbarMode};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
@@ -20,14 +20,23 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, IconName, Selectab
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::grid::{PAGE_SIZE, RowsDelegate, copy};
+use crate::grid::{PAGE_SIZE, RelatedRows, Relations, RowsDelegate, copy, row_menu};
 use crate::inspector::{self, Inspector};
 use crate::sql_complete::{SharedCatalog, SqlCompletion};
 use crate::highlight;
+use crate::keys;
 use dbcore::complete::Catalog;
 use dbcore::dialect::Dialect;
 use dbcore::state::{NewHistoryEntry, StateStore};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+
+/// What a tab asks of the workspace.
+pub enum TabEvent {
+    /// Open rows of another table (a foreign key, either way) in a tab of their own.
+    OpenRelated(RelatedRows),
+    /// A script ran DDL: the tables column should list the tables again.
+    SchemaMayHaveChanged,
+}
 
 /// Rows kept from one script result (like the macOS app); the rest are counted, not shown.
 pub const SCRIPT_ROW_LIMIT: u32 = 10_000;
@@ -91,13 +100,72 @@ fn copy_selection(grid: &Entity<TableState<RowsDelegate>>, headers: bool, cx: &m
 /// `settling`: drawn fully transparent. A new table measures its height while it draws, and only
 /// adds the striped filler rows below the data on the frame after; drawing that first frame
 /// invisibly avoids a flash of empty space (see `Settle`).
-fn data_table(grid: &Entity<TableState<RowsDelegate>>, settling: bool) -> AnyElement {
+///
+/// The horizontal scrollbar is always shown when the columns don't fit (so it's clear there's more
+/// to the right); the vertical one follows the system setting like every other list.
+fn data_table(grid: &Entity<TableState<RowsDelegate>>, settling: bool, menu: &CellMenu, cx: &App) -> AnyElement {
+    let horizontal = grid.read(cx).horizontal_scroll_handle.clone();
+    let pointer = menu.pointer.clone();
     div()
+        .id("grid")
+        .relative()
+        // Before the cell sees it: where a right-click's menu opens.
+        .capture_any_mouse_down(move |event, _, _| pointer.set(event.position))
         .size_full()
         .overflow_hidden()
         .when(settling, |d| d.opacity(0.))
-        .child(DataTable::new(grid).stripe(true).bordered(false))
+        .child(DataTable::new(grid).stripe(true).bordered(false).scrollbar_visible(true, false))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(Scrollbar::width())
+                .child(Scrollbar::horizontal(&horizontal).viewport_from_layout().mode(ScrollbarMode::Always)),
+        )
         .into_any_element()
+}
+
+/// The grid's right-click menu. gpui-component's table opens its own menu only for a right-click
+/// on a row; with cells selectable, the cell takes the click, so the tab opens this one instead.
+#[derive(Default)]
+struct CellMenu {
+    /// Where the mouse last went down on the grid: the menu opens there.
+    pointer: Rc<Cell<Point<Pixels>>>,
+    open: Option<(Entity<PopupMenu>, Point<Pixels>)>,
+    _dismiss: Option<Subscription>,
+}
+
+impl CellMenu {
+    fn open<T: 'static>(
+        &mut self,
+        grid: &Entity<TableState<RowsDelegate>>,
+        row: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<T>,
+        get: fn(&mut T) -> &mut CellMenu,
+    ) {
+        let grid = grid.clone();
+        let menu = PopupMenu::build(window, cx, move |menu, window, cx| row_menu(&grid, row, Some(col), menu, window, cx));
+        self._dismiss = Some(cx.subscribe_in(&menu, window, move |this, _, _: &DismissEvent, _, cx| {
+            get(this).open = None;
+            cx.notify();
+        }));
+        menu.read(cx).focus_handle(cx).focus(window, cx);
+        self.open = Some((menu, self.pointer.get()));
+        cx.notify();
+    }
+
+    fn render(&self) -> Option<AnyElement> {
+        let (menu, position) = self.open.clone()?;
+        Some(
+            deferred(anchored().position(position).snap_to_window_with_margin(px(8.)).child(menu))
+                .with_priority(1)
+                .into_any_element(),
+        )
+    }
 }
 
 /// Hides a grid for the frame it first appears in (see `data_table`).
@@ -137,7 +205,7 @@ fn inspector_button(cx: &App) -> Button {
         .small()
         .icon(IconName::PanelRight)
         .selected(inspector::is_shown(cx))
-        .tooltip("Show/Hide Inspector (⌥⌘I)")
+        .tooltip(format!("Show/Hide Inspector ({})", keys::shortcut("alt-secondary-i")))
         .on_click(|_, _, cx| inspector::toggle(cx))
 }
 
@@ -226,22 +294,41 @@ pub struct TableTab {
     edit_notice: Option<String>,
     edit_subscriptions: Vec<Subscription>,
     settle: Settle,
+    menu: CellMenu,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl TableTab {
-    pub fn new(connection: Arc<Connection>, table: TableInfo, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `filter`: a `WHERE` condition to start with (rows opened through a foreign key).
+    pub fn new(
+        connection: Arc<Connection>,
+        table: TableInfo,
+        filter: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let grid = new_grid(window, cx);
         let inspector = cx.new(|cx| Inspector::new(grid.clone(), window, cx));
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter rows, e.g. status = 'paid' and total > 10"));
-        // The grid's menu starts edits through the tab, which owns the input.
+        let typed = filter.clone().unwrap_or_default();
+        let filter_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Filter rows, e.g. status = 'paid' and total > 10").default_value(typed)
+        });
+        let query = RowQuery { filter, ..RowQuery::default() };
+        // The grid's menu starts edits and opens related rows through the tab.
         let tab = cx.entity().downgrade();
         grid.update(cx, |state, _| {
-            state.delegate_mut().begin_edit = Some(Rc::new(move |row, col, window, cx| {
-                tab.update(cx, |tab, cx| tab.begin_edit(row, col, window, cx)).ok();
+            let rows = state.delegate_mut();
+            rows.query = query.clone();
+            let edit_tab = tab.clone();
+            rows.begin_edit = Some(Rc::new(move |row, col, window, cx| {
+                edit_tab.update(cx, |tab, cx| tab.begin_edit(row, col, window, cx)).ok();
+            }));
+            rows.open_related = Some(Rc::new(move |related, _, cx| {
+                tab.update(cx, |_, cx| cx.emit(TabEvent::OpenRelated(related))).ok();
             }));
         });
+        let filter = filter_input;
         let subscriptions = vec![
             cx.observe(&grid, |this, grid, cx| {
                 // A tab with unsaved edits isn't a preview anymore: the next table opens beside it.
@@ -250,10 +337,12 @@ impl TableTab {
                 }
                 cx.notify();
             }),
-            cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| {
-                if let TableEvent::DoubleClickedCell(row, col) = *event {
-                    this.begin_edit(row, col, window, cx);
+            cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| match *event {
+                TableEvent::DoubleClickedCell(row, col) => this.begin_edit(row, col, window, cx),
+                TableEvent::RightClickedCell(row, col) => {
+                    this.menu.open(&this.grid, row, col, window, cx, |this: &mut Self| &mut this.menu)
                 }
+                _ => {}
             }),
             cx.observe_global::<inspector::ShowInspector>(|_, cx| cx.notify()),
             cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
@@ -265,15 +354,17 @@ impl TableTab {
         let task = cx.spawn({
             let (connection, table) = (connection.clone(), table.clone());
             async move |this, cx| {
-                let result = connection.fetch_page(table.clone(), RowQuery::default(), PAGE_SIZE, None).await;
+                let result = connection.fetch_page(table.clone(), query.clone(), PAGE_SIZE, None).await;
                 this.update(cx, |this, cx| {
                     this.rows = match result {
                         Ok(page) => {
                             this.grid.update(cx, |state, cx| {
-                                state.delegate_mut().show(connection, table, page);
+                                state.delegate_mut().show(connection, table, query, page);
                                 state.refresh(cx);
                             });
                             this.settle.start();
+                            // The foreign keys make cells into links; the structure view reuses it.
+                            this.load_structure(cx);
                             Load::Loaded
                         }
                         Err(e) => Load::Failed(e.to_string()),
@@ -296,6 +387,7 @@ impl TableTab {
             edit_notice: None,
             edit_subscriptions: Vec::new(),
             settle: Settle::default(),
+            menu: CellMenu::default(),
             _tasks: vec![task],
             _subscriptions: subscriptions,
         }
@@ -303,6 +395,11 @@ impl TableTab {
 
     pub fn title(&self) -> String {
         self.table.name.clone()
+    }
+
+    /// The `WHERE` filter the rows are read with.
+    pub fn applied_filter(&self, cx: &App) -> Option<String> {
+        self.grid.read(cx).delegate().query.filter.clone()
     }
 
     pub fn has_unsaved_edits(&self, cx: &App) -> bool {
@@ -487,24 +584,48 @@ impl TableTab {
         self.apply_filter(cx);
     }
 
-    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+    fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = mode;
-        if mode == Mode::Structure && matches!(self.structure, Structure::NotLoaded | Structure::Failed(_)) {
-            self.structure = Structure::Loading;
-            let (connection, table) = (self.connection.clone(), self.table.clone());
-            self._tasks.push(cx.spawn(async move |this, cx| {
-                let result = connection.describe_table(table).await;
-                this.update(cx, |this, cx| {
-                    this.structure = match result {
-                        Ok(structure) => Structure::Loaded(structure),
-                        Err(e) => Structure::Failed(e.to_string()),
-                    };
-                    cx.notify();
-                })
-                .ok();
-            }));
+        if mode == Mode::Data {
+            self.focus_grid(window, cx);
+        }
+        if mode == Mode::Structure && matches!(self.structure, Structure::Failed(_)) {
+            self.structure = Structure::NotLoaded;
+        }
+        if mode == Mode::Structure {
+            self.load_structure(cx);
         }
         cx.notify();
+    }
+
+    /// Describes the table once: for the structure view, and the grid's foreign key links.
+    fn load_structure(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.structure, Structure::NotLoaded) {
+            return;
+        }
+        self.structure = Structure::Loading;
+        let (connection, table) = (self.connection.clone(), self.table.clone());
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let result = connection.describe_table(table).await;
+            this.update(cx, |this, cx| {
+                this.structure = match result {
+                    Ok(structure) => {
+                        let relations = Relations {
+                            foreign_keys: structure.foreign_keys.clone(),
+                            referenced_by: structure.referenced_by.clone(),
+                        };
+                        this.grid.update(cx, |state, cx| {
+                            state.delegate_mut().relations = Some(relations);
+                            cx.notify();
+                        });
+                        Structure::Loaded(structure)
+                    }
+                    Err(e) => Structure::Failed(e.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn render_data(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -537,7 +658,7 @@ impl TableTab {
             Load::Loading => centered().child(Spinner::new()).into_any_element(),
             Load::Failed(e) => message("Couldn’t Load Rows", e.clone(), cx).into_any_element(),
             Load::Loaded => {
-                let table = data_table(&self.grid, self.settle.0);
+                let table = data_table(&self.grid, self.settle.0, &self.menu, cx);
                 grid_with_inspector(table, &self.inspector, cx)
             }
         };
@@ -555,7 +676,7 @@ impl TableTab {
                     Button::new("review")
                         .primary()
                         .small()
-                        .label("Review & Save… (⌘S)")
+                        .label(format!("Review & Save… ({})", keys::shortcut("secondary-s")))
                         .on_click(cx.listener(|this, _, window, cx| this.review(&SaveEdits, window, cx))),
                 )
         });
@@ -674,6 +795,8 @@ fn section(title: &str, headers: &[&str], rows: Vec<Vec<String>>, cx: &App) -> i
     v_flex().gap_2().child(div().font_semibold().child(title.to_string())).child(table)
 }
 
+impl EventEmitter<TabEvent> for TableTab {}
+
 impl Render for TableTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.settle.tick(window, cx, |this: &mut Self| &mut this.settle);
@@ -713,7 +836,7 @@ impl Render for TableTab {
         let mode = self.mode;
         let editable = matches!(self.rows, Load::Loaded) && self.grid.read(cx).delegate().read_only_reason().is_none();
         let mode_button = |id: &'static str, label: &'static str, m: Mode, cx: &mut Context<Self>| {
-            Button::new(id).ghost().small().label(label).selected(mode == m).on_click(cx.listener(move |this, _, _, cx| this.set_mode(m, cx)))
+            Button::new(id).ghost().small().label(label).selected(mode == m).on_click(cx.listener(move |this, _, window, cx| this.set_mode(m, window, cx)))
         };
         v_flex()
             .key_context("TableTab")
@@ -753,6 +876,7 @@ impl Render for TableTab {
             )
             .child(div().flex_1().min_h_0().child(body))
             .child(status_bar(status, cx))
+            .children(self.menu.render())
     }
 }
 
@@ -880,6 +1004,7 @@ pub struct ScriptTab {
     run_task: Option<Task<()>>,
     history: Option<History>,
     settle: Settle,
+    menu: CellMenu,
     _catalog_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -903,7 +1028,14 @@ impl ScriptTab {
         });
         let grid = new_grid(window, cx);
         let inspector = cx.new(|cx| Inspector::new(grid.clone(), window, cx));
-        let subscriptions = vec![cx.observe_global::<inspector::ShowInspector>(|_, cx| cx.notify())];
+        let subscriptions = vec![
+            cx.observe_global::<inspector::ShowInspector>(|_, cx| cx.notify()),
+            cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| {
+                if let TableEvent::RightClickedCell(row, col) = *event {
+                    this.menu.open(&this.grid, row, col, window, cx, |this: &mut Self| &mut this.menu);
+                }
+            }),
+        ];
         // Tables and columns for completion. Keywords complete meanwhile, and if this fails.
         let catalog_task = cx.spawn({
             let connection = connection.clone();
@@ -927,6 +1059,7 @@ impl ScriptTab {
             run_task: None,
             history,
             settle: Settle::default(),
+            menu: CellMenu::default(),
             _catalog_task: catalog_task,
             _subscriptions: subscriptions,
         }
@@ -1017,6 +1150,10 @@ impl ScriptTab {
             let result = connection.execute_limited(sql.clone(), Some(SCRIPT_ROW_LIMIT)).await;
             this.update(cx, |this, cx| {
                 this.record(&sql, &result, started.elapsed());
+                // Even when it failed: a script can create a table, then fail on a later statement.
+                if !matches!(result, Err(dbcore::Error::Cancelled)) && dbcore::dialect::changes_schema(&sql) {
+                    cx.emit(TabEvent::SchemaMayHaveChanged);
+                }
                 this.show(result, started.elapsed(), cx);
             })
             .ok();
@@ -1082,6 +1219,8 @@ fn took(duration: Duration) -> String {
     }
 }
 
+impl EventEmitter<TabEvent> for ScriptTab {}
+
 impl Render for ScriptTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.settle.tick(window, cx, |this: &mut Self| &mut this.settle);
@@ -1100,7 +1239,11 @@ impl Render for ScriptTab {
             .child(div().font_semibold().child(self.name.clone()))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.target.clone()))
             .child(div().flex_1())
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if running { "⌘. to stop" } else { "⌘↩ runs the selection or the script" }))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if running {
+                format!("{} to stop", keys::shortcut("secondary-."))
+            } else {
+                format!("{} runs the selection or the script", keys::shortcut("secondary-enter"))
+            }))
             .child(self.history_menu(cx))
             .child(inspector_button(cx))
             .child(run);
@@ -1109,7 +1252,7 @@ impl Render for ScriptTab {
             Outcome::Idle => centered().text_color(cx.theme().muted_foreground).child("Run a query to see its results").into_any_element(),
             Outcome::Running(_) => centered().child(Spinner::new()).into_any_element(),
             Outcome::Rows { .. } => {
-                grid_with_inspector(data_table(&self.grid, self.settle.0), &self.inspector, cx)
+                grid_with_inspector(data_table(&self.grid, self.settle.0, &self.menu, cx), &self.inspector, cx)
             }
             Outcome::Affected { rows, .. } => centered()
                 .text_lg()
@@ -1152,5 +1295,6 @@ impl Render for ScriptTab {
                 ),
             )
             .child(status_bar(status, cx))
+            .children(self.menu.render())
     }
 }
