@@ -936,6 +936,10 @@ impl Workspace {
                         cx.stop_propagation();
                         this.close_tab_at(ix, window, cx)
                     }));
+                // The tab pads its label on both sides but not the suffix, so the
+                // button would sit far from the title and flush against the right
+                // edge. Pull it into the label's padding and pad its right side.
+                let close = div().ml(px(-8.)).pr_2().child(close);
                 bar = bar.child(TabItem::new().label(tab.title(cx)).suffix(close));
             }
             bar
