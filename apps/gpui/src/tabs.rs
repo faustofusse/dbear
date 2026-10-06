@@ -54,9 +54,31 @@ actions!(
         SaveEdits,
         StartEdit,
         NextCell,
-        PreviousCell
+        PreviousCell,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom
     ]
 );
+
+/// The script editor's text size in points, the same for every script (⌘+ / ⌘- / ⌘0, like the
+/// macOS app). Saved by the workspace.
+pub struct EditorFontSize(pub f32);
+
+impl Global for EditorFontSize {}
+
+impl EditorFontSize {
+    pub const DEFAULT: f32 = 14.;
+    pub const RANGE: std::ops::RangeInclusive<f32> = 8.0..=40.0;
+
+    pub fn get(cx: &App) -> f32 {
+        cx.try_global::<Self>().map_or(Self::DEFAULT, |size| size.0)
+    }
+
+    fn set(size: f32, cx: &mut App) {
+        cx.set_global(Self(size.clamp(*Self::RANGE.start(), *Self::RANGE.end())));
+    }
+}
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -73,6 +95,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-tab", PreviousCell, Some("CellEditor > Input")),
         KeyBinding::new("secondary-backspace", DeleteRow, Some("DataTable")),
         KeyBinding::new("secondary-s", SaveEdits, Some("TableTab")),
+        KeyBinding::new("secondary-=", ZoomIn, Some("ScriptTab")),
+        KeyBinding::new("secondary-+", ZoomIn, Some("ScriptTab")),
+        KeyBinding::new("secondary--", ZoomOut, Some("ScriptTab")),
+        KeyBinding::new("secondary-0", ResetZoom, Some("ScriptTab")),
     ]);
 }
 
@@ -1030,6 +1056,7 @@ impl ScriptTab {
         let inspector = cx.new(|cx| Inspector::new(grid.clone(), window, cx));
         let subscriptions = vec![
             cx.observe_global::<inspector::ShowInspector>(|_, cx| cx.notify()),
+            cx.observe_global::<EditorFontSize>(|_, cx| cx.notify()),
             cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| {
                 if let TableEvent::RightClickedCell(row, col) = *event {
                     this.menu.open(&this.grid, row, col, window, cx, |this: &mut Self| &mut this.menu);
@@ -1143,6 +1170,8 @@ impl ScriptTab {
         if sql.trim().is_empty() {
             return;
         }
+        // ⌘↩ while completing: the suggestions would stay over the results.
+        self.editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
         let started = Instant::now();
         self.outcome = Outcome::Running(started);
         let connection = self.connection.clone();
@@ -1281,6 +1310,9 @@ impl Render for ScriptTab {
             .key_context("ScriptTab")
             .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::cancel))
+            .on_action(|_: &ZoomIn, _, cx| EditorFontSize::set(EditorFontSize::get(cx) + 1., cx))
+            .on_action(|_: &ZoomOut, _, cx| EditorFontSize::set(EditorFontSize::get(cx) - 1., cx))
+            .on_action(|_: &ResetZoom, _, cx| EditorFontSize::set(EditorFontSize::DEFAULT, cx))
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| copy_selection(&this.grid, false, cx)))
             .on_action(cx.listener(|this, _: &CopySelectionWithHeaders, _, cx| copy_selection(&this.grid, true, cx)))
             .size_full()
@@ -1289,7 +1321,11 @@ impl Render for ScriptTab {
                 div().flex_1().min_h_0().child(
                     v_resizable("script-split")
                         .child(resizable_panel().size(px(260.)).size_range(px(80.)..px(2000.)).child(
-                            Editor::new(&self.editor).size_full().border_0().font_family(cx.theme().mono_font_family.clone()).text_sm(),
+                            Editor::new(&self.editor)
+                                .size_full()
+                                .border_0()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(px(EditorFontSize::get(cx))),
                         ))
                         .child(resizable_panel().child(results)),
                 ),

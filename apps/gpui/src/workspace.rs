@@ -8,7 +8,7 @@ use std::sync::Arc;
 use dbcore::dialect::Dialect;
 use dbcore::secrets::{self, KeyringSecretStore, SecretStore as _};
 use dbcore::state::StateStore;
-use dbcore::{Connection, ConnectionConfig, ConnectionStore, Schema, TableInfo, TableKind};
+use dbcore::{Connection, ConnectionConfig, ConnectionStore, DatabaseKind, Schema, TableInfo, TableKind};
 use serde::{Deserialize, Serialize};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -18,15 +18,18 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab as TabItem, TabBar};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::backup::{Backups, DumpDialog, DumpPreset, Restored, RestoreDialog};
 use crate::connection_editor::ConnectionEditor;
 use crate::import_dialog::ImportDialog;
+use crate::new_database::{CreateRequested, NewDatabaseDialog};
 use crate::grid::{RelatedRows, copy};
-use crate::tabs::{History, ScriptTab, TabEvent, TableTab, count, plural};
+use crate::users::{self, RoleCreated, UsersState, UsersTab};
+use crate::tabs::{EditorFontSize, History, ScriptTab, TabEvent, TableTab, count, plural};
 
 enum Load<T> {
     Idle,
@@ -38,10 +41,37 @@ enum Load<T> {
 /// One connection per (connection id, database): Postgres can't switch databases on a session.
 type TargetKey = (String, String);
 
-actions!(dbear, [NewScript, CloseTab]);
+actions!(
+    dbear,
+    [NewScript, CloseTab, PreviousTab, NextTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, LastTab]
+);
+
+/// A tab being dragged to a new place in the tab bar.
+#[derive(Clone)]
+struct DraggedTab {
+    ix: usize,
+    title: SharedString,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .shadow_md()
+            .text_sm()
+            .child(self.title.clone())
+    }
+}
 
 /// Key of the open tabs in the state store.
 const SESSION_KEY: &str = "gpui.session";
+/// Key of the script editor's text size in the state store.
+const FONT_SIZE_KEY: &str = "gpui.editor_font_size";
 
 /// What's reopened at launch: the selection and the tabs, in order.
 #[derive(Serialize, Deserialize, Default)]
@@ -88,12 +118,33 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-t", NewScript, Some("Workspace")),
         KeyBinding::new("secondary-w", CloseTab, Some("Workspace")),
+        // Like the macOS app (⌘⇧[ / ⌘⇧]), plus the usual Linux and Windows ones.
+        KeyBinding::new("secondary-shift-[", PreviousTab, Some("Workspace")),
+        KeyBinding::new("secondary-shift-]", NextTab, Some("Workspace")),
+        KeyBinding::new("secondary-{", PreviousTab, Some("Workspace")),
+        KeyBinding::new("secondary-}", NextTab, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("Workspace")),
+        KeyBinding::new("ctrl-tab", NextTab, Some("Workspace")),
+        KeyBinding::new("ctrl-pageup", PreviousTab, Some("Workspace")),
+        KeyBinding::new("ctrl-pagedown", NextTab, Some("Workspace")),
+        // ⌘1–⌘8 pick that tab and ⌘9 the last, like browsers.
+        KeyBinding::new("secondary-1", SelectTab1, Some("Workspace")),
+        KeyBinding::new("secondary-2", SelectTab2, Some("Workspace")),
+        KeyBinding::new("secondary-3", SelectTab3, Some("Workspace")),
+        KeyBinding::new("secondary-4", SelectTab4, Some("Workspace")),
+        KeyBinding::new("secondary-5", SelectTab5, Some("Workspace")),
+        KeyBinding::new("secondary-6", SelectTab6, Some("Workspace")),
+        KeyBinding::new("secondary-7", SelectTab7, Some("Workspace")),
+        KeyBinding::new("secondary-8", SelectTab8, Some("Workspace")),
+        KeyBinding::new("secondary-9", LastTab, Some("Workspace")),
     ]);
 }
 
 enum TabView {
     Table(Entity<TableTab>),
     Script(Entity<ScriptTab>),
+    /// A connection's users (the role selected in the middle column).
+    Users(Entity<UsersTab>),
 }
 
 struct OpenTab {
@@ -108,20 +159,21 @@ impl OpenTab {
         match &self.view {
             TabView::Table(tab) => tab.read(cx).title(),
             TabView::Script(tab) => tab.read(cx).name.clone(),
+            TabView::Users(tab) => tab.read(cx).title(cx),
         }
     }
 
     fn table(&self, cx: &App) -> Option<TableInfo> {
         match &self.view {
             TabView::Table(tab) => Some(tab.read(cx).table.clone()),
-            TabView::Script(_) => None,
+            TabView::Script(_) | TabView::Users(_) => None,
         }
     }
 
     fn filter(&self, cx: &App) -> Option<String> {
         match &self.view {
             TabView::Table(tab) => tab.read(cx).applied_filter(cx),
-            TabView::Script(_) => None,
+            TabView::Script(_) | TabView::Users(_) => None,
         }
     }
 }
@@ -135,6 +187,12 @@ pub struct Workspace {
     restore_task: Option<Task<()>>,
     _quit: Option<Subscription>,
     _focus_lost: Subscription,
+    _font_size: Subscription,
+    /// Dumps and restores running in the background.
+    backups: Entity<Backups>,
+    _restored: Subscription,
+    /// Enter in the open "New Database" dialog.
+    _new_database: Option<Subscription>,
     connections: Vec<ConnectionConfig>,
     /// Why the saved connections or passwords aren't available, shown under the list.
     notice: Option<String>,
@@ -151,6 +209,12 @@ pub struct Workspace {
     database: String,
     schemas: Load<Vec<Schema>>,
     collapsed: HashSet<String>,
+    /// The tables column hides views.
+    tables_only: bool,
+    /// The middle column lists users instead of tables (Postgres, MySQL).
+    users_mode: bool,
+    /// Each connection's users (roles are server-wide), and the tab showing them.
+    users: HashMap<String, (Entity<UsersState>, Entity<UsersTab>)>,
     tabs: Vec<OpenTab>,
     active: usize,
     /// Scripts opened so far, for their names ("SQL 1", "SQL 2"…).
@@ -184,6 +248,24 @@ impl Workspace {
                 None
             }
         });
+        // The script editor's text size, as last zoomed; saved whenever it changes.
+        if let Some(size) = state.as_ref().and_then(|s| s.borrow().get(FONT_SIZE_KEY)).and_then(|v| v.parse::<f32>().ok()) {
+            cx.set_global(EditorFontSize(size));
+        }
+        let font_size = cx.observe_global::<EditorFontSize>(|this, cx| {
+            let size = EditorFontSize::get(cx);
+            if let Some(state) = &this.state {
+                let value = (size != EditorFontSize::DEFAULT).then(|| size.to_string());
+                if let Err(e) = state.borrow_mut().set(FONT_SIZE_KEY, value.as_deref()) {
+                    log::warn!("couldn’t save the editor’s text size: {e}");
+                }
+            }
+        });
+        let backups = cx.new(|_| Backups::default());
+        // A restore may have created or dropped tables: list them again.
+        let restored = cx.subscribe(&backups, |this, _, event: &Restored, cx| {
+            this.schema_changed(&(event.connection_id.clone(), event.database.clone()), cx);
+        });
         // Script text isn't saved as you type: the last of it is saved when the app quits.
         let quit = cx.on_app_quit(|this, cx| {
             this.save_session(cx);
@@ -196,6 +278,10 @@ impl Workspace {
             restore_task: None,
             _quit: Some(quit),
             _focus_lost: focus_lost,
+            _font_size: font_size,
+            backups,
+            _restored: restored,
+            _new_database: None,
             connections,
             showing_samples,
             notice: (!notices.is_empty()).then(|| notices.join("\n")),
@@ -207,6 +293,9 @@ impl Workspace {
             database: String::new(),
             schemas: Load::Idle,
             collapsed: HashSet::new(),
+            tables_only: false,
+            users_mode: false,
+            users: HashMap::new(),
             tabs: Vec::new(),
             active: 0,
             scripts_made: 0,
@@ -249,6 +338,7 @@ impl Workspace {
         self.open.retain(|(open, _), _| open != id);
         self.schema_cache.retain(|(cached, _), _| cached != id);
         self.databases.remove(id);
+        self.users.remove(id);
     }
 
     // MARK: editing connections
@@ -405,6 +495,193 @@ impl Workspace {
             cx.update(|cx| copy(config.to_url(true), cx));
         })
         .detach();
+    }
+
+    // MARK: new database
+
+    fn open_new_database(&mut self, config: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = cx.new(|cx| NewDatabaseDialog::new(config, window, cx));
+        // The dialog takes focus as it opens: give it to the name once it's there.
+        let name = dialog.read(cx).name_input();
+        window.on_next_frame(move |window, cx| name.update(cx, |i, cx| i.focus(window, cx)));
+        self._new_database = Some(cx.subscribe_in(&dialog, window, |this, dialog, _: &CreateRequested, window, cx| {
+            this.create_database(dialog.clone(), window, cx)
+        }));
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |modal, _, cx| {
+            let (ready, creating) = {
+                let state = dialog.read(cx);
+                (state.statement(cx).is_ok(), state.creating)
+            };
+            let (dialog, workspace) = (dialog.clone(), workspace.clone());
+            let footer = h_flex()
+                .w_full()
+                .gap_2()
+                .child(div().flex_1())
+                .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(
+                    Button::new("create")
+                        .primary()
+                        .label(if creating { "Creating…" } else { "Create" })
+                        .disabled(!ready || creating)
+                        .on_click({
+                            let dialog = dialog.clone();
+                            move |_, window, cx| {
+                                let dialog = dialog.clone();
+                                workspace.update(cx, |w, cx| w.create_database(dialog, window, cx)).ok();
+                            }
+                        }),
+                );
+            modal.title("New Database").w(px(480.)).child(dialog).footer(footer)
+        });
+    }
+
+    fn create_database(&mut self, dialog: Entity<NewDatabaseDialog>, window: &mut Window, cx: &mut Context<Self>) {
+        let (config, name) = {
+            let state = dialog.read(cx);
+            if state.creating || state.statement(cx).is_err() {
+                return;
+            }
+            (state.config.clone(), state.name(cx))
+        };
+        dialog.update(cx, |d, cx| d.set_creating(true, cx));
+        // Any open session on that server will do; else a short-lived one.
+        let existing = self.open.iter().find(|((id, _), _)| *id == config.id).map(|(_, c)| c.clone());
+        let secrets = self.secrets.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let connection = match existing {
+                Some(connection) => connection,
+                None => new_connection(config.clone(), secrets, cx.background_executor().clone()).await,
+            };
+            match connection.create_database(name.clone()).await {
+                Ok(()) => {
+                    this.update_in(cx, |w, window, cx| {
+                        window.close_dialog(cx);
+                        w.database_created(config, name, cx);
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    dialog.update(cx, |d, cx| d.show_error(e.to_string(), cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Lists the server's databases again and opens the new one.
+    fn database_created(&mut self, config: ConnectionConfig, name: String, cx: &mut Context<Self>) {
+        self.databases.remove(&config.id);
+        self._new_database = None;
+        if self.selected.as_deref() != Some(config.id.as_str()) {
+            self.select_connection(config.id.clone(), cx);
+        }
+        if Self::browses_databases(&config) {
+            self.select_database(name, cx);
+        } else {
+            self.load_schemas_with(true, false, cx);
+        }
+    }
+
+    // MARK: dump and restore
+
+    /// The database a dump or restore of `config` starts on: the one shown when it's selected.
+    fn backup_database(&self, config: &ConnectionConfig) -> (String, Vec<String>) {
+        let database = if self.selected.as_deref() == Some(config.id.as_str()) {
+            self.database.clone()
+        } else {
+            config.default_database().to_string()
+        };
+        let databases = if Self::browses_databases(config) { self.databases.get(&config.id).cloned().unwrap_or_default() } else { Vec::new() };
+        (database, databases)
+    }
+
+    fn open_dump(&mut self, config: ConnectionConfig, preset: DumpPreset, window: &mut Window, cx: &mut Context<Self>) {
+        let (database, databases) = self.backup_database(&config);
+        let secrets = self.secrets.clone();
+        let dialog = cx.new(|cx| DumpDialog::new(config, database, databases, preset, secrets, cx));
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |modal, _, cx| {
+            let ready = dialog.read(cx).can_dump();
+            let title = format!("Dump “{}”", dbcore::dump::target_name(&dialog.read(cx).target()));
+            let (dialog, workspace) = (dialog.clone(), workspace.clone());
+            let footer = h_flex()
+                .w_full()
+                .gap_2()
+                .child(div().flex_1())
+                .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("dump").primary().label("Dump…").disabled(!ready).on_click({
+                    let dialog = dialog.clone();
+                    move |_, window, cx| {
+                        let dialog = dialog.clone();
+                        workspace.update(cx, |w, cx| w.start_dump(dialog, window, cx)).ok();
+                    }
+                }));
+            modal.title(title).w(px(540.)).child(dialog).footer(footer)
+        });
+    }
+
+    /// Asks where to save, then dumps in the background.
+    fn start_dump(&mut self, dialog: Entity<DumpDialog>, window: &mut Window, cx: &mut Context<Self>) {
+        let (target, options, name, secrets) = {
+            let d = dialog.read(cx);
+            (d.target(), d.options(), d.file_name(), d.secrets())
+        };
+        let directory = dbcore::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = cx.prompt_for_new_path(&directory, Some(&name));
+        let backups = self.backups.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = path.await else { return };
+            cx.update(|window, cx| {
+                window.close_dialog(cx);
+                backups.update(cx, |b, cx| b.dump(target, secrets, path, options, cx));
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks for a SQL file, then where to run it.
+    fn open_restore(&mut self, config: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Restore".into()) });
+        let (database, databases) = self.backup_database(&config);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let Some(file) = paths.into_iter().next() else { return };
+            this.update_in(cx, |w, window, cx| w.confirm_restore(RestoreDialog::new(config, database, databases, file), window, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn confirm_restore(&mut self, restore: RestoreDialog, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = cx.new(|_| restore);
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |modal, _, cx| {
+            let title = format!("Restore into “{}”", dbcore::dump::target_name(&dialog.read(cx).target()));
+            let (dialog, workspace) = (dialog.clone(), workspace.clone());
+            let footer = h_flex()
+                .w_full()
+                .gap_2()
+                .child(div().flex_1())
+                .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("restore").primary().label("Restore").on_click({
+                    let dialog = dialog.clone();
+                    move |_, window, cx| {
+                        let (target, options, file, database) = {
+                            let d = dialog.read(cx);
+                            (d.target(), d.options(), d.file.clone(), d.database())
+                        };
+                        window.close_dialog(cx);
+                        workspace
+                            .update(cx, |w, cx| {
+                                let secrets = w.secrets.clone();
+                                w.backups.update(cx, |b, cx| b.restore(target, secrets, file, options, database, cx));
+                            })
+                            .ok();
+                    }
+                }));
+            modal.title(title).w(px(500.)).child(dialog).footer(footer)
+        });
     }
 
     // MARK: related rows
@@ -781,7 +1058,7 @@ impl Workspace {
         let tab = OpenTab { key, view, _events: events };
         let preview = self.tabs.iter().position(|tab| match &tab.view {
             TabView::Table(t) => t.read(cx).preview,
-            TabView::Script(_) => false,
+            TabView::Script(_) | TabView::Users(_) => false,
         });
         match preview {
             Some(ix) => self.tabs[ix] = tab,
@@ -816,6 +1093,8 @@ impl Workspace {
                 cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx))
             }
             TabView::Script(tab) => cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx)),
+            // Its title follows the selected role.
+            TabView::Users(tab) => cx.observe(tab, |_, _, cx| cx.notify()),
         }
     }
 
@@ -842,9 +1121,11 @@ impl Workspace {
         let tabs = self
             .tabs
             .iter()
-            .map(|tab| {
+            .filter_map(|tab| {
                 let (connection, database) = tab.key.clone();
-                match &tab.view {
+                Some(match &tab.view {
+                    // Users tabs aren't reopened: the middle column is back to tables at launch.
+                    TabView::Users(_) => return None,
                     TabView::Table(t) => {
                         let tab = t.read(cx);
                         let table = &tab.table;
@@ -861,7 +1142,7 @@ impl Workspace {
                         let s = s.read(cx);
                         SavedTab::Script { connection, database, name: s.name.clone(), sql: s.text(cx) }
                     }
-                }
+                })
             })
             .collect();
         let session = Session {
@@ -971,7 +1252,7 @@ impl Workspace {
     fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let unsaved = match self.tabs.get(ix).map(|t| &t.view) {
             Some(TabView::Table(tab)) => tab.read(cx).has_unsaved_edits(cx),
-            Some(TabView::Script(_)) => false,
+            Some(TabView::Script(_) | TabView::Users(_)) => false,
             None => return,
         };
         if unsaved {
@@ -1019,11 +1300,204 @@ impl Workspace {
         }
     }
 
+    /// Moves through the tabs by `offset`, wrapping around.
+    fn cycle_tab(&mut self, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.tabs.len() as isize;
+        if count > 1 {
+            let ix = (self.active as isize + offset).rem_euclid(count) as usize;
+            self.activate(ix, window, cx);
+        }
+    }
+
+    fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.tabs.len() {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// Drops the tab at `from` at `to`, keeping the same tab active.
+    fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = if self.active == from {
+            to
+        } else if from < self.active && to >= self.active {
+            self.active - 1
+        } else if from > self.active && to <= self.active {
+            self.active + 1
+        } else {
+            self.active
+        };
+        self.save_session(cx);
+        cx.notify();
+    }
+
     fn toggle_schema(&mut self, name: &str, cx: &mut Context<Self>) {
         if !self.collapsed.remove(name) {
             self.collapsed.insert(name.to_string());
         }
         cx.notify();
+    }
+
+    // MARK: users
+
+    /// The selected connection's users, when the middle column lists them.
+    fn users_shown(&self, connection: &ConnectionConfig, cx: &App) -> Option<Entity<UsersState>> {
+        let _ = cx;
+        if !self.users_mode {
+            return None;
+        }
+        self.users.get(&connection.id).map(|(state, _)| state.clone())
+    }
+
+    /// Makes the selected connection's users (once it's connected), or points them at the database
+    /// shown (Postgres privileges are per database).
+    fn sync_users(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.selected_connection().cloned() else { return };
+        let Some(features) = dbcore::access::features(config.kind) else { return };
+        let Some((key, connection)) = self.open_connection() else { return };
+        if let Some((state, _)) = self.users.get(&config.id) {
+            if state.read(cx).key != key {
+                state.update(cx, |s, cx| s.retarget(connection, key, cx));
+            }
+            return;
+        }
+        let state = cx.new(|cx| UsersState::new(connection, key, features, window, cx));
+        let tab = cx.new(|cx| UsersTab::new(state.clone(), cx));
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        // A role made in the editor opens in the tab.
+        cx.subscribe_in(&state, window, |this, _, event: &RoleCreated, window, cx| this.show_role(event.0.clone(), window, cx)).detach();
+        self.users.insert(config.id, (state, tab));
+    }
+
+    /// Selects a role and shows it in the connection's users tab.
+    fn show_role(&mut self, role: dbcore::access::RoleRef, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected.clone() else { return };
+        let Some((state, tab)) = self.users.get(&id).cloned() else { return };
+        state.update(cx, |s, cx| s.select(role, cx));
+        let existing = self.tabs.iter().position(|t| matches!(&t.view, TabView::Users(u) if *u == tab));
+        let ix = match existing {
+            Some(ix) => ix,
+            None => {
+                let key = state.read(cx).key.clone();
+                let view = TabView::Users(tab);
+                let events = self.tab_events(&key, &view, window, cx);
+                let ix = if self.tabs.is_empty() { 0 } else { (self.active + 1).min(self.tabs.len()) };
+                self.tabs.insert(ix, OpenTab { key, view, _events: events });
+                ix
+            }
+        };
+        self.activate(ix, window, cx);
+    }
+
+    fn render_users(&self, state: Entity<UsersState>, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let s = state.read(cx);
+        match &s.roles {
+            users::Load::Idle | users::Load::Loading => return centered().child(Spinner::new()).into_any_element(),
+            users::Load::Failed(message) => {
+                let retry = state.clone();
+                return centered()
+                    .p_4()
+                    .gap_2()
+                    .child(Icon::new(IconName::TriangleAlert).text_color(theme.warning))
+                    .child(div().font_semibold().child(format!("Couldn’t List {}s", users::noun(s.kind()))))
+                    .child(div().text_sm().text_color(theme.muted_foreground).text_center().child(message.clone()))
+                    .child(Button::new("retry-users").small().label("Try Again").on_click(move |_, _, cx| {
+                        retry.update(cx, |s, cx| s.load_roles(None, cx));
+                    }))
+                    .into_any_element();
+            }
+            users::Load::Loaded(_) => {}
+        }
+        let kind = s.kind();
+        let hosts = s.features.hosts;
+        let roles = s.visible_roles(cx);
+        let tab_active = self.tabs.get(self.active).is_some_and(|t| matches!(&t.view, TabView::Users(u) if self.users.values().any(|(st, ut)| st == &state && ut == u)));
+        let selected = s.selected.clone().filter(|_| tab_active);
+        let show_system = s.show_system;
+        let empty = if s.search.read(cx).value().trim().is_empty() { format!("No {}s", users::noun(kind)) } else { "No Matches".to_string() };
+        let mut list = v_flex().id("roles").size_full().p_2().gap_px().overflow_y_scrollbar();
+        for role in &roles {
+            let reference = role.reference();
+            let is_selected = selected.as_ref() == Some(&reference);
+            list = list.child(
+                row(SharedString::from(format!("role-{}", reference.title())), is_selected, cx)
+                    .when(role.is_system, |r| r.opacity(0.6))
+                    .child(users::role_icon(role).small().text_color(if is_selected { theme.primary } else { theme.muted_foreground }))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().child(role.name.clone()))
+                            .children(role.host.clone().filter(|_| hosts).map(|h| div().text_xs().text_color(theme.muted_foreground).child(h))),
+                    )
+                    .when(role.is_superuser, |r| r.child(Icon::new(AssetIcon::Zap).xsmall().text_color(theme.warning)))
+                    .on_click({
+                        let reference = reference.clone();
+                        cx.listener(move |this, _, window, cx| this.show_role(reference.clone(), window, cx))
+                    })
+                    .context_menu({
+                        let (this, state, role) = (cx.entity().downgrade(), state.clone(), role.clone());
+                        move |menu, _, _| {
+                            let reference = role.reference();
+                            let (edit_state, edit_role) = (state.clone(), role.clone());
+                            let (grant_this, grant_role) = (this.clone(), reference.clone());
+                            let grant_state = state.clone();
+                            let copy_role = role.clone();
+                            let new_state = state.clone();
+                            let (drop_state, drop_role) = (state.clone(), role.clone());
+                            menu.item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
+                                users::open_role_editor(edit_state.clone(), Some(edit_role.clone()), window, cx)
+                            }))
+                            .item(PopupMenuItem::new("Grant Privileges…").on_click(move |_, window, cx| {
+                                grant_this.update(cx, |w, cx| w.show_role(grant_role.clone(), window, cx)).ok();
+                                users::open_privilege_editor(grant_state.clone(), grant_role.clone(), None, window, cx)
+                            }))
+                            .item(PopupMenuItem::new("Copy Name").on_click(move |_, _, cx| users::copy_name(&copy_role, cx)))
+                            .separator()
+                            .item(PopupMenuItem::new(format!("New {}…", users::noun(kind))).on_click(move |_, window, cx| {
+                                users::open_role_editor(new_state.clone(), None, window, cx)
+                            }))
+                            .item(PopupMenuItem::new("Drop…").disabled(role.is_system).on_click(move |_, window, cx| {
+                                users::confirm_drop(drop_state.clone(), drop_role.clone(), window, cx)
+                            }))
+                        }
+                    }),
+            );
+        }
+        if roles.is_empty() {
+            list = list.child(div().mt_4().px_2().text_sm().text_color(theme.muted_foreground).child(empty));
+        }
+        let toggle_state = state.clone();
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .px_2()
+                    .pt_2()
+                    .gap_1()
+                    .child(div().flex_1().child(gpui_kit::component::input::Input::new(&s.search).small().cleanable(true)))
+                    .child(
+                        Button::new("show-system")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(AssetIcon::KeyRound))
+                            .selected(show_system)
+                            .tooltip(if show_system { "Hide Built-in Roles" } else { "Show Built-in Roles" })
+                            .on_click(move |_, _, cx| {
+                                toggle_state.update(cx, |s, cx| {
+                                    s.show_system = !s.show_system;
+                                    cx.notify();
+                                })
+                            }),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(list))
+            .into_any_element()
     }
 
     // MARK: columns
@@ -1047,13 +1521,13 @@ impl Workspace {
                 let id = c.id.clone();
                 list = list.child(
                     row(SharedString::from(format!("conn-{}", c.id)), selected, cx)
-                        .child(Icon::new(IconName::HardDrive).small().text_color(if selected {
+                        .child(crate::assets::kind_icon(c.kind).small().text_color(if selected {
                             theme.primary
                         } else {
                             theme.muted_foreground
                         }))
                         .child(div().flex_1().truncate().child(c.name.clone()))
-                        .when(connected, |row| row.child(div().size_1p5().rounded_full().bg(theme.green)))
+                        .when(connected, |row| row.child(connected_indicator(SharedString::from(format!("lit-{}", c.id)), theme.green)))
                         .tooltip({
                             let summary = SharedString::from(c.summary());
                             move |window, cx| Tooltip::new(summary.clone()).build(window, cx)
@@ -1090,6 +1564,15 @@ impl Workspace {
                                         connect.update(cx, |w, cx| w.connect(id, cx)).ok();
                                     }))
                                 };
+                                let new_database = this.clone();
+                                let new_database_config = config.clone();
+                                let (dump_this, dump_config) = (this.clone(), config.clone());
+                                let menu = menu.when(config.supports_multiple_databases(), |menu| {
+                                    menu.item(PopupMenuItem::new("New Database…").on_click(move |_, window, cx| {
+                                        let config = new_database_config.clone();
+                                        new_database.update(cx, |w, cx| w.open_new_database(config, window, cx)).ok();
+                                    }))
+                                });
                                 menu.separator()
                                 .item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
                                     let config = config.clone();
@@ -1107,6 +1590,21 @@ impl Workspace {
                                 .item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
                                     let id = id.clone();
                                     delete.update(cx, |w, cx| w.confirm_delete(id, window, cx)).ok();
+                                }))
+                                .separator()
+                                .item(PopupMenuItem::new("Dump Database…").on_click({
+                                    let (this, config) = (dump_this.clone(), dump_config.clone());
+                                    move |_, window, cx| {
+                                        let config = config.clone();
+                                        this.update(cx, |w, cx| w.open_dump(config, DumpPreset::Database, window, cx)).ok();
+                                    }
+                                }))
+                                .item(PopupMenuItem::new("Restore from File…").on_click({
+                                    let (this, config) = (dump_this.clone(), dump_config.clone());
+                                    move |_, window, cx| {
+                                        let config = config.clone();
+                                        this.update(cx, |w, cx| w.open_restore(config, window, cx)).ok();
+                                    }
                                 }))
                                 .separator()
                                 .item(PopupMenuItem::new("Import from DBeaver…").on_click(move |_, window, cx| {
@@ -1158,11 +1656,26 @@ impl Workspace {
     }
 
     fn render_tables(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        // Cloned: the users list and the mode switch need `cx` while building.
+        let theme = cx.theme().clone();
+        let theme = &theme;
         let Some(connection) = self.selected_connection() else {
             return v_flex().size_full().bg(theme.background);
         };
+        let users = self.users_shown(connection, cx);
         let subtitle = match &self.schemas {
+            _ if users.is_some() => {
+                let state = users.as_ref().unwrap().read(cx);
+                match state.roles.value() {
+                    Some(roles) => {
+                        let shown = roles.iter().filter(|r| state.show_system || !r.is_system).count();
+                        let n = users::count_label(state.kind(), shown);
+                        if state.features.grants_per_database { format!("{n} · privileges in {}", state.database()) } else { n }
+                    }
+                    None => "Loading…".into(),
+                }
+            }
+            Load::Loaded(_) if self.tables_only => "Filter by: Tables only".into(),
             Load::Loaded(schemas) => {
                 let tables: usize = schemas.iter().map(|s| s.tables.len()).sum();
                 format!("{} · {tables} tables", plural(schemas.len(), "schema"))
@@ -1174,10 +1687,13 @@ impl Workspace {
             Some(databases) => {
                 let this = cx.entity().downgrade();
                 let (databases, current) = (databases.clone(), self.database.clone());
+                let config = connection.clone();
+                // A MySQL connection with no database of its own browses them all: no database to show.
+                let label = if self.database.is_empty() { connection.name.clone() } else { self.database.clone() };
                 Button::new("database-menu")
                     .ghost()
                     .compact()
-                    .label(self.database.clone())
+                    .label(label)
                     .dropdown_caret(true)
                     .dropdown_menu(move |mut menu, _, _| {
                         for database in &databases {
@@ -1189,7 +1705,11 @@ impl Workspace {
                                 },
                             ));
                         }
-                        menu
+                        let (this, config) = (this.clone(), config.clone());
+                        menu.separator().item(PopupMenuItem::new("New Database…").on_click(move |_, window, cx| {
+                            let config = config.clone();
+                            this.update(cx, |w, cx| w.open_new_database(config, window, cx)).ok();
+                        }))
                     })
                     .into_any_element()
             }
@@ -1207,15 +1727,29 @@ impl Workspace {
             .border_b_1()
             .border_color(theme.border)
             .child(
-                h_flex().gap_1().child(h_flex().flex_1().min_w_0().child(title)).child(
-                    Button::new("refresh-tables")
+                h_flex().gap_1().child(h_flex().flex_1().min_w_0().child(title)).when(users.is_some(), |h| {
+                    let state = users.clone().unwrap();
+                    let kind = state.read(cx).kind();
+                    h.child(
+                        Button::new("new-role")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(AssetIcon::UserPlus))
+                            .tooltip(format!("New {}…", users::noun(kind)))
+                            .on_click(move |_, window, cx| users::open_role_editor(state.clone(), None, window, cx)),
+                    )
+                }).when(users.is_none(), |h| h.child(
+                    Button::new("tables-only")
                         .ghost()
                         .small()
-                        .icon(IconName::RefreshCw)
-                        .disabled(matches!(self.schemas, Load::Loading))
-                        .tooltip("Refresh")
-                        .on_click(cx.listener(|this, _, _, cx| this.load_schemas_with(true, false, cx))),
-                ).child(
+                        .icon(Icon::new(AssetIcon::ListFilter))
+                        .selected(self.tables_only)
+                        .tooltip(if self.tables_only { "Show Views Too" } else { "Show Tables Only" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.tables_only = !this.tables_only;
+                            cx.notify();
+                        })),
+                )).child(
                     Button::new("new-script")
                         .ghost()
                         .small()
@@ -1223,11 +1757,72 @@ impl Workspace {
                         .disabled(!connected)
                         .tooltip(format!("New SQL Script ({})", crate::keys::shortcut("secondary-t")))
                         .on_click(cx.listener(|this, _, window, cx| this.new_script(&NewScript, window, cx))),
-                ),
+                ).child({
+                    let this = cx.entity().downgrade();
+                    let schema_names: Vec<String> = match &self.schemas {
+                        Load::Loaded(schemas) => schemas.iter().map(|s| s.name.clone()).collect(),
+                        _ => Vec::new(),
+                    };
+                    let backup_config = connection.clone();
+                    Button::new("tables-menu").ghost().small().icon(IconName::Ellipsis).dropdown_menu(move |menu, _, _| {
+                        let (refresh, expand, collapse) = (this.clone(), this.clone(), this.clone());
+                        let names = schema_names.clone();
+                        let (dump, restore, config) = (this.clone(), this.clone(), backup_config.clone());
+                        let restore_config = config.clone();
+                        let menu = menu
+                            .item(PopupMenuItem::new("Dump Database…").on_click(move |_, window, cx| {
+                                let config = config.clone();
+                                dump.update(cx, |w, cx| w.open_dump(config, DumpPreset::Database, window, cx)).ok();
+                            }))
+                            .item(PopupMenuItem::new("Restore from File…").on_click(move |_, window, cx| {
+                                let config = restore_config.clone();
+                                restore.update(cx, |w, cx| w.open_restore(config, window, cx)).ok();
+                            }))
+                            .separator();
+                        menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
+                            refresh.update(cx, |w, cx| w.load_schemas_with(true, false, cx)).ok();
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new("Expand All").on_click(move |_, _, cx| {
+                            expand
+                                .update(cx, |w, cx| {
+                                    w.collapsed.clear();
+                                    cx.notify();
+                                })
+                                .ok();
+                        }))
+                        .item(PopupMenuItem::new("Collapse All").on_click(move |_, _, cx| {
+                            let names = names.clone();
+                            collapse
+                                .update(cx, |w, cx| {
+                                    w.collapsed = names.into_iter().collect();
+                                    cx.notify();
+                                })
+                                .ok();
+                        }))
+                    })
+                }),
             )
-            .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(subtitle));
+            .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(subtitle))
+            .when(dbcore::access::features(connection.kind).is_some(), |header| {
+                let users_mode = self.users_mode;
+                let switch = |id: &'static str, label: &'static str, users: bool, cx: &mut Context<Self>| {
+                    Button::new(id).ghost().xsmall().label(label).selected(users_mode == users).on_click(cx.listener(move |this, _, _, cx| {
+                        this.users_mode = users;
+                        cx.notify();
+                    }))
+                };
+                header.child(
+                    h_flex()
+                        .mt_1()
+                        .gap_1()
+                        .child(switch("mode-tables", "Tables", false, cx))
+                        .child(switch("mode-users", if connection.kind == DatabaseKind::Mysql { "Users" } else { "Roles" }, true, cx)),
+                )
+            });
 
         let body = match &self.schemas {
+            _ if users.is_some() => self.render_users(users.clone().unwrap(), cx),
             Load::Idle | Load::Loading => centered().child(Spinner::new()).into_any_element(),
             Load::Failed(message) => centered()
                 .p_4()
@@ -1252,12 +1847,22 @@ impl Workspace {
                             .text_color(theme.muted_foreground)
                             .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).xsmall())
                             .child(schema.name.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_schema(&name, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_schema(&name, cx)))
+                            .context_menu({
+                                let (this, config, schema) = (cx.entity().downgrade(), connection.clone(), schema.name.clone());
+                                move |menu, _, _| {
+                                    let (this, config, schema) = (this.clone(), config.clone(), schema.clone());
+                                    menu.item(PopupMenuItem::new(format!("Dump “{schema}”…")).on_click(move |_, window, cx| {
+                                        let (config, preset) = (config.clone(), DumpPreset::Schema(schema.clone()));
+                                        this.update(cx, |w, cx| w.open_dump(config, preset, window, cx)).ok();
+                                    }))
+                                }
+                            }),
                     );
                     if collapsed {
                         continue;
                     }
-                    for table in &schema.tables {
+                    for table in schema.tables.iter().filter(|t| !self.tables_only || t.kind == TableKind::Table) {
                         let selected = active_table.as_ref() == Some(table);
                         let open = table.clone();
                         let icon = if table.kind == TableKind::View { IconName::Eye } else { IconName::FileText };
@@ -1274,7 +1879,17 @@ impl Workspace {
                                 }))
                                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                                     this.open_table(open.clone(), event.click_count() >= 2, window, cx)
-                                })),
+                                }))
+                                .context_menu({
+                                    let (this, config, table) = (cx.entity().downgrade(), connection.clone(), table.clone());
+                                    move |menu, _, _| {
+                                        let (this, config, table) = (this.clone(), config.clone(), table.clone());
+                                        menu.item(PopupMenuItem::new(format!("Dump “{}”…", table.name)).on_click(move |_, window, cx| {
+                                            let (config, preset) = (config.clone(), DumpPreset::Table(table.clone()));
+                                            this.update(cx, |w, cx| w.open_dump(config, preset, window, cx)).ok();
+                                        }))
+                                    }
+                                }),
                         );
                     }
                 }
@@ -1297,6 +1912,7 @@ impl Workspace {
         let content = match &active.view {
             TabView::Table(tab) => tab.clone().into_any_element(),
             TabView::Script(tab) => tab.clone().into_any_element(),
+            TabView::Users(tab) => tab.clone().into_any_element(),
         };
         // Like the macOS app: no tab bar while there's only one tab.
         let bar = (self.tabs.len() > 1).then(|| {
@@ -1316,7 +1932,16 @@ impl Workspace {
                 // button would sit far from the title and flush against the right
                 // edge. Pull it into the label's padding and pad its right side.
                 let close = div().ml(px(-8.)).pr_2().child(close);
-                bar = bar.child(TabItem::new().label(tab.title(cx)).suffix(close));
+                let title = SharedString::from(tab.title(cx));
+                let drop_color = theme.drag_border;
+                bar = bar.child(
+                    TabItem::new()
+                        .label(title.clone())
+                        .suffix(close)
+                        .on_drag(DraggedTab { ix, title }, |tab, _, _, cx| cx.new(|_| tab.clone()))
+                        .drag_over::<DraggedTab>(move |style, _, _, _| style.border_l_2().border_color(drop_color))
+                        .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| this.move_tab(dragged.ix, ix, cx))),
+                );
             }
             bar
         });
@@ -1330,13 +1955,31 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.users_mode {
+            self.sync_users(window, cx);
+        }
         div()
             .size_full()
+            .relative()
             .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::new_script))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab1, window, cx| this.select_tab(0, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab2, window, cx| this.select_tab(1, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab3, window, cx| this.select_tab(2, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab4, window, cx| this.select_tab(3, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab5, window, cx| this.select_tab(4, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab6, window, cx| this.select_tab(5, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab7, window, cx| this.select_tab(6, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectTab8, window, cx| this.select_tab(7, window, cx)))
+            .on_action(cx.listener(|this, _: &LastTab, window, cx| {
+                let last = this.tabs.len().saturating_sub(1);
+                this.select_tab(last, window, cx)
+            }))
             .child(
                 h_resizable("workspace")
                     .child(
@@ -1345,6 +1988,8 @@ impl Render for Workspace {
                     .child(resizable_panel().size(px(300.)).size_range(px(200.)..px(520.)).child(self.render_tables(cx)))
                     .child(resizable_panel().child(self.render_tabs(cx))),
             )
+            // Running and finished dumps/restores, over the bottom-right corner.
+            .child(div().absolute().bottom_4().right_4().child(self.backups.clone()))
     }
 }
 
@@ -1372,6 +2017,42 @@ fn row(id: SharedString, selected: bool, cx: &App) -> Stateful<Div> {
         .text_sm()
         .when(selected, |row| row.bg(theme.sidebar_accent).text_color(theme.sidebar_accent_foreground))
         .when(!selected, |row| row.hover(|row| row.bg(theme.list_hover)))
+}
+
+/// The status light of an open connection, like the macOS app's: a lit dot with a soft halo and a
+/// glow, that sends out one ripple when it appears.
+fn connected_indicator(id: SharedString, green: Hsla) -> impl IntoElement {
+    const BOX: f32 = 14.;
+    const DOT: f32 = 7.;
+    let centered = |size: f32| div().absolute().left(px((BOX - size) / 2.)).top(px((BOX - size) / 2.)).size(px(size)).rounded_full();
+    let lighter = Hsla { l: (green.l + 0.12).min(1.), ..green };
+    let ripple = centered(DOT).border_1().border_color(green.opacity(0.6)).with_animation(
+        id,
+        Animation::new(std::time::Duration::from_millis(1100)).with_easing(ease_out_quint()),
+        move |ring, delta| {
+            let size = DOT * (1. + 1.4 * delta);
+            ring.left(px((BOX - size) / 2.)).top(px((BOX - size) / 2.)).size(px(size)).opacity(1. - delta)
+        },
+    );
+    div()
+        .relative()
+        .flex_shrink_0()
+        .size(px(BOX))
+        .child(centered(13.).bg(green.opacity(0.18)))
+        .child(ripple)
+        .child(
+            centered(DOT)
+                .bg(linear_gradient(180., linear_color_stop(lighter, 0.), linear_color_stop(green, 1.)))
+                .border_1()
+                .border_color(gpui_kit::white().opacity(0.25))
+                .shadow(vec![BoxShadow {
+                    color: green.opacity(0.7),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(2.5),
+                    spread_radius: px(0.),
+                    inset: false,
+                }]),
+        )
 }
 
 fn centered() -> Div {

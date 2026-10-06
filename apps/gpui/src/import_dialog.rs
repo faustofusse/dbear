@@ -9,7 +9,7 @@ use dbcore::import::{ImportScan, ImportedConnection, dbeaver};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -167,6 +167,7 @@ impl ImportDialog {
                     this.update(cx, |this, cx| this.toggle(index, cx)).ok();
                 },
             )))
+            .child(div().pt_0p5().child(crate::assets::kind_icon(item.config.kind).small().text_color(theme.muted_foreground)))
             .child(
                 v_flex()
                     .flex_1()

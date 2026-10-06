@@ -2,14 +2,17 @@
 //! development; the macOS release is the SwiftUI app in `apps/macos`.
 
 mod assets;
+mod backup;
 mod connection_editor;
 mod grid;
 mod inspector;
 mod keys;
+mod new_database;
 mod highlight;
 mod import_dialog;
 mod sql_complete;
 mod tabs;
+mod users;
 mod workspace;
 
 use gpui_kit::component::Theme;
