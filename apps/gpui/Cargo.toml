@@ -16,3 +16,7 @@ dbcore = { workspace = true, features = ["os-keyring"] }
 gpui-kit = "=0.7.1"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 log = "0.4"
+# The editor's completion API speaks LSP types; same version and features as gpui-kit's.
+lsp-types = { version = "0.97", features = ["proposed"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

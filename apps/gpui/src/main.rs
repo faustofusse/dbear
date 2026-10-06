@@ -4,7 +4,8 @@
 mod connection_editor;
 mod grid;
 mod inspector;
-mod sql_highlight;
+mod highlight;
+mod sql_complete;
 mod tabs;
 mod workspace;
 
@@ -34,6 +35,7 @@ fn main() {
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         workspace::bind_keys(cx);
         tabs::bind_keys(cx);
+        inspector::bind_keys(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -49,8 +51,13 @@ fn main() {
             app_id: Some("ar.fausto.dbear".into()),
             ..Default::default()
         };
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| workspace::Workspace::new(window, cx)))
-            .expect("failed to open the window");
+        let (window, workspace) =
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| workspace::Workspace::new(window, cx)))
+                .expect("failed to open the window");
+        // Reopen last session's tabs once the window exists.
+        window
+            .update(cx, |_, window, cx| workspace.update(cx, |w, cx| w.restore_session(window, cx)))
+            .ok();
         cx.activate(true);
     });
 }

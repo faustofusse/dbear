@@ -254,6 +254,16 @@ impl RowsDelegate {
         }
     }
 
+    /// Drops the pending edit of one cell (back to the loaded value).
+    pub fn revert_cell(&mut self, row: usize, col: usize) {
+        if let Some(cells) = self.edits.updates.get_mut(&row) {
+            cells.remove(&col);
+            if cells.is_empty() {
+                self.edits.updates.remove(&row);
+            }
+        }
+    }
+
     /// Adds an empty row (every column DEFAULT) and returns its index.
     pub fn add_row(&mut self) -> usize {
         self.edits.inserted.push(vec![EditValue::Default; self.columns.len()]);

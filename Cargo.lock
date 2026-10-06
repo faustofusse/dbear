@@ -1704,6 +1704,9 @@ dependencies = [
  "env_logger",
  "gpui-kit",
  "log",
+ "lsp-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

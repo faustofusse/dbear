@@ -1,5 +1,6 @@
 //! What the right pane shows: a table (rows or structure), or a SQL script with its results.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,14 +22,31 @@ use gpui_kit::*;
 
 use crate::grid::{PAGE_SIZE, RowsDelegate, copy};
 use crate::inspector::{self, Inspector};
-use crate::sql_highlight;
+use crate::sql_complete::{SharedCatalog, SqlCompletion};
+use crate::highlight;
+use dbcore::complete::Catalog;
+use dbcore::dialect::Dialect;
+use dbcore::state::{NewHistoryEntry, StateStore};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 
 /// Rows kept from one script result (like the macOS app); the rest are counted, not shown.
 pub const SCRIPT_ROW_LIMIT: u32 = 10_000;
 
 actions!(
     dbear,
-    [RunScript, CancelScript, CopySelection, CopySelectionWithHeaders, ToggleInspector, CancelEdit, DeleteRow, SaveEdits]
+    [
+        RunScript,
+        CancelScript,
+        CopySelection,
+        CopySelectionWithHeaders,
+        ToggleInspector,
+        CancelEdit,
+        DeleteRow,
+        SaveEdits,
+        StartEdit,
+        NextCell,
+        PreviousCell
+    ]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -41,6 +59,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-secondary-c", CopySelectionWithHeaders, Some("DataTable")),
         KeyBinding::new("alt-secondary-i", ToggleInspector, None),
         KeyBinding::new("escape", CancelEdit, Some("CellEditor > Input")),
+        KeyBinding::new("enter", StartEdit, Some("DataTable")),
+        KeyBinding::new("tab", NextCell, Some("CellEditor > Input")),
+        KeyBinding::new("shift-tab", PreviousCell, Some("CellEditor > Input")),
         KeyBinding::new("secondary-backspace", DeleteRow, Some("DataTable")),
         KeyBinding::new("secondary-s", SaveEdits, Some("TableTab")),
     ]);
@@ -66,8 +87,37 @@ fn copy_selection(grid: &Entity<TableState<RowsDelegate>>, headers: bool, cx: &m
 
 /// The grid. Its focus ring (a shadow outside its edge, drawn after keyboard input, e.g. ↩ to
 /// commit a cell) is clipped away: the selected cell already shows where focus is.
-fn data_table(grid: &Entity<TableState<RowsDelegate>>) -> AnyElement {
-    div().size_full().overflow_hidden().child(DataTable::new(grid).stripe(true).bordered(false)).into_any_element()
+///
+/// `settling`: drawn fully transparent. A new table measures its height while it draws, and only
+/// adds the striped filler rows below the data on the frame after; drawing that first frame
+/// invisibly avoids a flash of empty space (see `Settle`).
+fn data_table(grid: &Entity<TableState<RowsDelegate>>, settling: bool) -> AnyElement {
+    div()
+        .size_full()
+        .overflow_hidden()
+        .when(settling, |d| d.opacity(0.))
+        .child(DataTable::new(grid).stripe(true).bordered(false))
+        .into_any_element()
+}
+
+/// Hides a grid for the frame it first appears in (see `data_table`).
+#[derive(Default)]
+struct Settle(bool);
+
+impl Settle {
+    fn start(&mut self) {
+        self.0 = true;
+    }
+
+    /// Called from `render`: shows the grid again on the next frame.
+    fn tick<T: 'static>(&self, window: &mut Window, cx: &mut Context<T>, get: fn(&mut T) -> &mut Settle) {
+        if self.0 {
+            cx.on_next_frame(window, move |this, _, cx| {
+                get(this).0 = false;
+                cx.notify();
+            });
+        }
+    }
 }
 
 /// The grid, with the inspector beside it when it's shown.
@@ -175,6 +225,7 @@ pub struct TableTab {
     /// Why the last edit attempt was refused (read-only table or column).
     edit_notice: Option<String>,
     edit_subscriptions: Vec<Subscription>,
+    settle: Settle,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -182,7 +233,7 @@ pub struct TableTab {
 impl TableTab {
     pub fn new(connection: Arc<Connection>, table: TableInfo, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = new_grid(window, cx);
-        let inspector = cx.new(|cx| Inspector::new(grid.clone(), cx));
+        let inspector = cx.new(|cx| Inspector::new(grid.clone(), window, cx));
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter rows, e.g. status = 'paid' and total > 10"));
         // The grid's menu starts edits through the tab, which owns the input.
         let tab = cx.entity().downgrade();
@@ -222,6 +273,7 @@ impl TableTab {
                                 state.delegate_mut().show(connection, table, page);
                                 state.refresh(cx);
                             });
+                            this.settle.start();
                             Load::Loaded
                         }
                         Err(e) => Load::Failed(e.to_string()),
@@ -243,6 +295,7 @@ impl TableTab {
             inspector,
             edit_notice: None,
             edit_subscriptions: Vec::new(),
+            settle: Settle::default(),
             _tasks: vec![task],
             _subscriptions: subscriptions,
         }
@@ -308,6 +361,43 @@ impl TableTab {
             cx.notify();
         });
         self.focus_grid(window, cx);
+    }
+
+    /// ↩ on the grid: edit the selected cell (or the first editable cell of the selected row).
+    fn start_edit(&mut self, _: &StartEdit, window: &mut Window, cx: &mut Context<Self>) {
+        let target = {
+            let state = self.grid.read(cx);
+            let grid = state.delegate();
+            match state.selection() {
+                gpui_kit::component::table::TableSelection::Cell(row, col) => Some((row, col)),
+                gpui_kit::component::table::TableSelection::Row(row) => {
+                    (0..grid.columns.len()).find(|&c| grid.is_editable(c)).map(|col| (row, col))
+                }
+                _ => None,
+            }
+        };
+        if let Some((row, col)) = target {
+            self.begin_edit(row, col, window, cx);
+        }
+    }
+
+    /// Tab / ⇧Tab while editing: keep the value and edit the next (previous) editable cell,
+    /// continuing on the next (previous) row at the end of one.
+    fn move_edit(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, col)) = self.grid.read(cx).delegate().editing.as_ref().map(|(r, c, _)| (*r, *c)) else { return };
+        let next = {
+            let grid = self.grid.read(cx).delegate();
+            let (columns, rows) = (grid.columns.len(), grid.rows.len() + grid.edits.inserted.len());
+            let total = columns * rows;
+            let at = row * columns + col;
+            (1..total).map(|step| if forward { (at + step) % total } else { (at + total - step) % total })
+                .map(|i| (i / columns, i % columns))
+                .find(|&(r, c)| grid.is_editable(c) && !grid.is_deleted(r))
+        };
+        self.commit_edit(window, cx);
+        if let Some((row, col)) = next {
+            self.begin_edit(row, col, window, cx);
+        }
     }
 
     fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
@@ -447,7 +537,7 @@ impl TableTab {
             Load::Loading => centered().child(Spinner::new()).into_any_element(),
             Load::Failed(e) => message("Couldn’t Load Rows", e.clone(), cx).into_any_element(),
             Load::Loaded => {
-                let table = data_table(&self.grid);
+                let table = data_table(&self.grid, self.settle.0);
                 grid_with_inspector(table, &self.inspector, cx)
             }
         };
@@ -586,6 +676,7 @@ fn section(title: &str, headers: &[&str], rows: Vec<Vec<String>>, cx: &App) -> i
 
 impl Render for TableTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.settle.tick(window, cx, |this: &mut Self| &mut this.settle);
         let body = match self.mode {
             Mode::Data => self.render_data(window, cx),
             Mode::Structure => self.render_structure(cx),
@@ -629,6 +720,9 @@ impl Render for TableTab {
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| copy_selection(&this.grid, false, cx)))
             .on_action(cx.listener(|this, _: &CopySelectionWithHeaders, _, cx| copy_selection(&this.grid, true, cx)))
             .on_action(cx.listener(Self::cancel_edit))
+            .on_action(cx.listener(Self::start_edit))
+            .on_action(cx.listener(|this, _: &NextCell, window, cx| this.move_edit(true, window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousCell, window, cx| this.move_edit(false, window, cx)))
             .on_action(cx.listener(Self::delete_row))
             .on_action(cx.listener(Self::review))
             .size_full()
@@ -765,6 +859,14 @@ enum Outcome {
     Cancelled,
 }
 
+/// Where a script records its runs: the shared state store, and the connection and database.
+#[derive(Clone)]
+pub struct History {
+    pub state: Rc<RefCell<StateStore>>,
+    pub connection_id: String,
+    pub database: String,
+}
+
 pub struct ScriptTab {
     /// "SQL 1", "SQL 2"…
     pub name: String,
@@ -776,6 +878,9 @@ pub struct ScriptTab {
     inspector: Entity<Inspector>,
     outcome: Outcome,
     run_task: Option<Task<()>>,
+    history: Option<History>,
+    settle: Settle,
+    _catalog_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -784,17 +889,33 @@ impl ScriptTab {
         connection: Arc<Connection>,
         name: String,
         target: String,
+        history: Option<History>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let catalog: SharedCatalog = Rc::default();
+        let completion = SqlCompletion { catalog: catalog.clone(), dialect: Dialect(connection.config().kind) };
         let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx).language(sql_highlight::LANGUAGE).line_number(true);
-            state.set_highlighter_factory(sql_highlight::factory(), cx);
+            let mut state = EditorState::new(window, cx).language(highlight::SQL).line_number(true);
+            state.set_highlighter_factory(highlight::factory(), cx);
+            state.lsp_mut().completion_provider = Some(Rc::new(completion));
             state
         });
         let grid = new_grid(window, cx);
-        let inspector = cx.new(|cx| Inspector::new(grid.clone(), cx));
+        let inspector = cx.new(|cx| Inspector::new(grid.clone(), window, cx));
         let subscriptions = vec![cx.observe_global::<inspector::ShowInspector>(|_, cx| cx.notify())];
+        // Tables and columns for completion. Keywords complete meanwhile, and if this fails.
+        let catalog_task = cx.spawn({
+            let connection = connection.clone();
+            async move |_, _| {
+                let schemas = connection.list_schemas().await;
+                let columns = connection.list_columns().await;
+                match (schemas, columns) {
+                    (Ok(schemas), Ok(columns)) => *catalog.borrow_mut() = Some(Rc::new(Catalog::new(schemas, columns))),
+                    (Err(e), _) | (_, Err(e)) => log::warn!("couldn’t load the completion catalog: {e}"),
+                }
+            }
+        });
         Self {
             name,
             target,
@@ -804,6 +925,9 @@ impl ScriptTab {
             inspector,
             outcome: Outcome::Idle,
             run_task: None,
+            history,
+            settle: Settle::default(),
+            _catalog_task: catalog_task,
             _subscriptions: subscriptions,
         }
     }
@@ -813,6 +937,65 @@ impl ScriptTab {
     }
 
     /// The selection when there is one, else the whole script.
+    /// The whole script.
+    pub fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).value().to_string()
+    }
+
+    pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.to_string();
+        self.editor.update(cx, |e, cx| e.set_value(text, window, cx));
+    }
+
+    /// Puts a query from the history in the editor: as the script when it's empty, else after it.
+    fn insert_from_history(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.text(cx);
+        let text = if current.trim().is_empty() { sql.to_string() } else { format!("{}\n\n{sql}", current.trim_end()) };
+        self.set_text(&text, window, cx);
+        let focus = self.editor_focus(cx);
+        focus.focus(window, cx);
+    }
+
+    fn history_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let history = self.history.clone();
+        Button::new("history")
+            .ghost()
+            .small()
+            .label("History")
+            .dropdown_caret(true)
+            .disabled(history.is_none())
+            .dropdown_menu(move |mut menu, _, _| {
+                let Some(history) = history.clone() else { return menu };
+                // Read when the menu opens, so it's always current.
+                let entries = history.state.borrow().history(&history.connection_id, 25).unwrap_or_default();
+                if entries.is_empty() {
+                    return menu.item(PopupMenuItem::new("No queries yet").disabled(true));
+                }
+                for entry in entries {
+                    let one_line = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let mut label: String = one_line.chars().take(70).collect();
+                    if one_line.chars().count() > 70 {
+                        label.push('…');
+                    }
+                    if entry.error.is_some() {
+                        label.push_str("  · failed");
+                    }
+                    let (this, sql) = (this.clone(), entry.sql.clone());
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        this.update(cx, |tab, cx| tab.insert_from_history(&sql, window, cx)).ok();
+                    }));
+                }
+                let state = history.state.clone();
+                let id = history.connection_id.clone();
+                menu.separator().item(PopupMenuItem::new("Clear History").on_click(move |_, _, _| {
+                    if let Err(e) = state.borrow_mut().clear_history(&id) {
+                        log::warn!("couldn’t clear the history: {e}");
+                    }
+                }))
+            })
+    }
+
     fn sql(&self, cx: &App) -> String {
         let editor = self.editor.read(cx);
         let selected = editor.selected_text().to_string();
@@ -831,13 +1014,36 @@ impl ScriptTab {
         self.outcome = Outcome::Running(started);
         let connection = self.connection.clone();
         self.run_task = Some(cx.spawn(async move |this, cx| {
-            let result = connection.execute_limited(sql, Some(SCRIPT_ROW_LIMIT)).await;
+            let result = connection.execute_limited(sql.clone(), Some(SCRIPT_ROW_LIMIT)).await;
             this.update(cx, |this, cx| {
+                this.record(&sql, &result, started.elapsed());
                 this.show(result, started.elapsed(), cx);
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Adds the run to the connection's history (cancelled runs aren't kept).
+    fn record(&self, sql: &str, result: &dbcore::Result<QueryResult>, took: Duration) {
+        let Some(history) = &self.history else { return };
+        let (rows, error) = match result {
+            Ok(r) if r.columns.is_empty() => (r.rows_affected, None),
+            Ok(r) => (Some(r.total_count.unwrap_or(r.rows.len() as u64)), None),
+            Err(dbcore::Error::Cancelled) => return,
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let entry = NewHistoryEntry {
+            connection_id: history.connection_id.clone(),
+            database: history.database.clone(),
+            sql: sql.to_string(),
+            duration: Some(took),
+            rows,
+            error,
+        };
+        if let Err(e) = history.state.borrow_mut().add_history(entry) {
+            log::warn!("couldn’t record the query: {e}");
+        }
     }
 
     fn show(&mut self, result: dbcore::Result<QueryResult>, took: Duration, cx: &mut Context<Self>) {
@@ -850,6 +1056,7 @@ impl ScriptTab {
                     state.delegate_mut().show_result(kind, result);
                     state.refresh(cx);
                 });
+                self.settle.start();
                 Outcome::Rows { took, truncated }
             }
             Err(dbcore::Error::Cancelled) => Outcome::Cancelled,
@@ -876,7 +1083,8 @@ fn took(duration: Duration) -> String {
 }
 
 impl Render for ScriptTab {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.settle.tick(window, cx, |this: &mut Self| &mut this.settle);
         let running = matches!(self.outcome, Outcome::Running(_));
         let run = if running {
             Button::new("stop").small().icon(IconName::Square).label("Stop").on_click(cx.listener(|this, _, window, cx| this.cancel(&CancelScript, window, cx)))
@@ -893,6 +1101,7 @@ impl Render for ScriptTab {
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.target.clone()))
             .child(div().flex_1())
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if running { "⌘. to stop" } else { "⌘↩ runs the selection or the script" }))
+            .child(self.history_menu(cx))
             .child(inspector_button(cx))
             .child(run);
 
@@ -900,7 +1109,7 @@ impl Render for ScriptTab {
             Outcome::Idle => centered().text_color(cx.theme().muted_foreground).child("Run a query to see its results").into_any_element(),
             Outcome::Running(_) => centered().child(Spinner::new()).into_any_element(),
             Outcome::Rows { .. } => {
-                grid_with_inspector(data_table(&self.grid), &self.inspector, cx)
+                grid_with_inspector(data_table(&self.grid, self.settle.0), &self.inspector, cx)
             }
             Outcome::Affected { rows, .. } => centered()
                 .text_lg()

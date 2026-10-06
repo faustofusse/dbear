@@ -1,10 +1,14 @@
 //! The main window: connections | schemas and tables | tabs (tables and SQL scripts), like the macOS app.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use dbcore::secrets::{self, KeyringSecretStore};
+use dbcore::state::StateStore;
 use dbcore::{Connection, ConnectionConfig, ConnectionStore, Schema, TableInfo, TableKind};
+use serde::{Deserialize, Serialize};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
@@ -18,7 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::connection_editor::ConnectionEditor;
-use crate::tabs::{ScriptTab, TableTab, count, plural};
+use crate::tabs::{History, ScriptTab, TableTab, count, plural};
 
 enum Load<T> {
     Idle,
@@ -31,6 +35,41 @@ enum Load<T> {
 type TargetKey = (String, String);
 
 actions!(dbear, [NewScript, CloseTab]);
+
+/// Key of the open tabs in the state store.
+const SESSION_KEY: &str = "gpui.session";
+
+/// What's reopened at launch: the selection and the tabs, in order.
+#[derive(Serialize, Deserialize, Default)]
+struct Session {
+    selected: Option<(String, String)>,
+    active: usize,
+    tabs: Vec<SavedTab>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum SavedTab {
+    Table { connection: String, database: String, schema: String, table: String, view: bool },
+    Script { connection: String, database: String, name: String, sql: String },
+}
+
+/// A connection for `config`, with its saved password read off the UI thread (it can block or prompt).
+async fn new_connection(
+    config: ConnectionConfig,
+    secrets: Option<Arc<KeyringSecretStore>>,
+    executor: BackgroundExecutor,
+) -> Arc<Connection> {
+    let config = executor
+        .spawn(async move {
+            match secrets {
+                Some(store) => secrets::with_password(store.as_ref(), config.clone()).unwrap_or(config),
+                None => config,
+            }
+        })
+        .await;
+    Arc::new(Connection::new(config))
+}
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -68,6 +107,12 @@ impl OpenTab {
 
 pub struct Workspace {
     store: Option<ConnectionStore>,
+    /// Open tabs and query history (`state.db`, beside the connection store).
+    state: Option<Rc<RefCell<StateStore>>>,
+    /// Reopening last session's tabs; nothing is saved until it's done.
+    restoring: bool,
+    restore_task: Option<Task<()>>,
+    _quit: Option<Subscription>,
     connections: Vec<ConnectionConfig>,
     /// Why the saved connections or passwords aren't available, shown under the list.
     notice: Option<String>,
@@ -107,8 +152,24 @@ impl Workspace {
         };
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        let state = store.as_ref().and_then(|s| match StateStore::open_beside(s.path()) {
+            Ok(state) => Some(Rc::new(RefCell::new(state))),
+            Err(e) => {
+                log::warn!("couldn’t open the state file (no history or restored tabs): {e}");
+                None
+            }
+        });
+        // Script text isn't saved as you type: the last of it is saved when the app quits.
+        let quit = cx.on_app_quit(|this, cx| {
+            this.save_session(cx);
+            async {}
+        });
         Self {
             store,
+            state,
+            restoring: false,
+            restore_task: None,
+            _quit: Some(quit),
             connections,
             showing_samples,
             notice: (!notices.is_empty()).then(|| notices.join("\n")),
@@ -248,6 +309,9 @@ impl Workspace {
         if let Some(secrets) = &self.secrets {
             let _ = secrets::save_password(secrets.as_ref(), id, None);
         }
+        if let Some(state) = &self.state {
+            let _ = state.borrow_mut().clear_history(id);
+        }
         self.forget(id);
         if self.selected.as_deref() == Some(id) {
             self.selected = None;
@@ -275,6 +339,7 @@ impl Workspace {
         self.database = database;
         self.collapsed.clear();
         self.load_schemas(cx);
+        self.save_session(cx);
     }
 
     /// Whether the title offers the server's other databases.
@@ -304,6 +369,7 @@ impl Workspace {
         self.database = database;
         self.collapsed.clear();
         self.load_schemas(cx);
+        self.save_session(cx);
     }
 
     fn target(&self) -> Option<(ConnectionConfig, TargetKey)> {
@@ -397,6 +463,7 @@ impl Workspace {
             let focus = script.read(cx).editor_focus(cx);
             focus.focus(window, cx);
         }
+        self.save_session(cx);
         cx.notify();
     }
 
@@ -436,14 +503,157 @@ impl Workspace {
         let Some((key, connection)) = self.open_connection() else { return };
         self.scripts_made += 1;
         let name = format!("SQL {}", self.scripts_made);
-        let target = match self.selected_connection() {
+        let target = self.target_label(&key);
+        let history = self.history_for(&key);
+        let view = cx.new(|cx| ScriptTab::new(connection, name, target, history, window, cx));
+        self.tabs.push(OpenTab { key, view: TabView::Script(view) });
+        self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    fn history_for(&self, key: &TargetKey) -> Option<History> {
+        Some(History { state: self.state.clone()?, connection_id: key.0.clone(), database: key.1.clone() })
+    }
+
+    /// "conn · db" (or just the connection's name) for a script's header.
+    fn target_label(&self, key: &TargetKey) -> String {
+        match self.connections.iter().find(|c| c.id == key.0) {
             Some(c) if Self::browses_databases(c) && c.name != key.1 => format!("{} · {}", c.name, key.1),
             Some(c) => c.name.clone(),
             None => key.1.clone(),
+        }
+    }
+
+    // MARK: session
+
+    fn save_session(&self, cx: &App) {
+        let Some(state) = &self.state else { return };
+        if self.restoring {
+            return;
+        }
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let (connection, database) = tab.key.clone();
+                match &tab.view {
+                    TabView::Table(t) => {
+                        let table = &t.read(cx).table;
+                        SavedTab::Table {
+                            connection,
+                            database,
+                            schema: table.schema.clone(),
+                            table: table.name.clone(),
+                            view: table.kind == TableKind::View,
+                        }
+                    }
+                    TabView::Script(s) => {
+                        let s = s.read(cx);
+                        SavedTab::Script { connection, database, name: s.name.clone(), sql: s.text(cx) }
+                    }
+                }
+            })
+            .collect();
+        let session = Session {
+            selected: self.selected.clone().map(|id| (id, self.database.clone())),
+            active: self.active,
+            tabs,
         };
-        let view = cx.new(|cx| ScriptTab::new(connection, name, target, window, cx));
-        self.tabs.push(OpenTab { key, view: TabView::Script(view) });
-        self.activate(self.tabs.len() - 1, window, cx);
+        match serde_json::to_string(&session) {
+            Ok(json) => {
+                if let Err(e) = state.borrow_mut().set(SESSION_KEY, Some(&json)) {
+                    log::warn!("couldn’t save the open tabs: {e}");
+                }
+            }
+            Err(e) => log::warn!("couldn’t save the open tabs: {e}"),
+        }
+    }
+
+    /// Reopens last session's selection and tabs (tabs whose connection fails are skipped).
+    pub fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(json) = self.state.as_ref().and_then(|s| s.borrow().get(SESSION_KEY)) else { return };
+        let session: Session = match serde_json::from_str(&json) {
+            Ok(session) => session,
+            Err(e) => return log::warn!("ignoring the saved tabs: {e}"),
+        };
+        if let Some((id, database)) = session.selected.filter(|(id, _)| self.connections.iter().any(|c| c.id == *id)) {
+            self.select_connection(id, cx);
+            if !database.is_empty() && database != self.database {
+                self.select_database(database, cx);
+            }
+        }
+        if session.tabs.is_empty() {
+            return;
+        }
+        self.restoring = true;
+        let secrets = self.secrets.clone();
+        self.restore_task = Some(cx.spawn_in(window, async move |this, cx| {
+            for saved in session.tabs {
+                let key = match &saved {
+                    SavedTab::Table { connection, database, .. } | SavedTab::Script { connection, database, .. } => {
+                        (connection.clone(), database.clone())
+                    }
+                };
+                let Ok(Some((config, existing))) = this.update(cx, |w, _| {
+                    let config = w.connections.iter().find(|c| c.id == key.0)?;
+                    let config =
+                        if key.1 == config.default_database() { config.clone() } else { config.with_database(&key.1) };
+                    Some((config, w.open.get(&key).cloned()))
+                }) else {
+                    continue;
+                };
+                let connection = match existing {
+                    Some(connection) => connection,
+                    None => {
+                        let connection = new_connection(config, secrets.clone(), cx.background_executor().clone()).await;
+                        if let Err(e) = connection.connect().await {
+                            log::warn!("not reopening a tab on {}: {e}", key.0);
+                            continue;
+                        }
+                        {
+                            let mine = connection.clone();
+                            this.update(cx, |w, _| w.open.entry(key.clone()).or_insert(mine).clone()).unwrap_or(connection)
+                        }
+                    }
+                };
+                this.update_in(cx, |w, window, cx| w.push_restored(key, saved, connection, window, cx)).ok();
+            }
+            this.update_in(cx, |w, window, cx| {
+                w.restoring = false;
+                let active = session.active.min(w.tabs.len().saturating_sub(1));
+                w.activate(active, window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn push_restored(&mut self, key: TargetKey, saved: SavedTab, connection: Arc<Connection>, window: &mut Window, cx: &mut Context<Self>) {
+        let view = match saved {
+            SavedTab::Table { schema, table, view, .. } => {
+                let mut table = TableInfo::new(schema, table);
+                if view {
+                    table.kind = TableKind::View;
+                }
+                TabView::Table(cx.new(|cx| {
+                    let mut tab = TableTab::new(connection, table, window, cx);
+                    tab.preview = false;
+                    tab
+                }))
+            }
+            SavedTab::Script { name, sql, .. } => {
+                // Keep numbering new scripts after the restored ones.
+                if let Some(n) = name.strip_prefix("SQL ").and_then(|n| n.parse::<usize>().ok()) {
+                    self.scripts_made = self.scripts_made.max(n);
+                }
+                let (target, history) = (self.target_label(&key), self.history_for(&key));
+                TabView::Script(cx.new(|cx| {
+                    let mut tab = ScriptTab::new(connection, name, target, history, window, cx);
+                    tab.set_text(&sql, window, cx);
+                    tab
+                }))
+            }
+        };
+        self.tabs.push(OpenTab { key, view });
+        cx.notify();
     }
 
     fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -482,6 +692,7 @@ impl Workspace {
         }
         if self.tabs.is_empty() {
             window.focus(&self.focus, cx);
+            self.save_session(cx);
         } else {
             self.activate(self.active, window, cx);
         }

@@ -1,22 +1,34 @@
-//! SQL highlighting for the script editor, from the core's tree-sitter highlighter
-//! (`dbcore::highlight`), so it matches the macOS editor.
+//! Syntax highlighting for the editors (SQL scripts, JSON in the inspector), from the core's
+//! tree-sitter highlighters (`dbcore::highlight`), so it matches the macOS app.
 
 use std::ops::Range;
 use std::rc::Rc;
 
-use dbcore::highlight::{HighlightKind, highlight_sql};
+use dbcore::highlight::{HighlightKind, HighlightSpan, highlight_json, highlight_sql};
 use gpui_kit::component::input::{FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, InputHighlighterFactory, Rope};
 use gpui_kit::*;
 
-pub const LANGUAGE: &str = "sql";
+pub const SQL: &str = "sql";
+pub const JSON: &str = "json";
+/// No highlighting.
+pub const PLAIN: &str = "text";
 
-/// Installs on an editor with `.set_highlighter_factory(factory(), cx)`.
+/// Installs on an editor with `.set_highlighter_factory(factory(), cx)`; the editor's language
+/// (`SQL`, `JSON`) picks the highlighter.
 pub fn factory() -> InputHighlighterFactory {
-    Rc::new(|language: &str| (language == LANGUAGE).then(|| Box::new(SqlHighlighter::default()) as Box<dyn InputHighlighter>))
+    Rc::new(|language: &str| {
+        let highlight: fn(&str) -> Vec<HighlightSpan> = match language {
+            SQL => highlight_sql,
+            JSON => highlight_json,
+            _ => return None,
+        };
+        Some(Box::new(Highlighter { language: language.to_string().into(), highlight, spans: Vec::new() }) as Box<dyn InputHighlighter>)
+    })
 }
 
-#[derive(Default)]
-struct SqlHighlighter {
+struct Highlighter {
+    language: SharedString,
+    highlight: fn(&str) -> Vec<HighlightSpan>,
     /// Byte ranges and theme names, sorted and non-overlapping (as the core returns them).
     spans: Vec<(Range<usize>, &'static str)>,
 }
@@ -40,16 +52,16 @@ fn theme_name(kind: HighlightKind) -> &'static str {
     }
 }
 
-impl InputHighlighter for SqlHighlighter {
+impl InputHighlighter for Highlighter {
     fn language(&self) -> SharedString {
-        LANGUAGE.into()
+        self.language.clone()
     }
 
     fn update(&mut self, _: Option<InputEdit>, text: &Rope, _: bool, _: &mut Window, _: &mut Context<EditorState>) {
-        // Scripts are small enough to re-highlight whole (the macOS editor does the same).
+        // Scripts and values are small enough to re-highlight whole (the macOS app does the same).
         let source = text.to_string();
         let mut spans: Vec<(Range<usize>, &'static str)> =
-            highlight_sql(&source).into_iter().map(|s| (s.start..s.end, theme_name(s.kind))).collect();
+            (self.highlight)(&source).into_iter().map(|s| (s.start..s.end, theme_name(s.kind))).collect();
         spans.sort_by_key(|(range, _)| range.start);
         let mut end = 0;
         spans.retain(|(range, _)| {
