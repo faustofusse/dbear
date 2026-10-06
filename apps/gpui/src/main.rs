@@ -1,6 +1,7 @@
 //! dbear for Linux, written with GPUI. It also runs on macOS and Windows, which is handy for
 //! development; the macOS release is the SwiftUI app in `apps/macos`.
 
+mod assets;
 mod connection_editor;
 mod grid;
 mod inspector;
@@ -10,6 +11,7 @@ mod tabs;
 mod workspace;
 
 use gpui_kit::component::Theme;
+use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::*;
 
 actions!(dbear, [Quit]);
@@ -18,7 +20,7 @@ fn main() {
     // RUST_LOG=info (or debug) shows what GPUI and the drivers are doing; warnings and errors by default.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(|cx| {
+    gpui_kit::application().with_assets(assets::AppAssets).run(|cx| {
         gpui_kit::init(cx);
         Theme::sync_system_appearance(None, cx);
         // Selected cells and rows: a soft neutral highlight, like the macOS app (not the theme's blue).
@@ -27,7 +29,9 @@ fn main() {
             theme.colors.table_active = fg.opacity(0.10);
             theme.colors.table_active_border = fg.opacity(0.25);
         });
-        Theme::sync_scrollbar_appearance(cx);
+        // Always show scrollbars where there's more to scroll to, so wide tables and long values
+        // show it up front. (Following macOS's "when scrolling" setting hid them until you scrolled.)
+        Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_global(inspector::ShowInspector(false));

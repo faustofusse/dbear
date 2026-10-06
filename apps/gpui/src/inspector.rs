@@ -6,8 +6,9 @@ use dbcore::edit::EditValue;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::table::{TableEvent, TableState};
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -36,6 +37,15 @@ pub fn toggle(cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Whether inspectors wrap long lines (one switch for the whole app, on by default).
+pub struct WrapLines(pub bool);
+
+impl Global for WrapLines {}
+
+fn wraps_lines(cx: &App) -> bool {
+    cx.try_global::<WrapLines>().is_none_or(|w| w.0)
+}
+
 pub struct Inspector {
     grid: Entity<TableState<RowsDelegate>>,
     /// The cell shown: (row, column).
@@ -51,8 +61,14 @@ pub struct Inspector {
 impl Inspector {
     pub fn new(grid: Entity<TableState<RowsDelegate>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| {
-            // No gutter at all: no line numbers, no fold markers.
-            let mut state = EditorState::new(window, cx).soft_wrap(true).line_number(false).folding(false).language(highlight::PLAIN);
+            // No gutter at all: no line numbers, no fold markers. No empty space after the last
+            // line either, so a value that fits doesn't get a scrollbar.
+            let mut state = EditorState::new(window, cx)
+                .soft_wrap(wraps_lines(cx))
+                .line_number(false)
+                .folding(false)
+                .scroll_beyond_last_line(Some(0))
+                .language(highlight::PLAIN);
             state.set_highlighter_factory(highlight::factory(), cx);
             state
         });
@@ -77,6 +93,12 @@ impl Inspector {
                 cx.notify();
             }),
             cx.observe(&editor, |_, _, cx| cx.notify()),
+            // Toggled in another tab's inspector: follow it.
+            cx.observe_global_in::<WrapLines>(window, |this, window, cx| {
+                let wrap = wraps_lines(cx);
+                this.editor.update(cx, |e, cx| e.set_soft_wrap(wrap, window, cx));
+                cx.notify();
+            }),
         ];
         Self { grid, focus: None, raw: false, editor, loaded: String::new(), _subscriptions: subscriptions }
     }
@@ -207,6 +229,17 @@ impl Render for Inspector {
                                     this.load(window, cx);
                                 })),
                         )
+                    })
+                    .child({
+                        let wrap = wraps_lines(cx);
+                        Button::new("wrap-lines")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(AssetIcon::TextWrap))
+                            .selected(wrap)
+                            .toggled(wrap)
+                            .tooltip(if wrap { "Don't Wrap Lines" } else { "Wrap Lines" })
+                            .on_click(move |_, _, cx| cx.set_global(WrapLines(!wrap)))
                     })
                     .child(
                         Button::new("copy-value")
