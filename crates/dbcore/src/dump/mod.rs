@@ -136,6 +136,32 @@ pub struct DumpProgress {
     pub bytes_written: u64,
 }
 
+impl DumpProgress {
+    /// How far along, 0…1, when it can tell (tables done, plus the current one's share by its
+    /// estimated size).
+    pub fn fraction(&self) -> Option<f64> {
+        if self.tables_total == 0 {
+            return None;
+        }
+        let mut done = f64::from(self.tables_done);
+        if let Some(estimate) = self.table_rows_estimate.filter(|&e| e > 0) {
+            if self.tables_done < self.tables_total {
+                done += (self.table_rows_done as f64 / estimate as f64).min(1.0);
+            }
+        }
+        Some((done / f64::from(self.tables_total)).min(1.0))
+    }
+}
+
+/// The database a dump or restore works on, for titles: a SQLite file's name, else the database
+/// (or the connection's name when it has none).
+pub fn target_name(config: &ConnectionConfig) -> String {
+    if config.kind == DatabaseKind::Sqlite {
+        return crate::paths::file_name(&config.database).to_string();
+    }
+    if config.database.is_empty() { config.name.clone() } else { config.database.clone() }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DumpSummary {
     pub tables: u32,
@@ -384,6 +410,37 @@ pub fn partial_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_fraction_counts_the_current_table() {
+        let mut p = DumpProgress {
+            phase: DumpPhase::Data,
+            object: None,
+            tables_done: 1,
+            tables_total: 4,
+            rows_done: 0,
+            table_rows_done: 50,
+            table_rows_estimate: Some(100),
+            bytes_written: 0,
+        };
+        assert_eq!(p.fraction(), Some(0.375));
+        p.table_rows_done = 500; // past the estimate: the table counts as done, no more
+        assert_eq!(p.fraction(), Some(0.5));
+        p.tables_total = 0;
+        assert_eq!(p.fraction(), None);
+    }
+
+    #[test]
+    fn names_targets() {
+        let mut config = ConnectionConfig::new_empty(DatabaseKind::Sqlite);
+        config.database = "/home/me/notes.db".into();
+        assert_eq!(target_name(&config), "notes.db");
+        let mut config = ConnectionConfig::new_empty(DatabaseKind::Postgres);
+        config.name = "Prod".into();
+        assert_eq!(target_name(&config), "Prod");
+        config.database = "app".into();
+        assert_eq!(target_name(&config), "app");
+    }
 
     #[test]
     fn names_files() {

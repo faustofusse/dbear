@@ -30,6 +30,14 @@ impl RoleRef {
     pub fn new(name: impl Into<String>, host: Option<String>) -> Self {
         Self { name: name.into(), host }
     }
+
+    /// `app`, or `app@%` for a MySQL account.
+    pub fn title(&self) -> String {
+        match &self.host {
+            Some(host) => format!("{}@{host}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +111,32 @@ pub enum GrantObject {
     AllSequences { schema: String },
 }
 
+impl GrantObjectKind {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Server => "Server",
+            Self::Database => "Database",
+            Self::Schema => "Schema",
+            Self::Table => "Table",
+            Self::Sequence => "Sequence",
+            Self::AllTables => "All Tables in Schema",
+            Self::AllSequences => "All Sequences in Schema",
+        }
+    }
+}
+
 impl GrantObject {
+    /// `Server (*.*)`, `public.users`, `All tables in public`…
+    pub fn title(&self) -> String {
+        match self {
+            Self::Server => "Server (*.*)".into(),
+            Self::Database { name } | Self::Schema { name } => name.clone(),
+            Self::Table { schema, name } | Self::Sequence { schema, name } => format!("{schema}.{name}"),
+            Self::AllTables { schema } => format!("All tables in {schema}"),
+            Self::AllSequences { schema } => format!("All sequences in {schema}"),
+        }
+    }
+
     pub fn kind(&self) -> GrantObjectKind {
         match self {
             Self::Server => GrantObjectKind::Server,
@@ -804,6 +837,15 @@ pub(crate) fn object_from_catalog(kind: &str, schema: Option<String>, name: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles() {
+        assert_eq!(RoleRef::new("app", Some("%".into())).title(), "app@%");
+        assert_eq!(RoleRef::new("reader", None).title(), "reader");
+        assert_eq!(GrantObject::Table { schema: "public".into(), name: "users".into() }.title(), "public.users");
+        assert_eq!(GrantObject::AllTables { schema: "public".into() }.title(), "All tables in public");
+        assert_eq!(GrantObject::Server.title(), "Server (*.*)");
+    }
 
     fn sql(kind: DatabaseKind, change: AccessChange) -> Vec<String> {
         statements(kind, &change).unwrap().into_iter().map(|s| s.sql).collect()

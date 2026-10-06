@@ -52,6 +52,13 @@ pub struct RestoreProgress {
     pub errors: u32,
 }
 
+impl RestoreProgress {
+    /// How far along, 0…1: the share of the file read.
+    pub fn fraction(&self) -> Option<f64> {
+        (self.bytes_total > 0).then(|| (self.bytes_read as f64 / self.bytes_total as f64).min(1.0))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RestoreSummary {
     /// Statements (and COPY blocks) that ran.
@@ -312,6 +319,13 @@ fn copy_unsupported(kind: DatabaseKind) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_fraction_is_the_share_read() {
+        let p = RestoreProgress { bytes_read: 25, bytes_total: 100, statements: 0, errors: 0 };
+        assert_eq!(p.fraction(), Some(0.25));
+        assert_eq!(RestoreProgress { bytes_total: 0, ..p }.fraction(), None);
+    }
 
     #[test]
     fn recognises_transaction_control() {
