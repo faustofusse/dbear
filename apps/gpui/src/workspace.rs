@@ -12,7 +12,7 @@ use dbcore::{Connection, ConnectionConfig, ConnectionStore, DatabaseKind, Schema
 use serde::{Deserialize, Serialize};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab as TabItem, TabBar};
@@ -219,6 +219,9 @@ pub struct Workspace {
     active: usize,
     /// Scripts opened so far, for their names ("SQL 1", "SQL 2"…).
     scripts_made: usize,
+    /// The tab bar's right-click menu while it's open, and where.
+    tab_menu: Option<(Entity<PopupMenu>, Point<Pixels>)>,
+    _tab_menu_dismiss: Option<Subscription>,
     focus: FocusHandle,
     // Dropping a task cancels it, so switching selection abandons the previous load.
     schemas_task: Option<Task<()>>,
@@ -299,6 +302,8 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             scripts_made: 0,
+            tab_menu: None,
+            _tab_menu_dismiss: None,
             focus,
             schemas_task: None,
         }
@@ -1292,6 +1297,115 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Closes every tab in `close` (indices), asking once if any of them has unsaved edits.
+    /// `keep` is the tab to show afterwards when it's still open.
+    fn close_tabs(&mut self, close: Vec<usize>, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let unsaved = close
+            .iter()
+            .filter(|&&ix| matches!(self.tabs.get(ix).map(|t| &t.view), Some(TabView::Table(t)) if t.read(cx).has_unsaved_edits(cx)))
+            .count();
+        if unsaved == 0 {
+            return self.remove_tabs(close, keep, window, cx);
+        }
+        let workspace = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (workspace, close) = (workspace.clone(), close.clone());
+            alert
+                .title(if unsaved == 1 {
+                    "Discard unsaved changes in 1 tab?".to_string()
+                } else {
+                    format!("Discard unsaved changes in {unsaved} tabs?")
+                })
+                .description("Your edits haven’t been saved.")
+                .show_cancel(true)
+                .button_props(DialogButtonProps::default().ok_text("Discard"))
+                .on_ok(move |_, window, cx| {
+                    workspace.update(cx, |w, cx| w.remove_tabs(close.clone(), keep, window, cx)).ok();
+                    true
+                })
+        });
+    }
+
+    fn remove_tabs(&mut self, mut close: Vec<usize>, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
+        close.sort_unstable();
+        close.dedup();
+        let shown = if close.contains(&self.active) { keep } else { self.active };
+        let before = |ix: usize| close.iter().filter(|&&c| c < ix).count();
+        let shown = (!close.contains(&shown)).then(|| shown - before(shown));
+        for &ix in close.iter().rev() {
+            if ix < self.tabs.len() {
+                self.tabs.remove(ix);
+            }
+        }
+        if self.tabs.is_empty() {
+            self.active = 0;
+            window.focus(&self.focus, cx);
+            self.save_session(cx);
+        } else {
+            let ix = shown.unwrap_or(self.active.saturating_sub(before(self.active))).min(self.tabs.len() - 1);
+            self.activate(ix, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Keeps a preview tab open (like double-clicking its table).
+    fn keep_open(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(TabView::Table(tab)) = self.tabs.get(ix).map(|t| &t.view) {
+            tab.update(cx, |tab, cx| {
+                tab.preview = false;
+                cx.notify();
+            });
+            self.save_session(cx);
+            cx.notify();
+        }
+    }
+
+    /// The right-click menu of the tab at `ix`, opened at `position`.
+    fn open_tab_menu(&mut self, ix: usize, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.tabs.len();
+        let preview = matches!(self.tabs.get(ix).map(|t| &t.view), Some(TabView::Table(t)) if t.read(cx).preview);
+        let this = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            // A menu item that runs `$body` on the workspace.
+            macro_rules! act {
+                ($label:expr, |$w:ident, $window:ident, $cx:ident| $body:expr) => {{
+                    let this = this.clone();
+                    PopupMenuItem::new($label).on_click(move |_, $window, cx| {
+                        this.update(cx, |$w, $cx| $body).ok();
+                    })
+                }};
+            }
+            menu.when(preview, |menu| menu.item(act!("Keep Open", |w, _window, cx| w.keep_open(ix, cx))).separator())
+                .item(act!("Close Tab", |w, window, cx| w.close_tab_at(ix, window, cx)))
+                .item(
+                    act!("Close Other Tabs", |w, window, cx| {
+                        let others = (0..w.tabs.len()).filter(|&i| i != ix).collect();
+                        w.close_tabs(others, ix, window, cx)
+                    })
+                    .disabled(count < 2),
+                )
+                .item(
+                    act!("Close Tabs to the Right", |w, window, cx| {
+                        let right = (ix + 1..w.tabs.len()).collect();
+                        w.close_tabs(right, ix, window, cx)
+                    })
+                    .disabled(ix + 1 >= count),
+                )
+                .separator()
+                .item(act!("Close All Tabs", |w, window, cx| {
+                    let all = (0..w.tabs.len()).collect();
+                    w.close_tabs(all, 0, window, cx)
+                }))
+        });
+        self._tab_menu_dismiss = Some(cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.tab_menu = None;
+            cx.notify();
+        }));
+        menu.read(cx).focus_handle(cx).focus(window, cx);
+        self.tab_menu = Some((menu, position));
+        cx.notify();
+    }
+
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             window.remove_window();
@@ -1938,6 +2052,13 @@ impl Workspace {
                     TabItem::new()
                         .label(title.clone())
                         .suffix(close)
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_tab_menu(ix, event.position, window, cx)
+                            }),
+                        )
                         .on_drag(DraggedTab { ix, title }, |tab, _, _, cx| cx.new(|_| tab.clone()))
                         .drag_over::<DraggedTab>(move |style, _, _, _| style.border_l_2().border_color(drop_color))
                         .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| this.move_tab(dragged.ix, ix, cx))),
@@ -1950,6 +2071,9 @@ impl Workspace {
             .bg(theme.background)
             .children(bar)
             .child(div().flex_1().min_h_0().child(content))
+            .children(self.tab_menu.clone().map(|(menu, position)| {
+                deferred(anchored().position(position).snap_to_window_with_margin(px(8.)).child(menu)).with_priority(1)
+            }))
             .into_any_element()
     }
 }
