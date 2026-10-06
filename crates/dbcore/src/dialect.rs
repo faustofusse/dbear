@@ -136,6 +136,15 @@ fn where_clause(filter: Option<&str>) -> String {
     filter.map_or(String::new(), |f| format!(" where (\n{f}\n)"))
 }
 
+/// Whether running `sql` may have changed the list of tables (`create`, `drop`, `alter`, `rename`),
+/// so a frontend should list them again. A keyword in a comment or string also counts: that costs
+/// one extra listing, which is cheaper than parsing every dialect.
+pub fn changes_schema(sql: &str) -> bool {
+    static DDL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(create|drop|alter|rename)\b").unwrap());
+    DDL.is_match(sql)
+}
+
 /// Cleans up a user `WHERE` filter: trims it, drops a leading `where` and trailing `;`s, and
 /// returns `None` when nothing is left. Rejects a `;` between statements, so a filter can't
 /// smuggle in a second statement (quotes and comments are skipped when looking for one).
@@ -248,6 +257,15 @@ pub(crate) fn line_column(sql: &str, char_offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changes_schema_spots_ddl() {
+        assert!(changes_schema("CREATE TABLE t (id int)"));
+        assert!(changes_schema("select 1;\ndrop view v"));
+        assert!(changes_schema("alter table t add column x int"));
+        assert!(!changes_schema("select created_at, dropped from t"));
+        assert!(!changes_schema("update t set x = 1"));
+    }
 
     #[test]
     fn create_database_quotes_the_name() {
