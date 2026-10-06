@@ -76,6 +76,10 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   on Linux), versioned with `PRAGMA user_version`. An old `connections.json` is imported once and
   renamed to `connections.json.migrated`. Override with `DBEAR_CONNECTIONS_FILE`. Secrets live in the
   keychain, never in that file.
+- App state: `dbcore::state::StateStore`, `state.db` next to the connection store. Holds UI state as
+  JSON under a key (the GPUI app's open tabs: `gpui.session`) and per-connection query history (newest
+  1000 kept). It's a separate file so `dbear.db`'s schema version doesn't move: released apps refuse a
+  newer connection store.
 - SQL highlighting: tree-sitter with [DerekStride/tree-sitter-sql](https://github.com/DerekStride/tree-sitter-sql)
   (crate `tree-sitter-sequel`) in `dbcore::highlight`. The core returns spans; frontends pick colors.
 - Table paging: the core sorts by the user's columns then the primary key (or ctid/rowid) so pages

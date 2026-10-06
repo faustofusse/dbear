@@ -26,6 +26,7 @@ pub mod secrets;
 pub mod postgres;
 pub mod sqlite;
 pub mod sqlserver;
+pub mod state;
 pub mod store;
 
 pub use connection::Connection;
