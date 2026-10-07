@@ -30,21 +30,20 @@ struct GridEditing {
     var selectionChanged: (Set<Int>) -> Void
     /// Called once `editRequest` was acted on.
     var requestHandled: () -> Void
+    /// Why a column's cells can't be edited (script results mix table columns and expressions).
+    var columnReadOnly: (Int) -> String? = { _ in nil }
+    var canAddRows = true
+    var canDeleteRows = true
 }
 
-/// Foreign keys of a table's grid. Hovering a key cell shows an arrow that calls `open` with the
-/// key and the row's values for its columns (in key order). Right-clicking a row lists
-/// `referencedBy` (other tables' keys pointing at this table); picking one calls `openReferencing`
-/// with the row's values for the columns that key references.
+/// Foreign keys of a grid, by column index (from the core: a table's own keys, or those of the
+/// tables a script result reads). Hovering a key cell shows an arrow that calls `open` with the
+/// link and the row's values for its columns (in key order). Right-clicking a row lists the
+/// tables referencing it; picking one calls `openReferencing` with the row's referenced values.
 struct GridForeignKeys {
-    var keys: [ForeignKeyInfo]
-    var referencedBy: [ReferencingKey]
-    /// The table's schema (other schemas are spelled out in the menu) and primary key (what SQLite
-    /// keys without referenced columns point at).
-    var schema: String
-    var primaryKey: [String]
-    var open: (ForeignKeyInfo, [DBValue]) -> Void
-    var openReferencing: (ReferencingKey, [DBValue]) -> Void
+    var sources: ResultSources
+    var open: (ForeignKeyLink, [DBValue]) -> Void
+    var openReferencing: (ReferenceLink, [DBValue]) -> Void
 }
 
 /// The grid's current cell: the selected row (the last one clicked, when several are selected) and
@@ -181,7 +180,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     private var loadRequested = false
     private var foreignKeys: GridForeignKeys?
     /// Model column index to the foreign key it belongs to (the narrowest one, if several).
-    private var keyByColumn: [Int: ForeignKeyInfo] = [:]
+    private var keyByColumn: [Int: ForeignKeyLink] = [:]
     /// The foreign key cell under the mouse (row index, model column), showing `linkButton`.
     private var hoveredLink: (row: Int, column: Int)?
     private lazy var linkButton: LinkButton = {
@@ -233,7 +232,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         self.paging = paging
         self.sorting = sorting
         self.editing = editing
-        let keysChanged = foreignKeys?.keys != self.foreignKeys?.keys
+        let keysChanged = foreignKeys?.sources !== self.foreignKeys?.sources
         self.foreignKeys = foreignKeys
         defer {
             if keysChanged || hoveredLink != nil {
@@ -256,10 +255,8 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         }
         if !(paging?.isLoading ?? false) { loadRequested = false }
         guard let table else { return }
-        if (editing == nil) != (table.onReturn == nil) {
-            table.onReturn = editing == nil ? nil : { [weak self] in self?.editSelectedRow() }
-            table.onDelete = editing == nil ? nil : { [weak self] in self?.deleteSelectedRows() }
-        }
+        table.onReturn = editing == nil ? nil : { [weak self] in self?.editSelectedRow() }
+        table.onDelete = editing?.canDeleteRows == true ? { [weak self] in self?.deleteSelectedRows() } : nil
 
         if version != self.version || result.columns != columns {
             finishEditing(commit: false)
@@ -357,10 +354,9 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     /// the reference in the header tooltips.
     private func indexForeignKeys(_ table: NSTableView) {
         keyByColumn = [:]
-        let keys = (foreignKeys?.keys ?? []).sorted { $0.columns.count < $1.columns.count }
+        let keys = (foreignKeys?.sources.foreignKeys ?? []).sorted { $0.columns.count < $1.columns.count }
         for key in keys {
-            for name in key.columns {
-                guard let index = columns.firstIndex(where: { $0.name == name }), keyByColumn[index] == nil else { continue }
+            for index in key.columns where columns.indices.contains(index) && keyByColumn[index] == nil {
                 keyByColumn[index] = key
             }
         }
@@ -381,26 +377,32 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     }
 
     /// `public.users(id)`.
-    private static func reference(_ key: ForeignKeyInfo) -> String {
-        let table = key.referencedSchema.isEmpty ? key.referencedTable : "\(key.referencedSchema).\(key.referencedTable)"
-        return key.referencedColumns.isEmpty ? table : "\(table)(\(key.referencedColumns.joined(separator: ", ")))"
+    private static func reference(_ key: ForeignKeyLink) -> String {
+        let table = key.schema.isEmpty ? key.table : "\(key.schema).\(key.table)"
+        return key.targetColumns.isEmpty ? table : "\(table)(\(key.targetColumns.joined(separator: ", ")))"
     }
 
     /// The foreign key a cell links through and the row's values for the key's columns, or `nil`
     /// when it isn't a link: not a key column, a NULL in the key, a new or deleted row, or an unsaved edit.
-    private func link(row: Int, column: Int) -> (key: ForeignKeyInfo, values: [DBValue])? {
-        guard foreignKeys != nil, let key = keyByColumn[column], rows.indices.contains(row) else { return nil }
+    private func link(row: Int, column: Int) -> (key: ForeignKeyLink, values: [DBValue])? {
+        guard foreignKeys != nil, let key = keyByColumn[column], let values = values(of: key.columns, row: row) else { return nil }
+        return (key, values)
+    }
+
+    /// A row's values in `indexes`, or `nil` when they can't be followed: a new or deleted row, a
+    /// NULL, binary or unsaved value.
+    private func values(of indexes: [Int], row: Int) -> [DBValue]? {
+        guard rows.indices.contains(row), !indexes.isEmpty else { return nil }
         let id = rows[row].id
         guard id >= 0, !edits.deleted.contains(id) else { return nil }
         var values: [DBValue] = []
-        for name in key.columns {
-            guard let index = columns.firstIndex(where: { $0.name == name }), !columns[index].isBinary,
-                  edits.value(row: id, column: index) == nil,
+        for index in indexes {
+            guard columns.indices.contains(index), !columns[index].isBinary, edits.value(row: id, column: index) == nil,
                   let value = rows[row].values[safe: index], !value.isNull
             else { return nil }
             values.append(value)
         }
-        return (key, values)
+        return values
     }
 
     /// `point` is in the table's coordinates; `nil` when the mouse left it.
@@ -452,42 +454,18 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         openLink(row: hovered.row, column: hovered.column)
     }
 
-    /// A row's values for the columns `key` points at, or `nil` when it can't be followed: a new or
-    /// deleted row, a NULL, binary or unsaved value.
-    private func referencedValues(_ key: ReferencingKey, row: Int) -> [DBValue]? {
-        guard let foreignKeys, rows.indices.contains(row) else { return nil }
-        let names = key.referencedColumns.isEmpty ? foreignKeys.primaryKey : key.referencedColumns
-        let id = rows[row].id
-        guard !names.isEmpty, id >= 0, !edits.deleted.contains(id) else { return nil }
-        var values: [DBValue] = []
-        for name in names {
-            guard let index = columns.firstIndex(where: { $0.name == name }), !columns[index].isBinary,
-                  edits.value(row: id, column: index) == nil,
-                  let value = rows[row].values[safe: index], !value.isNull
-            else { return nil }
-            values.append(value)
-        }
-        return values
-    }
-
-    /// "Referenced By" for a row: each table with a key to this one. A table with several such keys
-    /// lists each with its columns.
+    /// "Referenced By" for a row: each table with a key to a table of the row (labels from the core).
     private func referencedByMenu(row: Int) -> NSMenuItem? {
-        guard let foreignKeys, !foreignKeys.referencedBy.isEmpty, rows.indices.contains(row), rows[row].id >= 0 else { return nil }
+        guard let foreignKeys, !foreignKeys.sources.referencedBy.isEmpty, rows.indices.contains(row), rows[row].id >= 0 else { return nil }
         let submenu = NSMenu()
-        let keys = foreignKeys.referencedBy
-        for key in keys {
-            var title = key.schema == foreignKeys.schema ? key.table : "\(key.schema).\(key.table)"
-            if keys.filter({ $0.schema == key.schema && $0.table == key.table }).count > 1 {
-                title += " (\(key.columns.joined(separator: ", ")))"
-            }
-            if let values = referencedValues(key, row: row) {
-                let item = ClosureMenuItem(title) { foreignKeys.openReferencing(key, values) }
+        for key in foreignKeys.sources.referencedBy {
+            if let values = values(of: key.values, row: row) {
+                let item = ClosureMenuItem(key.label) { foreignKeys.openReferencing(key, values) }
                 item.toolTip = "Rows of \(key.schema).\(key.table) where \(key.columns.joined(separator: ", ")) match this row"
                 submenu.addItem(item)
             } else {
                 // No action: shown disabled.
-                submenu.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: ""))
+                submenu.addItem(NSMenuItem(title: key.label, action: nil, keyEquivalent: ""))
             }
         }
         let item = NSMenuItem(title: "Referenced By", action: nil, keyEquivalent: "")
@@ -573,7 +551,8 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
     // MARK: Editing
 
     private func isEditable(column: Int) -> Bool {
-        editing != nil && columns.indices.contains(column) && !columns[column].isBinary
+        guard let editing, columns.indices.contains(column), !columns[column].isBinary else { return false }
+        return editing.columnReadOnly(column) == nil
     }
 
     /// Model column index of a table column (columns can be reordered by dragging).
@@ -821,9 +800,13 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
                 })
                 menu.addItem(.separator())
             }
-            menu.addItem(ClosureMenuItem("Add Row") { editing.addRow() })
+            if editing.canAddRows {
+                menu.addItem(ClosureMenuItem("Add Row") { editing.addRow() })
+            }
             let count = targets.count
-            menu.addItem(ClosureMenuItem(count == 1 ? "Delete Row" : "Delete \(count) Rows") { editing.deleteRows(targets) })
+            if editing.canDeleteRows {
+                menu.addItem(ClosureMenuItem(count == 1 ? "Delete Row" : "Delete \(count) Rows") { editing.deleteRows(targets) })
+            }
             if targets.contains(where: { $0 < 0 || edits.updates[$0] != nil || edits.deleted.contains($0) }) {
                 menu.addItem(ClosureMenuItem(count == 1 ? "Revert Row" : "Revert \(count) Rows") { editing.revertRows(targets) })
             }
@@ -832,7 +815,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         let clickedRow = table.clickedRow
         let openRow: NSMenuItem? = column.flatMap { column in
             guard link(row: clickedRow, column: column) != nil, let key = keyByColumn[column] else { return nil }
-            return ClosureMenuItem("Open \(key.referencedTable) Row") { [weak self] in self?.openLink(row: clickedRow, column: column) }
+            return ClosureMenuItem(key.label) { [weak self] in self?.openLink(row: clickedRow, column: column) }
         }
         let related = [openRow, referencedByMenu(row: clickedRow)].compactMap { $0 }
         if !related.isEmpty {

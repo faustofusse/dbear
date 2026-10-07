@@ -15,7 +15,7 @@ struct InspectedCell {
     let identity: String
     /// Writes the cell (as a pending edit) when it can be edited.
     let apply: ((EditValue) -> Void)?
-    /// Why it can't be edited (table tabs only).
+    /// Why it can't be edited.
     let readOnlyReason: String?
 }
 
@@ -66,12 +66,24 @@ extension AppModel {
               let column = result.columns[safe: address.column],
               let index = result.rows.firstIndex(where: { $0.id == address.row })
         else { return nil }
-        let value = result.rows[index].values[safe: address.column] ?? .null
+        let id = address.row
+        let loaded = result.rows[index].values[safe: address.column] ?? .null
+        let edit = tab.edits.value(row: id, column: address.column)
+        let text: String? = switch edit {
+        case .text(let t)?: t
+        case .null?, .default?: nil
+        case nil: loaded.isNull ? nil : loaded.displayString
+        }
+        // Cells of a table whose primary key is in the results can be edited (see `ResultSources`).
+        let reason: String? = tab.columnReadOnly(address.column)
+            ?? (column.isBinary ? "Binary values can’t be edited here." : nil)
+            ?? (tab.edits.deleted.contains(id) ? "This row will be deleted." : nil)
         return InspectedCell(
-            column: column, text: value.isNull ? nil : value.displayString, isDefault: false,
+            column: column, text: text, isDefault: edit == .default,
             rowLabel: "Row \((index + 1).formatted())",
-            identity: "\(tab.id)/\(tab.runCount)/\(address.row)/\(address.column)",
-            apply: nil, readOnlyReason: nil
+            identity: "\(tab.id)/\(tab.runCount)/\(id)/\(address.column)/\(text ?? "\u{0}")/\(edit == .default)",
+            apply: reason == nil ? { [weak self] in self?.setCell(tab, row: id, column: address.column, to: $0) } : nil,
+            readOnlyReason: reason
         )
     }
 }

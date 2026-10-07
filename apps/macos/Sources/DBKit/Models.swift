@@ -333,6 +333,25 @@ public struct EditStatement: Hashable, Sendable {
     public var target: String
 }
 
+extension DBValue {
+    /// Text typed into a cell, shown like the value it replaced (after saving, until a reload
+    /// reads what the database stored).
+    public init(typed text: String, like original: DBValue) {
+        switch original {
+        case .int: self = Int64(text).map(DBValue.int) ?? .text(text)
+        case .double: self = Double(text).map(DBValue.double) ?? .text(text)
+        case .decimal: self = Double(text) != nil ? .decimal(text) : .text(text)
+        case .bool:
+            switch text.lowercased() {
+            case "true", "t", "1", "yes": self = .bool(true)
+            case "false", "f", "0", "no": self = .bool(false)
+            default: self = .text(text)
+            }
+        default: self = .text(text)
+        }
+    }
+}
+
 public struct Row: Identifiable, Hashable, Sendable {
     public let id: Int
     public var values: [DBValue]
@@ -351,15 +370,86 @@ public struct QueryResult: Sendable {
     public var rowsAffected: Int?
     /// A script result was cut at the row limit; `totalCount` is how many rows it really returned.
     public var truncated: Bool
+    /// Script results: the table column each column reads (`nil`: an expression). Empty when unknown.
+    public var origins: [ColumnOrigin?]
 
     public init(
-        columns: [ColumnInfo], rows: [Row], totalCount: Int? = nil, rowsAffected: Int? = nil, truncated: Bool = false
+        columns: [ColumnInfo], rows: [Row], totalCount: Int? = nil, rowsAffected: Int? = nil, truncated: Bool = false,
+        origins: [ColumnOrigin?] = []
     ) {
         self.columns = columns
         self.rows = rows
         self.totalCount = totalCount
         self.rowsAffected = rowsAffected
         self.truncated = truncated
+        self.origins = origins
+    }
+}
+
+/// The table column a script result column reads, unchanged.
+public struct ColumnOrigin: Hashable, Sendable {
+    public var schema: String
+    public var table: String
+    public var column: String
+
+    public init(schema: String, table: String, column: String) {
+        self.schema = schema
+        self.table = table
+        self.column = column
+    }
+}
+
+/// A foreign key whose columns are all in a grid: its cells open the row it points at.
+public struct ForeignKeyLink: Hashable, Sendable {
+    /// Grid columns holding the key, in key order.
+    public var columns: [Int]
+    public var schema: String
+    public var table: String
+    /// Columns of `table` they match; empty means its primary key (SQLite's implicit reference).
+    public var targetColumns: [String]
+    /// "Open users Row".
+    public var label: String
+
+    public init(columns: [Int], schema: String, table: String, targetColumns: [String], label: String) {
+        self.columns = columns
+        self.schema = schema
+        self.table = table
+        self.targetColumns = targetColumns
+        self.label = label
+    }
+}
+
+/// Another table's key pointing at a table in a grid: a row opens the rows that reference it.
+public struct ReferenceLink: Hashable, Sendable {
+    /// Grid columns holding the values the key references.
+    public var values: [Int]
+    public var schema: String
+    public var table: String
+    /// The key's columns, in `table`.
+    public var columns: [String]
+    /// "orders (user_id)".
+    public var label: String
+
+    public init(values: [Int], schema: String, table: String, columns: [String], label: String) {
+        self.values = values
+        self.schema = schema
+        self.table = table
+        self.columns = columns
+        self.label = label
+    }
+}
+
+/// One script result row's edits: its values as loaded, new values for some cells, or delete it.
+public struct ResultRowEdit: Sendable {
+    public var values: [DBValue]
+    /// Result column → new value.
+    public var set: [Int: EditValue]
+    public var delete: Bool
+
+    public init(values: [DBValue], set: [Int: EditValue] = [:], delete: Bool = false) {
+        self.values = values
+        self.set = set
+        self.delete = delete
     }
 }
 

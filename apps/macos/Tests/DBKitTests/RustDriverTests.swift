@@ -282,3 +282,20 @@ private func pageThrough(_ driver: any DatabaseDriver, _ table: TableInfo, query
     _ = try await driver.execute("drop table public.dbear_swift_edit")
     await driver.disconnect()
 }
+
+@Test(.enabled(if: postgresEnabled)) func realPostgresScriptResultsLinkAndEdit() async throws {
+    let driver = Drivers.make(for: devDB)
+    let result = try await driver.execute(
+        "select o.id, o.status, o.user_id, u.email, count(*) over () as n from orders o join users u on u.id = o.user_id limit 1")
+    #expect(result.origins.map { $0?.column } == ["id", "status", "user_id", "email", nil])
+    let sources = try await driver.describeResult(result)
+    // orders' key is in the results; users' isn't; `n` is computed.
+    #expect(sources.readOnlyReason(column: 1) == nil)
+    #expect(sources.readOnlyReason(column: 3)?.contains("primary key of “users”") == true)
+    #expect(sources.readOnlyReason(column: 4) != nil)
+    #expect(sources.foreignKeys.contains { $0.table == "users" && $0.columns == [2] })
+    #expect(sources.editableTables == ["orders"])
+    let row = result.rows[0]
+    let sql = try driver.previewResultEdits(sources, edits: [ResultRowEdit(values: row.values, set: [1: .text("paid")])])
+    #expect(sql.map(\.sql) == [#"UPDATE "public"."orders" SET "status" = 'paid' WHERE "id" = \#(row.values[0].displayString);"#])
+}

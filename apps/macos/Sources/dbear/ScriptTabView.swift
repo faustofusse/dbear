@@ -1,12 +1,29 @@
 import DBKit
 import SwiftUI
 
-/// SQL editor on top, results below, resizable.
+/// SQL editor on top, results below, resizable. A results tab shows only the results.
 struct ScriptTabView: View {
     @Environment(AppModel.self) private var model
     @Bindable var tab: ScriptTab
 
     var body: some View {
+        Group {
+            if tab.isResults {
+                VStack(spacing: 0) {
+                    resultsBar
+                    Divider()
+                    results
+                }
+            } else {
+                scriptBody
+            }
+        }
+        .sheet(isPresented: Binding(get: { tab.isReviewingEdits }, set: { tab.isReviewingEdits = $0 })) {
+            ReviewChangesSheet(tab: tab)
+        }
+    }
+
+    private var scriptBody: some View {
         // Split position lives on the tab, so it survives switching tabs.
         VerticalSplit(topHeight: $tab.editorHeight, minTop: 120, minBottom: 150) {
             VStack(spacing: 0) {
@@ -36,26 +53,82 @@ struct ScriptTabView: View {
         return true
     }
 
-    private var editorBar: some View {
+    private var connectionLabel: some View {
+        Label {
+            Text(model.displayName(of: tab.connection))
+        } icon: {
+            DatabaseKindIcon(kind: tab.connection.kind, size: 13)
+        }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .help(tab.connection.summary)
+            .fixedSize()
+    }
+
+    private var stopButton: some View {
+        Button {
+            Task { await model.cancel(tab) }
+        } label: {
+            Label("Stop", systemImage: "stop.fill")
+        }
+        .keyboardShortcut(".", modifiers: .command)
+        .help("Stop Script (⌘.)")
+    }
+
+    /// A results tab's bar: the SQL it ran, and Re-run.
+    private var resultsBar: some View {
         HStack(spacing: 8) {
-            Label {
-                Text(model.displayName(of: tab.connection))
-            } icon: {
-                DatabaseKindIcon(kind: tab.connection.kind, size: 13)
-            }
-                .font(.callout)
+            connectionLabel
+            Text(tab.text.split(whereSeparator: \.isWhitespace).joined(separator: " "))
+                .font(.system(.callout, design: .monospaced))
                 .foregroundStyle(.secondary)
-                .help(tab.connection.summary)
-            Spacer()
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(tab.text)
+                .frame(maxWidth: .infinity, alignment: .leading)
             if tab.result.isLoading {
                 ProgressView().controlSize(.small)
+                stopButton
+            } else {
                 Button {
-                    Task { await model.cancel(tab) }
+                    Task { await model.run(tab) }
                 } label: {
-                    Label("Stop", systemImage: "stop.fill")
+                    Label("Re-run", systemImage: "arrow.clockwise")
                 }
-                .keyboardShortcut(".", modifiers: .command)
-                .help("Stop Script (⌘.)")
+                .keyboardShortcut(.return, modifiers: .command)
+                .help("Run the Query Again (⌘↩)")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    private var editorBar: some View {
+        HStack(spacing: 8) {
+            connectionLabel
+            Spacer()
+            if tab.hasRows && !tab.result.isLoading {
+                Button {
+                    model.openResultsInNewTab(tab)
+                } label: {
+                    Label("Open in New Tab", systemImage: "arrow.up.right.square")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .help("Open These Results in a New Tab")
+            }
+            Button {
+                model.runInNewTab(tab)
+            } label: {
+                Label(tab.hasSelection ? "Run Selection in New Tab" : "Run in New Tab", systemImage: "plus.rectangle.on.rectangle")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .keyboardShortcut(.return, modifiers: [.command, .shift])
+            .help(tab.hasSelection ? "Run Selected SQL in a New Tab (⇧⌘↩)" : "Run Script in a New Tab (⇧⌘↩)")
+            if tab.result.isLoading {
+                ProgressView().controlSize(.small)
+                stopButton
             } else {
                 Button {
                     Task { await model.run(tab) }
@@ -74,7 +147,7 @@ struct ScriptTabView: View {
     private var results: some View {
         switch tab.result {
         case .idle:
-            Text(tab.wasCancelled ? "Query cancelled" : "Press ⌘↩ to run")
+            Text(tab.wasCancelled ? "Query cancelled" : tab.isResults ? "Not run yet" : "Press ⌘↩ to run")
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .loading:
@@ -103,6 +176,14 @@ struct ScriptTabView: View {
         case .loaded(let result):
             DataGrid(
                 result: result, version: tab.runCount, duration: tab.lastDuration,
+                editing: editing,
+                foreignKeys: tab.sources.map { sources in
+                    GridForeignKeys(
+                        sources: sources,
+                        open: { model.openReferencedRow($0, values: $1, from: tab.connection) },
+                        openReferencing: { model.openReferencingRows($0, values: $1, from: tab.connection) }
+                    )
+                },
                 focus: GridFocus(
                     initial: { tab.focusedCell },
                     changed: { tab.focusedCell = $0 },
@@ -111,5 +192,23 @@ struct ScriptTabView: View {
                 source: GridSource(kind: tab.connection.kind)
             )
         }
+    }
+
+    /// Cells of tables whose primary key is in the results can be edited (see `ResultSources`).
+    private var editing: GridEditing? {
+        guard let sources = tab.sources, sources.isEditable else { return nil }
+        return GridEditing(
+            edits: tab.edits,
+            editRequest: tab.editRequest,
+            setCell: { model.setCell(tab, row: $0, column: $1, to: $2) },
+            addRow: {},
+            deleteRows: { model.deleteRows(tab, ids: $0) },
+            revertRows: { model.revertRows(tab, ids: $0) },
+            selectionChanged: { tab.selectedRowIDs = $0 },
+            requestHandled: { tab.editRequest = nil },
+            columnReadOnly: { sources.readOnlyReason(column: $0) },
+            canAddRows: false,
+            canDeleteRows: sources.canDeleteRows
+        )
     }
 }

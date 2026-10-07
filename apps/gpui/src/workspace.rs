@@ -29,7 +29,7 @@ use crate::import_dialog::ImportDialog;
 use crate::new_database::{CreateRequested, NewDatabaseDialog};
 use crate::grid::{RelatedRows, copy};
 use crate::users::{self, RoleCreated, UsersState, UsersTab};
-use crate::tabs::{EditorFontSize, History, ScriptTab, TabEvent, TableTab, count, plural};
+use crate::tabs::{EditorFontSize, History, OpenResults, ResultTab, ScriptTab, TabEvent, TableTab, count, plural};
 
 enum Load<T> {
     Idle,
@@ -145,6 +145,19 @@ enum TabView {
     Script(Entity<ScriptTab>),
     /// A connection's users (the role selected in the middle column).
     Users(Entity<UsersTab>),
+    /// A script's results on their own.
+    Result(Entity<ResultTab>),
+}
+
+impl TabView {
+    fn has_unsaved_edits(&self, cx: &App) -> bool {
+        match self {
+            TabView::Table(tab) => tab.read(cx).has_unsaved_edits(cx),
+            TabView::Script(tab) => tab.read(cx).has_unsaved_edits(cx),
+            TabView::Result(tab) => tab.read(cx).has_unsaved_edits(cx),
+            TabView::Users(_) => false,
+        }
+    }
 }
 
 struct OpenTab {
@@ -160,20 +173,21 @@ impl OpenTab {
             TabView::Table(tab) => tab.read(cx).title(),
             TabView::Script(tab) => tab.read(cx).name.clone(),
             TabView::Users(tab) => tab.read(cx).title(cx),
+            TabView::Result(tab) => tab.read(cx).title.clone(),
         }
     }
 
     fn table(&self, cx: &App) -> Option<TableInfo> {
         match &self.view {
             TabView::Table(tab) => Some(tab.read(cx).table.clone()),
-            TabView::Script(_) | TabView::Users(_) => None,
+            TabView::Script(_) | TabView::Users(_) | TabView::Result(_) => None,
         }
     }
 
     fn filter(&self, cx: &App) -> Option<String> {
         match &self.view {
             TabView::Table(tab) => tab.read(cx).applied_filter(cx),
-            TabView::Script(_) | TabView::Users(_) => None,
+            TabView::Script(_) | TabView::Users(_) | TabView::Result(_) => None,
         }
     }
 }
@@ -1063,7 +1077,7 @@ impl Workspace {
         let tab = OpenTab { key, view, _events: events };
         let preview = self.tabs.iter().position(|tab| match &tab.view {
             TabView::Table(t) => t.read(cx).preview,
-            TabView::Script(_) | TabView::Users(_) => false,
+            TabView::Script(_) | TabView::Users(_) | TabView::Result(_) => false,
         });
         match preview {
             Some(ix) => self.tabs[ix] = tab,
@@ -1091,16 +1105,38 @@ impl Workspace {
         let handle = move |this: &mut Self, event: &TabEvent, window: &mut Window, cx: &mut Context<Self>| match event {
             TabEvent::OpenRelated(related) => this.open_related(key.clone(), related.clone(), window, cx),
             TabEvent::SchemaMayHaveChanged => this.schema_changed(&key, cx),
+            TabEvent::OpenResults(request) => this.open_results(key.clone(), request.clone(), window, cx),
         };
         match view {
             TabView::Table(tab) => {
                 let handle = handle.clone();
                 cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx))
             }
-            TabView::Script(tab) => cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx)),
+            TabView::Script(tab) => {
+                let handle = handle.clone();
+                cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx))
+            }
+            TabView::Result(tab) => cx.subscribe_in(tab, window, move |this, _, event, window, cx| handle(this, event, window, cx)),
             // Its title follows the selected role.
             TabView::Users(tab) => cx.observe(tab, |_, _, cx| cx.notify()),
         }
+    }
+
+    /// Opens a script's results in a tab after the current one ("SQL 1 Results", then "… 2").
+    fn open_results(&mut self, key: TargetKey, request: OpenResults, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connection) = self.open.get(&key).cloned() else { return };
+        let base = format!("{} Results", request.source);
+        let taken: HashSet<String> = self.tabs.iter().map(|t| t.title(cx)).collect();
+        let title = std::iter::once(base.clone())
+            .chain((2..).map(|n| format!("{base} {n}")))
+            .find(|t| !taken.contains(t))
+            .unwrap_or(base);
+        let (target, history) = (self.target_label(&key), self.history_for(&key));
+        let view = TabView::Result(cx.new(|cx| ResultTab::new(connection, title, target, request, history, window, cx)));
+        let events = self.tab_events(&key, &view, window, cx);
+        let ix = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(ix, OpenTab { key, view, _events: events });
+        self.activate(ix, window, cx);
     }
 
     fn history_for(&self, key: &TargetKey) -> Option<History> {
@@ -1131,6 +1167,8 @@ impl Workspace {
                 Some(match &tab.view {
                     // Users tabs aren't reopened: the middle column is back to tables at launch.
                     TabView::Users(_) => return None,
+                    // Nor results: running a script by itself at launch could write.
+                    TabView::Result(_) => return None,
                     TabView::Table(t) => {
                         let tab = t.read(cx);
                         let table = &tab.table;
@@ -1256,8 +1294,7 @@ impl Workspace {
 
     fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let unsaved = match self.tabs.get(ix).map(|t| &t.view) {
-            Some(TabView::Table(tab)) => tab.read(cx).has_unsaved_edits(cx),
-            Some(TabView::Script(_) | TabView::Users(_)) => false,
+            Some(view) => view.has_unsaved_edits(cx),
             None => return,
         };
         if unsaved {
@@ -1302,7 +1339,7 @@ impl Workspace {
     fn close_tabs(&mut self, close: Vec<usize>, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
         let unsaved = close
             .iter()
-            .filter(|&&ix| matches!(self.tabs.get(ix).map(|t| &t.view), Some(TabView::Table(t)) if t.read(cx).has_unsaved_edits(cx)))
+            .filter(|&&ix| self.tabs.get(ix).is_some_and(|t| t.view.has_unsaved_edits(cx)))
             .count();
         if unsaved == 0 {
             return self.remove_tabs(close, keep, window, cx);
@@ -2027,6 +2064,7 @@ impl Workspace {
             TabView::Table(tab) => tab.clone().into_any_element(),
             TabView::Script(tab) => tab.clone().into_any_element(),
             TabView::Users(tab) => tab.clone().into_any_element(),
+            TabView::Result(tab) => tab.clone().into_any_element(),
         };
         // Like the macOS app: no tab bar while there's only one tab.
         let bar = (self.tabs.len() > 1).then(|| {

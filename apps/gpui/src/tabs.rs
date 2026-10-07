@@ -16,11 +16,14 @@ use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::assets::IconName as AssetIcon;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::grid::{PAGE_SIZE, RelatedRows, Relations, RowsDelegate, copy, row_menu};
+use crate::grid::{PAGE_SIZE, RelatedRows, RowsDelegate, copy, row_menu};
+use dbcore::results::{ResultSources, TableChanges};
 use crate::inspector::{self, Inspector};
 use crate::sql_complete::{SharedCatalog, SqlCompletion};
 use crate::highlight;
@@ -36,6 +39,8 @@ pub enum TabEvent {
     OpenRelated(RelatedRows),
     /// A script ran DDL: the tables column should list the tables again.
     SchemaMayHaveChanged,
+    /// Show a script's results in a tab of their own.
+    OpenResults(OpenResults),
 }
 
 /// Rows kept from one script result (like the macOS app); the rest are counted, not shown.
@@ -45,6 +50,7 @@ actions!(
     dbear,
     [
         RunScript,
+        RunInNewTab,
         CancelScript,
         CopySelection,
         CopySelectionWithHeaders,
@@ -85,7 +91,11 @@ pub fn bind_keys(cx: &mut App) {
         // More specific than the editor's own ⌘↩ (insert a line), so running wins inside scripts.
         KeyBinding::new("secondary-enter", RunScript, Some("ScriptTab > Input")),
         KeyBinding::new("secondary-enter", RunScript, Some("ScriptTab")),
+        KeyBinding::new("shift-secondary-enter", RunInNewTab, Some("ScriptTab > Input")),
+        KeyBinding::new("shift-secondary-enter", RunInNewTab, Some("ScriptTab")),
         KeyBinding::new("secondary-.", CancelScript, Some("ScriptTab")),
+        KeyBinding::new("secondary-enter", RunScript, Some("ResultTab")),
+        KeyBinding::new("secondary-.", CancelScript, Some("ResultTab")),
         KeyBinding::new("secondary-c", CopySelection, Some("DataTable")),
         KeyBinding::new("shift-secondary-c", CopySelectionWithHeaders, Some("DataTable")),
         KeyBinding::new("alt-secondary-i", ToggleInspector, None),
@@ -95,6 +105,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-tab", PreviousCell, Some("CellEditor > Input")),
         KeyBinding::new("secondary-backspace", DeleteRow, Some("DataTable")),
         KeyBinding::new("secondary-s", SaveEdits, Some("TableTab")),
+        KeyBinding::new("secondary-s", SaveEdits, Some("Results")),
         KeyBinding::new("secondary-=", ZoomIn, Some("ScriptTab")),
         KeyBinding::new("secondary-+", ZoomIn, Some("ScriptTab")),
         KeyBinding::new("secondary--", ZoomOut, Some("ScriptTab")),
@@ -316,9 +327,7 @@ pub struct TableTab {
     filter: Entity<InputState>,
     structure: Structure,
     inspector: Entity<Inspector>,
-    /// Why the last edit attempt was refused (read-only table or column).
-    edit_notice: Option<String>,
-    edit_subscriptions: Vec<Subscription>,
+    editor: GridEditor,
     settle: Settle,
     menu: CellMenu,
     _tasks: Vec<Task<()>>,
@@ -406,12 +415,11 @@ impl TableTab {
             connection,
             mode: Mode::Data,
             rows: Load::Loading,
-            grid,
+            grid: grid.clone(),
             filter,
             structure: Structure::NotLoaded,
             inspector,
-            edit_notice: None,
-            edit_subscriptions: Vec::new(),
+            editor: GridEditor::new(grid.clone()),
             settle: Settle::default(),
             menu: CellMenu::default(),
             _tasks: vec![task],
@@ -435,106 +443,13 @@ impl TableTab {
     // MARK: editing
 
     fn begin_edit(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_edit(window, cx);
-        let (editable, reason, text) = {
-            let grid = self.grid.read(cx).delegate();
-            let reason = grid.read_only_reason().or_else(|| {
-                (!grid.is_editable(col)).then(|| "Binary columns can’t be edited here.".to_string())
-            });
-            (reason.is_none() && !grid.is_deleted(row), reason, grid.edit_text(row, col))
-        };
-        if !editable {
-            self.edit_notice = reason;
-            cx.notify();
-            return;
+        if self.editor.begin(row, col, window, cx, |this: &mut Self| &mut this.editor) {
+            self.preview = false;
         }
-        self.edit_notice = None;
-        self.preview = false;
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(text));
-        self.edit_subscriptions = vec![cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
-            InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_edit(window, cx),
-            _ => {}
-        })];
-        input.update(cx, |s, cx| {
-            s.focus(window, cx);
-            // Typing replaces the value; arrows keep it.
-            s.select_all(window, cx);
-        });
-        self.grid.update(cx, |state, cx| {
-            // The table's selection highlights the cell being edited (also when started from the menu).
-            // Only when needed: selecting also scrolls the row to the middle.
-            if state.selected_cell() != Some((row, col)) {
-                state.set_selected_cell(row, col, cx);
-            }
-            state.delegate_mut().editing = Some((row, col, input));
-            cx.notify();
-        });
-    }
-
-    /// Keeps what was typed (when it differs from what the cell showed).
-    fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((row, col, input)) = self.grid.update(cx, |state, _| state.delegate_mut().editing.take()) else { return };
-        self.edit_subscriptions.clear();
-        let text = input.read(cx).value().to_string();
-        self.grid.update(cx, |state, cx| {
-            let grid = state.delegate_mut();
-            if text != grid.edit_text(row, col) {
-                grid.set_cell(row, col, EditValue::Text(text));
-            }
-            cx.notify();
-        });
-        self.focus_grid(window, cx);
-    }
-
-    /// ↩ on the grid: edit the selected cell (or the first editable cell of the selected row).
-    fn start_edit(&mut self, _: &StartEdit, window: &mut Window, cx: &mut Context<Self>) {
-        let target = {
-            let state = self.grid.read(cx);
-            let grid = state.delegate();
-            match state.selection() {
-                gpui_kit::component::table::TableSelection::Cell(row, col) => Some((row, col)),
-                gpui_kit::component::table::TableSelection::Row(row) => {
-                    (0..grid.columns.len()).find(|&c| grid.is_editable(c)).map(|col| (row, col))
-                }
-                _ => None,
-            }
-        };
-        if let Some((row, col)) = target {
-            self.begin_edit(row, col, window, cx);
-        }
-    }
-
-    /// Tab / ⇧Tab while editing: keep the value and edit the next (previous) editable cell,
-    /// continuing on the next (previous) row at the end of one.
-    fn move_edit(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((row, col)) = self.grid.read(cx).delegate().editing.as_ref().map(|(r, c, _)| (*r, *c)) else { return };
-        let next = {
-            let grid = self.grid.read(cx).delegate();
-            let (columns, rows) = (grid.columns.len(), grid.rows.len() + grid.edits.inserted.len());
-            let total = columns * rows;
-            let at = row * columns + col;
-            (1..total).map(|step| if forward { (at + step) % total } else { (at + total - step) % total })
-                .map(|i| (i / columns, i % columns))
-                .find(|&(r, c)| grid.is_editable(c) && !grid.is_deleted(r))
-        };
-        self.commit_edit(window, cx);
-        if let Some((row, col)) = next {
-            self.begin_edit(row, col, window, cx);
-        }
-    }
-
-    fn cancel_edit(&mut self, _: &CancelEdit, window: &mut Window, cx: &mut Context<Self>) {
-        self.edit_subscriptions.clear();
-        self.grid.update(cx, |state, cx| {
-            state.delegate_mut().editing = None;
-            cx.notify();
-        });
-        self.focus_grid(window, cx);
     }
 
     fn focus_grid(&self, window: &mut Window, cx: &mut App) {
-        let focus = self.grid.read(cx).focus_handle(cx);
-        focus.focus(window, cx);
+        self.editor.focus_grid(window, cx);
     }
 
     fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -548,47 +463,6 @@ impl TableTab {
             (row, col)
         });
         self.begin_edit(row, col, window, cx);
-    }
-
-    fn delete_row(&mut self, _: &DeleteRow, _: &mut Window, cx: &mut Context<Self>) {
-        self.grid.update(cx, |state, cx| {
-            let Some(row) = RowsDelegate::selected_row(state.selection()) else { return };
-            if state.delegate().read_only_reason().is_some() {
-                return;
-            }
-            state.delegate_mut().toggle_delete(row);
-            cx.notify();
-        });
-    }
-
-    fn discard_edits(&mut self, cx: &mut Context<Self>) {
-        self.edit_subscriptions.clear();
-        self.grid.update(cx, |state, cx| {
-            state.delegate_mut().discard_edits();
-            cx.notify();
-        });
-    }
-
-    fn review(&mut self, _: &SaveEdits, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_edit(window, cx);
-        if !self.has_unsaved_edits(cx) {
-            return;
-        }
-        let review = cx.new(|cx| ReviewEdits::new(self.grid.clone(), cx));
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let saving = review.read(cx).saving;
-            let can_save = review.read(cx).statements.is_ok() && !saving;
-            let footer = h_flex()
-                .w_full()
-                .gap_2()
-                .child(div().flex_1())
-                .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
-                .child(Button::new("save").primary().label(if saving { "Saving…" } else { "Save" }).disabled(!can_save).on_click({
-                    let review = review.clone();
-                    move |_, window, cx| review.update(cx, |r, cx| r.save(window, cx))
-                }));
-            dialog.title("Review Changes").w(px(760.)).child(review.clone()).footer(footer)
-        });
     }
 
     /// Reads the rows again with the typed `WHERE` filter (empty: no filter).
@@ -636,12 +510,10 @@ impl TableTab {
             this.update(cx, |this, cx| {
                 this.structure = match result {
                     Ok(structure) => {
-                        let relations = Relations {
-                            foreign_keys: structure.foreign_keys.clone(),
-                            referenced_by: structure.referenced_by.clone(),
-                        };
+                        let table = this.table.clone();
                         this.grid.update(cx, |state, cx| {
-                            state.delegate_mut().relations = Some(relations);
+                            let rows = state.delegate_mut();
+                            rows.links = Some(ResultSources::for_table(&table, &rows.columns, &structure));
                             cx.notify();
                         });
                         Structure::Loaded(structure)
@@ -659,8 +531,7 @@ impl TableTab {
         let applied = grid.query.filter.clone();
         let typed = self.filter.read(cx).value().trim().to_string();
         let pending = typed != applied.clone().unwrap_or_default();
-        let error = grid.reload_error.clone().or_else(|| self.edit_notice.clone());
-        let edits = (!grid.edits.is_empty()).then(|| grid.edits.summary());
+        let error = grid.reload_error.clone().or_else(|| self.editor.notice.clone());
         let _ = window;
         let filter_bar = h_flex()
             .px_2()
@@ -688,24 +559,7 @@ impl TableTab {
                 grid_with_inspector(table, &self.inspector, cx)
             }
         };
-        let edit_bar = edits.map(|summary| {
-            h_flex()
-                .px_3()
-                .py_1p5()
-                .gap_2()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().yellow.opacity(0.10))
-                .child(div().flex_1().text_sm().child(format!("Unsaved changes: {summary}")))
-                .child(Button::new("discard").ghost().small().label("Discard").on_click(cx.listener(|this, _, _, cx| this.discard_edits(cx))))
-                .child(
-                    Button::new("review")
-                        .primary()
-                        .small()
-                        .label(format!("Review & Save… ({})", keys::shortcut("secondary-s")))
-                        .on_click(cx.listener(|this, _, window, cx| this.review(&SaveEdits, window, cx))),
-                )
-        });
+        let edit_bar = edit_bar(&self.grid, cx, |this: &mut Self| &mut this.editor);
         v_flex()
             .size_full()
             .child(filter_bar)
@@ -868,12 +722,16 @@ impl Render for TableTab {
             .key_context("TableTab")
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| copy_selection(&this.grid, false, cx)))
             .on_action(cx.listener(|this, _: &CopySelectionWithHeaders, _, cx| copy_selection(&this.grid, true, cx)))
-            .on_action(cx.listener(Self::cancel_edit))
-            .on_action(cx.listener(Self::start_edit))
-            .on_action(cx.listener(|this, _: &NextCell, window, cx| this.move_edit(true, window, cx)))
-            .on_action(cx.listener(|this, _: &PreviousCell, window, cx| this.move_edit(false, window, cx)))
-            .on_action(cx.listener(Self::delete_row))
-            .on_action(cx.listener(Self::review))
+            .on_action(cx.listener(|this, _: &CancelEdit, window, cx| this.editor.cancel(window, cx)))
+            .on_action(cx.listener(|this, _: &StartEdit, window, cx| {
+                if this.editor.start(window, cx, |this: &mut Self| &mut this.editor) {
+                    this.preview = false;
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NextCell, window, cx| this.editor.step(true, window, cx, |this: &mut Self| &mut this.editor)))
+            .on_action(cx.listener(|this, _: &PreviousCell, window, cx| this.editor.step(false, window, cx, |this: &mut Self| &mut this.editor)))
+            .on_action(cx.listener(|this, _: &DeleteRow, _, cx| this.editor.delete_selected_row(cx)))
+            .on_action(cx.listener(|this, _: &SaveEdits, window, cx| this.editor.review(window, cx)))
             .size_full()
             .child(
                 h_flex()
@@ -906,6 +764,192 @@ impl Render for TableTab {
     }
 }
 
+// MARK: cell editing
+
+/// Inline cell editing on a grid: table tabs and script results share it. The owner forwards the
+/// grid's double-clicks and the editing actions, and finds its editor again with `get`.
+struct GridEditor {
+    grid: Entity<TableState<RowsDelegate>>,
+    /// Why the last edit attempt was refused (read-only table or column).
+    notice: Option<String>,
+    subscriptions: Vec<Subscription>,
+}
+
+impl GridEditor {
+    fn new(grid: Entity<TableState<RowsDelegate>>) -> Self {
+        Self { grid, notice: None, subscriptions: Vec::new() }
+    }
+
+    /// Starts editing a cell. `false` (with `notice` saying why) when it can't be edited.
+    fn begin<T: 'static>(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<T>, get: fn(&mut T) -> &mut GridEditor) -> bool {
+        self.commit(window, cx);
+        let (reason, deleted, text) = {
+            let grid = self.grid.read(cx).delegate();
+            (grid.cell_read_only_reason(col), grid.is_deleted(row), grid.edit_text(row, col))
+        };
+        if reason.is_some() || deleted {
+            self.notice = reason;
+            cx.notify();
+            return false;
+        }
+        self.notice = None;
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(text));
+        self.subscriptions = vec![cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| match event {
+            InputEvent::PressEnter { .. } | InputEvent::Blur => get(this).commit(window, cx),
+            _ => {}
+        })];
+        input.update(cx, |s, cx| {
+            s.focus(window, cx);
+            // Typing replaces the value; arrows keep it.
+            s.select_all(window, cx);
+        });
+        self.grid.update(cx, |state, cx| {
+            // The table's selection highlights the cell being edited (also when started from the menu).
+            // Only when needed: selecting also scrolls the row to the middle.
+            if state.selected_cell() != Some((row, col)) {
+                state.set_selected_cell(row, col, cx);
+            }
+            state.delegate_mut().editing = Some((row, col, input));
+            cx.notify();
+        });
+        true
+    }
+
+    /// Keeps what was typed (when it differs from what the cell showed).
+    fn commit<T: 'static>(&mut self, window: &mut Window, cx: &mut Context<T>) {
+        let Some((row, col, input)) = self.grid.update(cx, |state, _| state.delegate_mut().editing.take()) else { return };
+        self.subscriptions.clear();
+        let text = input.read(cx).value().to_string();
+        self.grid.update(cx, |state, cx| {
+            let grid = state.delegate_mut();
+            if text != grid.edit_text(row, col) {
+                grid.set_cell(row, col, EditValue::Text(text));
+            }
+            cx.notify();
+        });
+        self.focus_grid(window, cx);
+    }
+
+    /// ↩ on the grid: edit the selected cell (or the first editable cell of the selected row).
+    fn start<T: 'static>(&mut self, window: &mut Window, cx: &mut Context<T>, get: fn(&mut T) -> &mut GridEditor) -> bool {
+        let target = {
+            let state = self.grid.read(cx);
+            let grid = state.delegate();
+            match state.selection() {
+                gpui_kit::component::table::TableSelection::Cell(row, col) => Some((row, col)),
+                gpui_kit::component::table::TableSelection::Row(row) => {
+                    (0..grid.columns.len()).find(|&c| grid.is_editable(c)).map(|col| (row, col))
+                }
+                _ => None,
+            }
+        };
+        target.is_some_and(|(row, col)| self.begin(row, col, window, cx, get))
+    }
+
+    /// Tab / ⇧Tab while editing: keep the value and edit the next (previous) editable cell,
+    /// continuing on the next (previous) row at the end of one.
+    fn step<T: 'static>(&mut self, forward: bool, window: &mut Window, cx: &mut Context<T>, get: fn(&mut T) -> &mut GridEditor) {
+        let Some((row, col)) = self.grid.read(cx).delegate().editing.as_ref().map(|(r, c, _)| (*r, *c)) else { return };
+        let next = {
+            let grid = self.grid.read(cx).delegate();
+            let (columns, rows) = (grid.columns.len(), grid.rows.len() + grid.edits.inserted.len());
+            let total = columns * rows;
+            let at = row * columns + col;
+            (1..total).map(|step| if forward { (at + step) % total } else { (at + total - step) % total })
+                .map(|i| (i / columns, i % columns))
+                .find(|&(r, c)| grid.is_editable(c) && !grid.is_deleted(r))
+        };
+        self.commit(window, cx);
+        if let Some((row, col)) = next {
+            self.begin(row, col, window, cx, get);
+        }
+    }
+
+    fn cancel<T: 'static>(&mut self, window: &mut Window, cx: &mut Context<T>) {
+        self.subscriptions.clear();
+        self.grid.update(cx, |state, cx| {
+            state.delegate_mut().editing = None;
+            cx.notify();
+        });
+        self.focus_grid(window, cx);
+    }
+
+    fn focus_grid(&self, window: &mut Window, cx: &mut App) {
+        let focus = self.grid.read(cx).focus_handle(cx);
+        focus.focus(window, cx);
+    }
+
+    /// ⌘⌫: marks the selected row for deletion (or restores it).
+    fn delete_selected_row<T: 'static>(&mut self, cx: &mut Context<T>) {
+        self.grid.update(cx, |state, cx| {
+            let Some(row) = RowsDelegate::selected_row(state.selection()) else { return };
+            if !state.delegate().can_delete_rows() {
+                return;
+            }
+            state.delegate_mut().toggle_delete(row);
+            cx.notify();
+        });
+    }
+
+    fn discard<T: 'static>(&mut self, cx: &mut Context<T>) {
+        self.subscriptions.clear();
+        self.grid.update(cx, |state, cx| {
+            state.delegate_mut().discard_edits();
+            cx.notify();
+        });
+    }
+
+    /// ⌘S: the SQL that saving runs, and Save.
+    fn review<T: 'static>(&mut self, window: &mut Window, cx: &mut Context<T>) {
+        self.commit(window, cx);
+        if self.grid.read(cx).delegate().edits.is_empty() {
+            return;
+        }
+        let review = cx.new(|cx| ReviewEdits::new(self.grid.clone(), cx));
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let saving = review.read(cx).saving;
+            let can_save = review.read(cx).statements.is_ok() && !saving;
+            let footer = h_flex()
+                .w_full()
+                .gap_2()
+                .child(div().flex_1())
+                .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("save").primary().label(if saving { "Saving…" } else { "Save" }).disabled(!can_save).on_click({
+                    let review = review.clone();
+                    move |_, window, cx| review.update(cx, |r, cx| r.save(window, cx))
+                }));
+            dialog.title("Review Changes").w(px(760.)).child(review.clone()).footer(footer)
+        });
+    }
+}
+
+/// "Unsaved changes: 2 edited · 1 deleted  [Discard] [Review & Save…]" while a grid has edits.
+fn edit_bar<T: 'static>(grid: &Entity<TableState<RowsDelegate>>, cx: &mut Context<T>, get: fn(&mut T) -> &mut GridEditor) -> Option<Div> {
+    let edits = &grid.read(cx).delegate().edits;
+    if edits.is_empty() {
+        return None;
+    }
+    let summary = edits.summary();
+    Some(
+        h_flex()
+            .px_3()
+            .py_1p5()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().yellow.opacity(0.10))
+            .child(div().flex_1().text_sm().child(format!("Unsaved changes: {summary}")))
+            .child(Button::new("discard").ghost().small().label("Discard").on_click(cx.listener(move |this, _, _, cx| get(this).discard(cx))))
+            .child(
+                Button::new("review")
+                    .primary()
+                    .small()
+                    .label(format!("Review & Save… ({})", keys::shortcut("secondary-s")))
+                    .on_click(cx.listener(move |this, _, window, cx| get(this).review(window, cx))),
+            ),
+    )
+}
+
 // MARK: review
 
 /// The SQL that saving will run, and the Save itself (one transaction in the core).
@@ -917,17 +961,34 @@ pub struct ReviewEdits {
     task: Option<Task<()>>,
 }
 
+/// What saving runs: a table's changes, or a script result's (to one or more tables).
+enum Save {
+    Table { connection: Arc<Connection>, table: TableInfo, columns: Vec<dbcore::ColumnInfo>, changes: Vec<dbcore::edit::RowChange> },
+    Results { connection: Arc<Connection>, changes: Vec<TableChanges> },
+}
+
+impl Save {
+    fn of(rows: &RowsDelegate) -> Result<Self, String> {
+        if let Some((connection, table)) = rows.source() {
+            return Ok(Self::Table { connection: connection.clone(), table: table.clone(), columns: rows.columns.clone(), changes: rows.changes() });
+        }
+        let (Some(links), Some(connection)) = (&rows.links, rows.connection()) else { return Err("Nothing to save.".into()) };
+        let changes = links.changes(&rows.result_edits()).map_err(|e| e.to_string())?;
+        Ok(Self::Results { connection: connection.clone(), changes })
+    }
+
+    fn preview(&self) -> Result<Vec<EditStatement>, String> {
+        match self {
+            Self::Table { connection, table, columns, changes } => connection.preview_changes(table, columns, changes),
+            Self::Results { connection, changes } => connection.preview_result_changes(changes),
+        }
+        .map_err(|e| e.to_string())
+    }
+}
+
 impl ReviewEdits {
     fn new(grid: Entity<TableState<RowsDelegate>>, cx: &mut Context<Self>) -> Self {
-        let statements = {
-            let rows = grid.read(cx).delegate();
-            match rows.source() {
-                Some((connection, table)) => {
-                    connection.preview_changes(table, &rows.columns, &rows.changes()).map_err(|e| e.to_string())
-                }
-                None => Err("Nothing to save.".into()),
-            }
-        };
+        let statements = Save::of(grid.read(cx).delegate()).and_then(|save| save.preview());
         Self { grid, statements, error: None, saving: false, task: None }
     }
 
@@ -935,23 +996,37 @@ impl ReviewEdits {
         if self.saving {
             return;
         }
-        let (source, columns, changes) = {
-            let rows = self.grid.read(cx).delegate();
-            (rows.source().cloned(), rows.columns.clone(), rows.changes())
+        let save = match Save::of(self.grid.read(cx).delegate()) {
+            Ok(save) => save,
+            Err(e) => {
+                self.error = Some(e);
+                cx.notify();
+                return;
+            }
         };
-        let Some((connection, table)) = source else { return };
         self.saving = true;
         self.error = None;
         let grid = self.grid.clone();
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = connection.apply_changes(table, columns, changes).await;
+            let table = matches!(save, Save::Table { .. });
+            let result = match save {
+                Save::Table { connection, table, columns, changes } => connection.apply_changes(table, columns, changes).await,
+                Save::Results { connection, changes } => connection.apply_result_changes(changes).await,
+            };
             this.update_in(cx, |this, window, cx| {
                 this.saving = false;
                 match result {
                     Ok(_) => {
                         grid.update(cx, |state, cx| {
-                            state.delegate_mut().discard_edits();
-                            state.delegate_mut().refresh_rows(cx);
+                            if table {
+                                state.delegate_mut().discard_edits();
+                                state.delegate_mut().refresh_rows(cx);
+                            } else {
+                                // Not re-run: a script may do more than select.
+                                state.delegate_mut().apply_saved_edits();
+                                state.refresh(cx);
+                            }
+                            cx.notify();
                         });
                         window.close_dialog(cx);
                     }
@@ -1017,173 +1092,135 @@ pub struct History {
     pub database: String,
 }
 
-pub struct ScriptTab {
-    /// "SQL 1", "SQL 2"…
-    pub name: String,
-    /// The database it runs in (shown in the header).
-    pub target: String,
+/// A run that returned rows, kept so it can move to a results tab of its own.
+#[derive(Clone)]
+pub struct Ran {
+    pub sql: String,
+    pub result: QueryResult,
+    pub took: Duration,
+}
+
+/// A script asks for a results tab: of rows it already has (`ran`), or of running `sql` there.
+#[derive(Clone)]
+pub struct OpenResults {
+    /// The script's name ("SQL 1"), for the tab's title.
+    pub source: String,
+    pub sql: String,
+    pub ran: Option<Ran>,
+}
+
+/// A run finished, also when it failed (a script can create a table, then fail on a later
+/// statement). Not sent for cancelled runs.
+pub struct RunFinished {
+    pub sql: String,
+}
+
+/// What running SQL shows: rows (with the inspector), rows affected, or the error, and a status
+/// bar. A script tab has one under its editor; a results tab is one on its own.
+pub struct Results {
     connection: Arc<Connection>,
-    editor: Entity<EditorState>,
     grid: Entity<TableState<RowsDelegate>>,
     inspector: Entity<Inspector>,
     outcome: Outcome,
     run_task: Option<Task<()>>,
     history: Option<History>,
+    /// The last run that returned rows, for "Open in New Tab".
+    last: Option<Ran>,
+    /// Edits cells of tables whose primary key is in the result.
+    editor: GridEditor,
+    /// Finding the tables the rows come from (for editing and foreign key links).
+    links_task: Option<Task<()>>,
     settle: Settle,
     menu: CellMenu,
-    _catalog_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
-impl ScriptTab {
-    pub fn new(
-        connection: Arc<Connection>,
-        name: String,
-        target: String,
-        history: Option<History>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let catalog: SharedCatalog = Rc::default();
-        let completion = SqlCompletion { catalog: catalog.clone(), dialect: Dialect(connection.config().kind) };
-        let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx).language(highlight::SQL).line_number(true);
-            state.set_highlighter_factory(highlight::factory(), cx);
-            state.lsp_mut().completion_provider = Some(Rc::new(completion));
-            state
-        });
+impl EventEmitter<RunFinished> for Results {}
+/// Related rows to open (`TabEvent::OpenRelated`), passed on by the owning tab.
+impl EventEmitter<TabEvent> for Results {}
+
+impl Results {
+    fn new(connection: Arc<Connection>, history: Option<History>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = new_grid(window, cx);
         let inspector = cx.new(|cx| Inspector::new(grid.clone(), window, cx));
+        // The grid's menu starts edits and opens related rows through the results.
+        let this = cx.entity().downgrade();
+        grid.update(cx, |state, _| {
+            let rows = state.delegate_mut();
+            let edit = this.clone();
+            rows.begin_edit = Some(Rc::new(move |row, col, window, cx| {
+                edit.update(cx, |r, cx| r.editor.begin(row, col, window, cx, |r: &mut Self| &mut r.editor)).ok();
+            }));
+            rows.open_related = Some(Rc::new(move |related, _, cx| {
+                this.update(cx, |_, cx| cx.emit(TabEvent::OpenRelated(related))).ok();
+            }));
+        });
         let subscriptions = vec![
             cx.observe_global::<inspector::ShowInspector>(|_, cx| cx.notify()),
-            cx.observe_global::<EditorFontSize>(|_, cx| cx.notify()),
-            cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| {
-                if let TableEvent::RightClickedCell(row, col) = *event {
+            cx.observe(&grid, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&grid, window, |this, _, event: &TableEvent, window, cx| match *event {
+                TableEvent::DoubleClickedCell(row, col) => {
+                    this.editor.begin(row, col, window, cx, |this: &mut Self| &mut this.editor);
+                }
+                TableEvent::RightClickedCell(row, col) => {
                     this.menu.open(&this.grid, row, col, window, cx, |this: &mut Self| &mut this.menu);
                 }
+                _ => {}
             }),
         ];
-        // Tables and columns for completion. Keywords complete meanwhile, and if this fails.
-        let catalog_task = cx.spawn({
-            let connection = connection.clone();
-            async move |_, _| {
-                let schemas = connection.list_schemas().await;
-                let columns = connection.list_columns().await;
-                match (schemas, columns) {
-                    (Ok(schemas), Ok(columns)) => *catalog.borrow_mut() = Some(Rc::new(Catalog::new(schemas, columns))),
-                    (Err(e), _) | (_, Err(e)) => log::warn!("couldn’t load the completion catalog: {e}"),
-                }
-            }
-        });
         Self {
-            name,
-            target,
             connection,
-            editor,
+            editor: GridEditor::new(grid.clone()),
+            links_task: None,
             grid,
             inspector,
             outcome: Outcome::Idle,
             run_task: None,
             history,
+            last: None,
             settle: Settle::default(),
             menu: CellMenu::default(),
-            _catalog_task: catalog_task,
             _subscriptions: subscriptions,
         }
     }
 
-    pub fn editor_focus(&self, cx: &App) -> FocusHandle {
-        self.editor.read(cx).focus_handle(cx)
+    pub fn is_running(&self) -> bool {
+        matches!(self.outcome, Outcome::Running(_))
     }
 
-    /// The selection when there is one, else the whole script.
-    /// The whole script.
-    pub fn text(&self, cx: &App) -> String {
-        self.editor.read(cx).value().to_string()
+    /// The rows shown, when the last run returned some.
+    pub fn shown_rows(&self) -> Option<&Ran> {
+        self.last.as_ref().filter(|_| matches!(self.outcome, Outcome::Rows { .. }))
     }
 
-    pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let text = text.to_string();
-        self.editor.update(cx, |e, cx| e.set_value(text, window, cx));
+    pub fn has_unsaved_edits(&self, cx: &App) -> bool {
+        !self.grid.read(cx).delegate().edits.is_empty()
     }
 
-    /// Puts a query from the history in the editor: as the script when it's empty, else after it.
-    fn insert_from_history(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.text(cx);
-        let text = if current.trim().is_empty() { sql.to_string() } else { format!("{}\n\n{sql}", current.trim_end()) };
-        self.set_text(&text, window, cx);
-        let focus = self.editor_focus(cx);
-        focus.focus(window, cx);
-    }
-
-    fn history_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity().downgrade();
-        let history = self.history.clone();
-        Button::new("history")
-            .ghost()
-            .small()
-            .label("History")
-            .dropdown_caret(true)
-            .disabled(history.is_none())
-            .dropdown_menu(move |mut menu, _, _| {
-                let Some(history) = history.clone() else { return menu };
-                // Read when the menu opens, so it's always current.
-                let entries = history.state.borrow().history(&history.connection_id, 25).unwrap_or_default();
-                if entries.is_empty() {
-                    return menu.item(PopupMenuItem::new("No queries yet").disabled(true));
-                }
-                for entry in entries {
-                    let one_line = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let mut label: String = one_line.chars().take(70).collect();
-                    if one_line.chars().count() > 70 {
-                        label.push('…');
-                    }
-                    if entry.error.is_some() {
-                        label.push_str("  · failed");
-                    }
-                    let (this, sql) = (this.clone(), entry.sql.clone());
-                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        this.update(cx, |tab, cx| tab.insert_from_history(&sql, window, cx)).ok();
-                    }));
-                }
-                let state = history.state.clone();
-                let id = history.connection_id.clone();
-                menu.separator().item(PopupMenuItem::new("Clear History").on_click(move |_, _, _| {
-                    if let Err(e) = state.borrow_mut().clear_history(&id) {
-                        log::warn!("couldn’t clear the history: {e}");
-                    }
-                }))
-            })
-    }
-
-    fn sql(&self, cx: &App) -> String {
-        let editor = self.editor.read(cx);
-        let selected = editor.selected_text().to_string();
-        if selected.trim().is_empty() { editor.value().to_string() } else { selected }
-    }
-
-    fn run(&mut self, _: &RunScript, _: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.outcome, Outcome::Running(_)) {
+    fn run(&mut self, sql: String, cx: &mut Context<Self>) {
+        if self.is_running() || sql.trim().is_empty() {
             return;
         }
-        let sql = self.sql(cx);
-        if sql.trim().is_empty() {
+        // Running replaces the rows the edits point at.
+        if self.has_unsaved_edits(cx) {
+            self.editor.notice = Some("Save or discard your changes first.".into());
+            cx.notify();
             return;
         }
-        // ⌘↩ while completing: the suggestions would stay over the results.
-        self.editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+        self.editor.notice = None;
         let started = Instant::now();
         self.outcome = Outcome::Running(started);
         let connection = self.connection.clone();
         self.run_task = Some(cx.spawn(async move |this, cx| {
             let result = connection.execute_limited(sql.clone(), Some(SCRIPT_ROW_LIMIT)).await;
             this.update(cx, |this, cx| {
-                this.record(&sql, &result, started.elapsed());
-                // Even when it failed: a script can create a table, then fail on a later statement.
-                if !matches!(result, Err(dbcore::Error::Cancelled)) && dbcore::dialect::changes_schema(&sql) {
-                    cx.emit(TabEvent::SchemaMayHaveChanged);
+                let took = started.elapsed();
+                this.record(&sql, &result, took);
+                let cancelled = matches!(result, Err(dbcore::Error::Cancelled));
+                this.show(sql.clone(), result, took, cx);
+                if !cancelled {
+                    cx.emit(RunFinished { sql });
                 }
-                this.show(result, started.elapsed(), cx);
             })
             .ok();
         }));
@@ -1212,72 +1249,72 @@ impl ScriptTab {
         }
     }
 
-    fn show(&mut self, result: dbcore::Result<QueryResult>, took: Duration, cx: &mut Context<Self>) {
-        self.outcome = match result {
-            Ok(result) if result.columns.is_empty() => Outcome::Affected { rows: result.rows_affected, took },
-            Ok(result) => {
-                let truncated = result.truncated;
-                let kind = self.connection.config().kind;
-                self.grid.update(cx, |state, cx| {
-                    state.delegate_mut().show_result(kind, result);
-                    state.refresh(cx);
-                });
-                self.settle.start();
-                Outcome::Rows { took, truncated }
-            }
-            Err(dbcore::Error::Cancelled) => Outcome::Cancelled,
-            Err(e) => Outcome::Failed(e.to_string()),
-        };
+    fn show(&mut self, sql: String, result: dbcore::Result<QueryResult>, took: Duration, cx: &mut Context<Self>) {
+        match result {
+            Ok(result) if !result.columns.is_empty() => self.show_rows(Ran { sql, result, took }, cx),
+            Ok(result) => self.outcome = Outcome::Affected { rows: result.rows_affected, took },
+            Err(dbcore::Error::Cancelled) => self.outcome = Outcome::Cancelled,
+            Err(e) => self.outcome = Outcome::Failed(e.to_string()),
+        }
         cx.notify();
     }
 
-    fn cancel(&mut self, _: &CancelScript, _: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.outcome, Outcome::Running(_)) {
+    fn show_rows(&mut self, ran: Ran, cx: &mut Context<Self>) {
+        let result = ran.result.clone();
+        let origins = result.origins.clone();
+        self.outcome = Outcome::Rows { took: ran.took, truncated: result.truncated };
+        self.grid.update(cx, |state, cx| {
+            state.delegate_mut().show_result(self.connection.clone(), result);
+            state.refresh(cx);
+        });
+        // Which tables the rows come from: their cells can be edited (when the table's key is in
+        // the result) and their foreign keys followed. Until then (or if it fails) read-only.
+        self.links_task = (!origins.is_empty()).then(|| {
+            let connection = self.connection.clone();
+            cx.spawn(async move |this, cx| {
+                let Ok(links) = connection.describe_result(origins).await else { return };
+                this.update(cx, |this, cx| {
+                    this.grid.update(cx, |state, cx| {
+                        state.delegate_mut().links = Some(links);
+                        cx.notify();
+                    });
+                })
+                .ok();
+            })
+        });
+        self.last = Some(ran);
+        self.settle.start();
+        cx.notify();
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.is_running() {
             return;
         }
         let connection = self.connection.clone();
         cx.spawn(async move |_, _| connection.cancel().await).detach();
     }
-}
 
-fn took(duration: Duration) -> String {
-    if duration.as_millis() < 1000 {
-        format!("{} ms", duration.as_millis())
-    } else {
-        format!("{:.2} s", duration.as_secs_f64())
+    fn status(&self, cx: &App) -> String {
+        match &self.outcome {
+            Outcome::Rows { took: t, truncated } => {
+                let mut status = format!("{} · {}", rows_status(self.grid.read(cx).delegate()), took(*t));
+                if *truncated {
+                    status.push_str(&format!(" · first {} rows shown", count(u64::from(SCRIPT_ROW_LIMIT))));
+                }
+                status
+            }
+            Outcome::Affected { took: t, .. } => took(*t),
+            Outcome::Running(started) => format!("Running… {}", took(started.elapsed())),
+            _ => String::new(),
+        }
     }
 }
 
-impl EventEmitter<TabEvent> for ScriptTab {}
-
-impl Render for ScriptTab {
+impl Render for Results {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.settle.tick(window, cx, |this: &mut Self| &mut this.settle);
-        let running = matches!(self.outcome, Outcome::Running(_));
-        let run = if running {
-            Button::new("stop").small().icon(IconName::Square).label("Stop").on_click(cx.listener(|this, _, window, cx| this.cancel(&CancelScript, window, cx)))
-        } else {
-            Button::new("run").small().primary().icon(IconName::Play).label("Run").on_click(cx.listener(|this, _, window, cx| this.run(&RunScript, window, cx)))
-        };
-        let header = h_flex()
-            .px_3()
-            .py_2()
-            .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(div().font_semibold().child(self.name.clone()))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.target.clone()))
-            .child(div().flex_1())
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if running {
-                format!("{} to stop", keys::shortcut("secondary-."))
-            } else {
-                format!("{} runs the selection or the script", keys::shortcut("secondary-enter"))
-            }))
-            .child(self.history_menu(cx))
-            .child(inspector_button(cx))
-            .child(run);
-
-        let results = match &self.outcome {
+        let body = match &self.outcome {
             Outcome::Idle => centered().text_color(cx.theme().muted_foreground).child("Run a query to see its results").into_any_element(),
             Outcome::Running(_) => centered().child(Spinner::new()).into_any_element(),
             Outcome::Rows { .. } => {
@@ -1293,28 +1330,264 @@ impl Render for ScriptTab {
             Outcome::Failed(e) => message("Query Failed", e.clone(), cx).into_any_element(),
             Outcome::Cancelled => centered().text_color(cx.theme().muted_foreground).child("Query cancelled").into_any_element(),
         };
-        let status = match &self.outcome {
-            Outcome::Rows { took: t, truncated } => {
-                let mut status = format!("{} · {}", rows_status(self.grid.read(cx).delegate()), took(*t));
-                if *truncated {
-                    status.push_str(&format!(" · first {} rows shown", count(u64::from(SCRIPT_ROW_LIMIT))));
-                }
-                status
+        let notice = self.editor.notice.clone();
+        let edit_bar = edit_bar(&self.grid, cx, |this: &mut Self| &mut this.editor);
+        v_flex()
+            .size_full()
+            .key_context("Results")
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| copy_selection(&this.grid, false, cx)))
+            .on_action(cx.listener(|this, _: &CopySelectionWithHeaders, _, cx| copy_selection(&this.grid, true, cx)))
+            .on_action(cx.listener(|this, _: &CancelEdit, window, cx| this.editor.cancel(window, cx)))
+            .on_action(cx.listener(|this, _: &StartEdit, window, cx| {
+                this.editor.start(window, cx, |this: &mut Self| &mut this.editor);
+            }))
+            .on_action(cx.listener(|this, _: &NextCell, window, cx| this.editor.step(true, window, cx, |this: &mut Self| &mut this.editor)))
+            .on_action(cx.listener(|this, _: &PreviousCell, window, cx| this.editor.step(false, window, cx, |this: &mut Self| &mut this.editor)))
+            .on_action(cx.listener(|this, _: &DeleteRow, _, cx| this.editor.delete_selected_row(cx)))
+            .on_action(cx.listener(|this, _: &SaveEdits, window, cx| this.editor.review(window, cx)))
+            .children(notice.map(|e| div().px_3().py_1().text_xs().text_color(cx.theme().red).child(e)))
+            .child(div().flex_1().min_h_0().child(body))
+            .children(edit_bar)
+            .child(status_bar(self.status(cx), cx))
+            .children(self.menu.render())
+    }
+}
+
+fn took(duration: Duration) -> String {
+    if duration.as_millis() < 1000 {
+        format!("{} ms", duration.as_millis())
+    } else {
+        format!("{:.2} s", duration.as_secs_f64())
+    }
+}
+
+fn stop_button(results: &Entity<Results>) -> Button {
+    let results = results.clone();
+    Button::new("stop")
+        .small()
+        .icon(IconName::Square)
+        .label("Stop")
+        .on_click(move |_, _, cx| results.update(cx, |r, cx| r.cancel(cx)))
+}
+
+/// Passes what `results` asks on to the tab's owner: related rows to open, and DDL (the tables
+/// may have changed).
+fn forward_results_events<T: EventEmitter<TabEvent>>(results: &Entity<Results>, cx: &mut Context<T>) -> [Subscription; 2] {
+    [
+        cx.subscribe(results, |_, _, event: &RunFinished, cx| {
+            if dbcore::dialect::changes_schema(&event.sql) {
+                cx.emit(TabEvent::SchemaMayHaveChanged);
             }
-            Outcome::Affected { took: t, .. } => took(*t),
-            Outcome::Running(started) => format!("Running… {}", took(started.elapsed())),
-            _ => String::new(),
-        };
+        }),
+        cx.subscribe(results, |_, _, event: &TabEvent, cx| {
+            if let TabEvent::OpenRelated(related) = event {
+                cx.emit(TabEvent::OpenRelated(related.clone()));
+            }
+        }),
+    ]
+}
+
+pub struct ScriptTab {
+    /// "SQL 1", "SQL 2"…
+    pub name: String,
+    /// The database it runs in (shown in the header).
+    pub target: String,
+    editor: Entity<EditorState>,
+    results: Entity<Results>,
+    _catalog_task: Task<()>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl ScriptTab {
+    pub fn new(
+        connection: Arc<Connection>,
+        name: String,
+        target: String,
+        history: Option<History>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let catalog: SharedCatalog = Rc::default();
+        let completion = SqlCompletion { catalog: catalog.clone(), dialect: Dialect(connection.config().kind) };
+        let editor = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx).language(highlight::SQL).line_number(true);
+            state.set_highlighter_factory(highlight::factory(), cx);
+            state.lsp_mut().completion_provider = Some(Rc::new(completion));
+            state
+        });
+        let results = cx.new(|cx| Results::new(connection.clone(), history, window, cx));
+        let mut subscriptions = vec![cx.observe_global::<EditorFontSize>(|_, cx| cx.notify()), cx.observe(&results, |_, _, cx| cx.notify())];
+        subscriptions.extend(forward_results_events(&results, cx));
+        // Tables and columns for completion. Keywords complete meanwhile, and if this fails.
+        let catalog_task = cx.spawn({
+            let connection = connection.clone();
+            async move |_, _| {
+                let schemas = connection.list_schemas().await;
+                let columns = connection.list_columns().await;
+                match (schemas, columns) {
+                    (Ok(schemas), Ok(columns)) => *catalog.borrow_mut() = Some(Rc::new(Catalog::new(schemas, columns))),
+                    (Err(e), _) | (_, Err(e)) => log::warn!("couldn’t load the completion catalog: {e}"),
+                }
+            }
+        });
+        Self { name, target, editor, results, _catalog_task: catalog_task, _subscriptions: subscriptions }
+    }
+
+    pub fn has_unsaved_edits(&self, cx: &App) -> bool {
+        self.results.read(cx).has_unsaved_edits(cx)
+    }
+
+    pub fn editor_focus(&self, cx: &App) -> FocusHandle {
+        self.editor.read(cx).focus_handle(cx)
+    }
+
+    /// The whole script.
+    pub fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).value().to_string()
+    }
+
+    pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.to_string();
+        self.editor.update(cx, |e, cx| e.set_value(text, window, cx));
+    }
+
+    /// Puts a query from the history in the editor: as the script when it's empty, else after it.
+    fn insert_from_history(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.text(cx);
+        let text = if current.trim().is_empty() { sql.to_string() } else { format!("{}\n\n{sql}", current.trim_end()) };
+        self.set_text(&text, window, cx);
+        let focus = self.editor_focus(cx);
+        focus.focus(window, cx);
+    }
+
+    fn history_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let history = self.results.read(cx).history.clone();
+        Button::new("history")
+            .ghost()
+            .small()
+            .label("History")
+            .dropdown_caret(true)
+            .disabled(history.is_none())
+            .dropdown_menu(move |mut menu, _, _| {
+                let Some(history) = history.clone() else { return menu };
+                // Read when the menu opens, so it's always current.
+                let entries = history.state.borrow().history(&history.connection_id, 25).unwrap_or_default();
+                if entries.is_empty() {
+                    return menu.item(PopupMenuItem::new("No queries yet").disabled(true));
+                }
+                for entry in entries {
+                    let one_line = one_line(&entry.sql);
+                    let mut label: String = one_line.chars().take(70).collect();
+                    if one_line.chars().count() > 70 {
+                        label.push('…');
+                    }
+                    if entry.error.is_some() {
+                        label.push_str("  · failed");
+                    }
+                    let (this, sql) = (this.clone(), entry.sql.clone());
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        this.update(cx, |tab, cx| tab.insert_from_history(&sql, window, cx)).ok();
+                    }));
+                }
+                let state = history.state.clone();
+                let id = history.connection_id.clone();
+                menu.separator().item(PopupMenuItem::new("Clear History").on_click(move |_, _, _| {
+                    if let Err(e) = state.borrow_mut().clear_history(&id) {
+                        log::warn!("couldn’t clear the history: {e}");
+                    }
+                }))
+            })
+    }
+
+    /// The selection when there is one, else the whole script.
+    fn sql(&self, cx: &App) -> String {
+        let editor = self.editor.read(cx);
+        let selected = editor.selected_text().to_string();
+        if selected.trim().is_empty() { editor.value().to_string() } else { selected }
+    }
+
+    fn run(&mut self, _: &RunScript, _: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.sql(cx);
+        // ⌘↩ while completing: the suggestions would stay over the results.
+        self.editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+        self.results.update(cx, |results, cx| results.run(sql, cx));
+    }
+
+    /// ⇧⌘↩: runs the selection or the script in a results tab of its own.
+    fn run_in_new_tab(&mut self, _: &RunInNewTab, _: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.sql(cx);
+        if sql.trim().is_empty() {
+            return;
+        }
+        self.editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+        cx.emit(TabEvent::OpenResults(OpenResults { source: self.name.clone(), sql, ran: None }));
+    }
+
+    /// Moves the rows shown to a results tab, so the next run doesn't replace them.
+    fn open_in_new_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(ran) = self.results.read(cx).shown_rows().cloned() else { return };
+        cx.emit(TabEvent::OpenResults(OpenResults { source: self.name.clone(), sql: ran.sql.clone(), ran: Some(ran) }));
+    }
+}
+
+impl EventEmitter<TabEvent> for ScriptTab {}
+
+
+impl Render for ScriptTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let results = self.results.read(cx);
+        let running = results.is_running();
+        let has_rows = results.shown_rows().is_some();
+        let header = h_flex()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(div().font_semibold().child(self.name.clone()))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.target.clone()))
+            .child(div().flex_1())
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if running {
+                format!("{} to stop", keys::shortcut("secondary-."))
+            } else {
+                format!(
+                    "{} runs the selection or the script, {} in a new tab",
+                    keys::shortcut("secondary-enter"),
+                    keys::shortcut("shift-secondary-enter")
+                )
+            }))
+            .child(self.history_menu(cx))
+            .when(has_rows, |header| {
+                header.child(
+                    Button::new("open-results")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(AssetIcon::SquareArrowOutUpRight))
+                        .tooltip("Open Results in New Tab")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_in_new_tab(cx))),
+                )
+            })
+            .child(inspector_button(cx))
+            .child(if running {
+                stop_button(&self.results)
+            } else {
+                Button::new("run")
+                    .small()
+                    .primary()
+                    .icon(IconName::Play)
+                    .label("Run")
+                    .on_click(cx.listener(|this, _, window, cx| this.run(&RunScript, window, cx)))
+            });
 
         v_flex()
             .key_context("ScriptTab")
             .on_action(cx.listener(Self::run))
-            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::run_in_new_tab))
+            .on_action(cx.listener(|this, _: &CancelScript, _, cx| this.results.update(cx, |r, cx| r.cancel(cx))))
             .on_action(|_: &ZoomIn, _, cx| EditorFontSize::set(EditorFontSize::get(cx) + 1., cx))
             .on_action(|_: &ZoomOut, _, cx| EditorFontSize::set(EditorFontSize::get(cx) - 1., cx))
             .on_action(|_: &ResetZoom, _, cx| EditorFontSize::set(EditorFontSize::DEFAULT, cx))
-            .on_action(cx.listener(|this, _: &CopySelection, _, cx| copy_selection(&this.grid, false, cx)))
-            .on_action(cx.listener(|this, _: &CopySelectionWithHeaders, _, cx| copy_selection(&this.grid, true, cx)))
             .size_full()
             .child(header)
             .child(
@@ -1327,10 +1600,105 @@ impl Render for ScriptTab {
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_size(px(EditorFontSize::get(cx))),
                         ))
-                        .child(resizable_panel().child(results)),
+                        .child(resizable_panel().child(self.results.clone())),
                 ),
             )
-            .child(status_bar(status, cx))
-            .children(self.menu.render())
+    }
+}
+
+fn one_line(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// MARK: results tab
+
+/// A script's results in a tab of their own (⇧⌘↩, or "Open in New Tab"). Read-only; Re-run (⌘↩)
+/// runs the same SQL again. Not reopened at launch: running a script by itself could write.
+pub struct ResultTab {
+    pub title: String,
+    /// The database it ran in (shown in the header).
+    target: String,
+    sql: String,
+    results: Entity<Results>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl ResultTab {
+    pub fn new(
+        connection: Arc<Connection>,
+        title: String,
+        target: String,
+        request: OpenResults,
+        history: Option<History>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let OpenResults { sql, ran, .. } = request;
+        let results = cx.new(|cx| Results::new(connection, history, window, cx));
+        let mut subscriptions = vec![cx.observe(&results, |_, _, cx| cx.notify())];
+        subscriptions.extend(forward_results_events(&results, cx));
+        results.update(cx, |results, cx| match ran {
+            Some(ran) => results.show_rows(ran, cx),
+            None => results.run(sql.clone(), cx),
+        });
+        Self { title, target, sql, results, _subscriptions: subscriptions }
+    }
+}
+
+impl ResultTab {
+    pub fn has_unsaved_edits(&self, cx: &App) -> bool {
+        self.results.read(cx).has_unsaved_edits(cx)
+    }
+
+    fn rerun(&mut self, cx: &mut Context<Self>) {
+        let sql = self.sql.clone();
+        self.results.update(cx, |r, cx| r.run(sql, cx));
+    }
+}
+
+impl EventEmitter<TabEvent> for ResultTab {}
+
+impl Render for ResultTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let running = self.results.read(cx).is_running();
+        let sql: SharedString = self.sql.clone().into();
+        let header = h_flex()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(div().flex_none().font_semibold().child(self.title.clone()))
+            .child(div().flex_none().text_xs().text_color(cx.theme().muted_foreground).child(self.target.clone()))
+            .child(
+                div()
+                    .id("result-sql")
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(one_line(&self.sql))
+                    .tooltip(move |window, cx| Tooltip::new(sql.clone()).build(window, cx)),
+            )
+            .child(inspector_button(cx))
+            .child(if running {
+                stop_button(&self.results)
+            } else {
+                Button::new("rerun")
+                    .small()
+                    .icon(Icon::new(AssetIcon::RotateCw))
+                    .label("Re-run")
+                    .tooltip(format!("Run the query again ({})", keys::shortcut("secondary-enter")))
+                    .on_click(cx.listener(|this, _, _, cx| this.rerun(cx)))
+            });
+        v_flex()
+            .key_context("ResultTab")
+            .on_action(cx.listener(|this, _: &RunScript, _, cx| this.rerun(cx)))
+            .on_action(cx.listener(|this, _: &CancelScript, _, cx| this.results.update(cx, |r, cx| r.cancel(cx))))
+            .size_full()
+            .child(header)
+            .child(div().flex_1().min_h_0().child(self.results.clone()))
     }
 }

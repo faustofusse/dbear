@@ -62,6 +62,29 @@ struct CellAddress: Equatable {
     var column: Int
 }
 
+/// Rows that can be edited in a grid: a table tab's, or a script's results (where the core says
+/// which cells come from a table whose primary key is in the result).
+@MainActor protocol EditableRows: AnyObject {
+    var connection: ConnectionConfig { get }
+    var edits: PendingEdits { get set }
+    var selectedRowIDs: Set<Int> { get set }
+    var editRequest: CellAddress? { get set }
+    var isReviewingEdits: Bool { get set }
+    var isSaving: Bool { get set }
+    var saveError: String? { get set }
+    var nextInsertedID: Int { get set }
+    /// Why no row can be edited (`nil`: some cells can).
+    var readOnlyReason: String? { get }
+    /// The rows as loaded.
+    var loadedRows: QueryResult? { get }
+    /// What the review sheet saves to: “users”, or “orders” and “users”.
+    var editTarget: String { get }
+    var canAddRows: Bool { get }
+    var canDeleteRows: Bool { get }
+    /// Why `column`'s cells can't be edited (`nil`: they can).
+    func columnReadOnly(_ column: Int) -> String?
+}
+
 @Observable
 @MainActor
 final class TableTab: Identifiable {
@@ -89,6 +112,16 @@ final class TableTab: Identifiable {
     /// Rows (`data`) or the table's definition (`structure`).
     var mode = TableTabMode.data
     var structure: LoadState<TableStructure> = .idle
+    /// Foreign key links of the rows, made from the structure once per structure and columns.
+    @ObservationIgnored private var linkCache: (structure: TableStructure, columns: [ColumnInfo], sources: ResultSources)?
+
+    func linkSources(_ make: (TableStructure, [ColumnInfo]) -> ResultSources) -> ResultSources? {
+        guard let structure = structure.value, let columns = data.value?.columns else { return nil }
+        if let cache = linkCache, cache.structure == structure, cache.columns == columns { return cache.sources }
+        let sources = make(structure, columns)
+        linkCache = (structure, columns, sources)
+        return sources
+    }
 
     /// The grid's focused cell (row id, column index), shown in the value inspector.
     var focusedCell: CellAddress?
@@ -140,6 +173,14 @@ final class TableTab: Identifiable {
     }
 }
 
+extension TableTab: EditableRows {
+    var loadedRows: QueryResult? { data.value }
+    var editTarget: String { "“\(table.name)”" }
+    var canAddRows: Bool { readOnlyReason == nil }
+    var canDeleteRows: Bool { readOnlyReason == nil }
+    func columnReadOnly(_ column: Int) -> String? { readOnlyReason }
+}
+
 @Observable
 @MainActor
 final class ScriptTab: Identifiable {
@@ -183,10 +224,58 @@ final class ScriptTab: Identifiable {
     /// What ⌘↩ executes: the selection if there is one, otherwise the whole script.
     var sqlToRun: String { selectedSQL ?? text }
 
-    init(connection: ConnectionConfig, title: String, text: String) {
+    /// The SQL of the last run, for opening its results in a tab of their own.
+    var lastRunSQL: String?
+    /// A results tab: `text` is the SQL it ran, shown without an editor, read-only. Re-run (⌘↩)
+    /// runs it again. Holds the name of the script it came from.
+    let resultsOf: String?
+
+    var isResults: Bool { resultsOf != nil }
+
+    /// What the result's columns are (which cells can be edited, foreign key links). Loaded after
+    /// each run that returns rows; `nil` meanwhile.
+    var sources: ResultSources?
+    /// Unsaved cell edits and deleted rows (scripts can't add rows).
+    var edits = PendingEdits()
+    var selectedRowIDs: Set<Int> = []
+    var editRequest: CellAddress?
+    var isReviewingEdits = false
+    var isSaving = false
+    var saveError: String?
+    var nextInsertedID = -1
+
+    /// Rows to move to a results tab: the last run returned some, and nothing is running.
+    var hasRows: Bool {
+        if case .loaded(let result) = result { !result.columns.isEmpty } else { false }
+    }
+
+    var loadedRows: QueryResult? {
+        if case .loaded(let result) = result, !result.columns.isEmpty { result } else { nil }
+    }
+
+    init(connection: ConnectionConfig, title: String, text: String, resultsOf: String? = nil) {
         self.connection = connection
         self.title = title
         self.text = text
+        self.resultsOf = resultsOf
+    }
+}
+
+extension ScriptTab: EditableRows {
+    var readOnlyReason: String? {
+        guard loadedRows != nil else { return "No rows." }
+        guard let sources else { return "Finding the tables these rows come from…" }
+        return sources.summaryReason
+    }
+    var editTarget: String {
+        let names = sources?.editableTables.map { "“\($0)”" } ?? []
+        return names.count <= 1 ? names.first ?? "the results" : names.dropLast().joined(separator: ", ") + " and " + names.last!
+    }
+    var canAddRows: Bool { false }
+    var canDeleteRows: Bool { sources?.canDeleteRows ?? false }
+    func columnReadOnly(_ column: Int) -> String? {
+        guard let sources else { return readOnlyReason }
+        return sources.readOnlyReason(column: column)
     }
 }
 
@@ -223,8 +312,18 @@ enum WorkspaceTab: Identifiable {
         switch self {
         case .table(let t) where t.filter != nil: "line.3.horizontal.decrease"
         case .table(let t): t.table.kind == .view ? "eye" : "tablecells"
+        case .script(let s) where s.isResults: "rectangle.split.3x3"
         case .script: "chevron.left.forwardslash.chevron.right"
         case .users(let u): u.selected.map(\.roleSymbol) ?? "person.2"
+        }
+    }
+
+    /// Rows that may have unsaved edits.
+    @MainActor var editableRows: (any EditableRows)? {
+        switch self {
+        case .table(let t): t
+        case .script(let s): s
+        case .users: nil
         }
     }
 
@@ -392,8 +491,9 @@ final class AppModel {
         return stored > 0 ? min(max(CGFloat(stored), editorFontSizes.lowerBound), editorFontSizes.upperBound) : defaultEditorFontSize
     }
 
+    /// A script with an editor is shown (results tabs have none to zoom).
     var isScriptActive: Bool {
-        if case .script = activeTab { true } else { false }
+        if case .script(let s) = activeTab { !s.isResults } else { false }
     }
 
     func zoomEditor(by step: CGFloat) {
@@ -830,6 +930,42 @@ final class AppModel {
         loadCompletionCatalogIfNeeded(for: connection)
     }
 
+    /// ⇧⌘↩: runs the script's selection (or all of it) in a new results tab, after the script.
+    func runInNewTab(_ script: ScriptTab) {
+        let sql = script.sqlToRun
+        guard !sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let tab = resultsTab(of: script, sql: sql)
+        Task { await run(tab) }
+    }
+
+    /// Moves the rows a script shows to a results tab, so its next run doesn't replace them.
+    func openResultsInNewTab(_ script: ScriptTab) {
+        guard script.hasRows, case .loaded(let result) = script.result else { return }
+        let tab = resultsTab(of: script, sql: script.lastRunSQL ?? script.sqlToRun)
+        tab.result = .loaded(result)
+        tab.lastDuration = script.lastDuration
+        tab.lastRunSQL = script.lastRunSQL
+        tab.runCount = 1
+        tab.sources = script.sources
+    }
+
+    /// A results tab for `script` ("Script 1 Results", then "… 2"), opened after the active tab.
+    private func resultsTab(of script: ScriptTab, sql: String) -> ScriptTab {
+        let base = "\(script.title) Results"
+        let taken = Set(tabs.map(\.title))
+        var title = base
+        var number = 2
+        while taken.contains(title) {
+            title = "\(base) \(number)"
+            number += 1
+        }
+        let tab = ScriptTab(connection: script.connection, title: title, text: sql, resultsOf: script.title)
+        tab.needsInitialFocus = false
+        insertAfterActive(.script(tab))
+        activeTabID = tab.id
+        return tab
+    }
+
     func close(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         tabs.remove(at: index)
@@ -963,47 +1099,52 @@ final class AppModel {
 
     /// Opens the table a foreign key points to (same connection and database as `tab`).
     func openReferencedTable(_ foreignKey: ForeignKeyInfo, from tab: TableTab) {
-        openRelated(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable, from: tab)
+        openRelated(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable, from: tab.connection)
     }
 
     /// Opens a table that has a foreign key to `tab`'s table, unfiltered.
     func openReferencingTable(_ key: ReferencingKey, from tab: TableTab) {
-        openRelated(schema: key.schema, name: key.table, from: tab)
+        openRelated(schema: key.schema, name: key.table, from: tab.connection)
+    }
+
+    /// Foreign key links of a table tab's rows (`nil` until its structure has loaded).
+    func linkSources(for tab: TableTab) -> ResultSources? {
+        tab.linkSources { driver(for: tab.connection).tableSources(tab.table, columns: $1, structure: $0) }
     }
 
     /// Opens the row a foreign key cell points at: the referenced table, filtered to the rows whose
     /// referenced columns hold `values` (the cell's row's values for the key's columns, in order).
-    func openReferencedRow(_ foreignKey: ForeignKeyInfo, values: [DBValue], from tab: TableTab) {
-        let target = TableInfo(schema: foreignKey.referencedSchema, name: foreignKey.referencedTable)
+    func openReferencedRow(_ link: ForeignKeyLink, values: [DBValue], from connection: ConnectionConfig) {
+        let target = TableInfo(schema: link.schema, name: link.table)
         Task {
-            var columns = foreignKey.referencedColumns
+            var columns = link.targetColumns
             if columns.isEmpty {
                 // SQLite references the parent's primary key implicitly.
-                columns = (try? await driver(for: tab.connection).describeTable(target).primaryKey) ?? []
-                guard !columns.isEmpty else { return openRelated(schema: target.schema, name: target.name, from: tab) }
+                columns = (try? await driver(for: connection).describeTable(target).primaryKey) ?? []
+                guard !columns.isEmpty else { return openRelated(schema: target.schema, name: target.name, from: connection) }
             }
-            openRelated(schema: target.schema, name: target.name, from: tab, matching: columns, values: values)
+            openRelated(schema: target.schema, name: target.name, from: connection, matching: columns, values: values)
         }
     }
 
-    /// Opens the rows of another table that point at a row of `tab` through `key`. `values` are the
-    /// row's values for the columns the key references, in key order.
-    func openReferencingRows(_ key: ReferencingKey, values: [DBValue], from tab: TableTab) {
-        openRelated(schema: key.schema, name: key.table, from: tab, matching: key.columns, values: values)
+    /// Opens the rows of another table that point at a row through `link`. `values` are the row's
+    /// values for the columns the key references, in key order.
+    func openReferencingRows(_ link: ReferenceLink, values: [DBValue], from connection: ConnectionConfig) {
+        openRelated(schema: link.schema, name: link.table, from: connection, matching: link.columns, values: values)
     }
 
-    /// Opens `schema.name` from `tab`'s connection and database (switching the tables column to it),
+    /// Opens `schema.name` from `connection` (and its database, switching the tables column to it),
     /// filtered to the rows whose `columns` hold `values` when given.
     private func openRelated(
-        schema: String, name: String, from tab: TableTab, matching columns: [String] = [], values: [DBValue] = []
+        schema: String, name: String, from connection: ConnectionConfig, matching columns: [String] = [], values: [DBValue] = []
     ) {
-        if tab.connection.driverKey != selectedTarget?.driverKey {
-            select(tab.connection.id, database: tab.connection.database)
+        if connection.driverKey != selectedTarget?.driverKey {
+            select(connection.id, database: connection.database)
         }
         let fallback = TableInfo(schema: schema, name: name)
         let target = table(withID: fallback.id) ?? fallback
         guard !columns.isEmpty else { return openTable(target, pinned: true) }
-        let filter = RowQuery.matching(columns: columns, values: values, kind: tab.connection.kind)
+        let filter = RowQuery.matching(columns: columns, values: values, kind: connection.kind)
         let label = zip(columns, values).map { "\($0) = \($1.displayString)" }.joined(separator: ", ")
         openTable(target, pinned: true, filter: filter, filterLabel: label)
     }
@@ -1018,11 +1159,11 @@ final class AppModel {
 
     // MARK: Editing rows
 
-    /// Asks before throwing away unsaved edits (reload, re-sort, filter, close). True = go ahead.
-    func confirmDiscardingEdits(in tab: TableTab) -> Bool {
+    /// Asks before throwing away unsaved edits (reloading, re-running, closing). `true`: go ahead.
+    func confirmDiscardingEdits(in tab: any EditableRows) -> Bool {
         guard !tab.edits.isEmpty else { return true }
         let alert = NSAlert()
-        alert.messageText = "Discard unsaved changes to “\(tab.table.name)”?"
+        alert.messageText = "Discard unsaved changes to \(tab.editTarget)?"
         alert.informativeText = "\(tab.edits.summary). Reloading the rows throws these away."
         alert.addButton(withTitle: "Discard Changes")
         alert.addButton(withTitle: "Cancel")
@@ -1033,8 +1174,8 @@ final class AppModel {
     }
 
     /// Stages a cell value. Typing a loaded cell's original value back drops the edit.
-    func setCell(_ tab: TableTab, row id: Int, column: Int, to value: EditValue) {
-        guard tab.readOnlyReason == nil, let result = tab.data.value, result.columns.indices.contains(column) else { return }
+    func setCell(_ tab: any EditableRows, row id: Int, column: Int, to value: EditValue) {
+        guard tab.columnReadOnly(column) == nil, let result = tab.loadedRows, result.columns.indices.contains(column) else { return }
         if id < 0 {
             guard let index = tab.edits.inserted.firstIndex(where: { $0.id == id }) else { return }
             tab.edits.inserted[index].values[column] = value
@@ -1044,7 +1185,7 @@ final class AppModel {
             if Self.matches(value, original) { row[column] = nil } else { row[column] = value }
             tab.edits.updates[id] = row.isEmpty ? nil : row
         }
-        tab.isPreview = false
+        (tab as? TableTab)?.isPreview = false
     }
 
     /// Typed text equal to what the cell shows (or NULL left blank) isn't a change.
@@ -1057,25 +1198,25 @@ final class AppModel {
     }
 
     /// A new row at the top of the grid, editing its first editable cell.
-    func addRow(_ tab: TableTab) {
-        guard tab.readOnlyReason == nil, let columns = tab.data.value?.columns else { return }
+    func addRow(_ tab: any EditableRows) {
+        guard tab.canAddRows, let columns = tab.loadedRows?.columns else { return }
         let id = tab.nextInsertedID
         tab.nextInsertedID -= 1
         tab.edits.inserted.append(.init(id: id, values: Array(repeating: .default, count: columns.count)))
-        tab.isPreview = false
+        (tab as? TableTab)?.isPreview = false
         let first = columns.firstIndex { !$0.isBinary && !($0.isPrimaryKey && columns.filter(\.isPrimaryKey).count == 1) }
         tab.editRequest = CellAddress(row: id, column: first ?? 0)
     }
 
     /// New rows are dropped; loaded rows are marked for deletion.
-    func deleteRows(_ tab: TableTab, ids: Set<Int>) {
-        guard tab.readOnlyReason == nil, !ids.isEmpty else { return }
+    func deleteRows(_ tab: any EditableRows, ids: Set<Int>) {
+        guard tab.canDeleteRows, !ids.isEmpty else { return }
         tab.edits.inserted.removeAll { ids.contains($0.id) }
         tab.edits.deleted.formUnion(ids.filter { $0 >= 0 })
-        tab.isPreview = false
+        (tab as? TableTab)?.isPreview = false
     }
 
-    func revertRows(_ tab: TableTab, ids: Set<Int>) {
+    func revertRows(_ tab: any EditableRows, ids: Set<Int>) {
         for id in ids {
             tab.edits.updates[id] = nil
             tab.edits.deleted.remove(id)
@@ -1085,7 +1226,7 @@ final class AppModel {
 
     /// Opens the review sheet. A cell still being edited is committed first (ending editing keeps
     /// what was typed), so ⌘S right after typing includes that value.
-    func reviewEdits(_ tab: TableTab) {
+    func reviewEdits(_ tab: any EditableRows) {
         NSApp.keyWindow?.makeFirstResponder(nil)
         guard !tab.edits.isEmpty else { return }
         tab.isReviewingEdits = true
@@ -1093,7 +1234,7 @@ final class AppModel {
 
     /// Saves without the review sheet (⌘S, the toolbar's Save). If it fails, the edits stay and
     /// the review sheet opens with the error and the SQL that was tried.
-    func saveEditsNow(_ tab: TableTab) {
+    func saveEditsNow(_ tab: any EditableRows) {
         NSApp.keyWindow?.makeFirstResponder(nil)
         guard !tab.edits.isEmpty, !tab.isSaving else { return }
         tab.isSaving = true
@@ -1108,7 +1249,7 @@ final class AppModel {
         }
     }
 
-    func discardEdits(_ tab: TableTab) {
+    func discardEdits(_ tab: any EditableRows) {
         tab.edits = PendingEdits()
         tab.isReviewingEdits = false
     }
@@ -1136,30 +1277,95 @@ final class AppModel {
         return changes
     }
 
-    func previewEdits(_ tab: TableTab) throws -> [EditStatement] {
-        guard let columns = tab.data.value?.columns else { return [] }
-        return try driver(for: tab.connection).previewChanges(of: tab.table, columns: columns, changes: changes(in: tab))
+    /// A script's pending edits, row by row (the core groups them by table).
+    private func resultEdits(in tab: ScriptTab) -> [ResultRowEdit] {
+        guard let result = tab.loadedRows else { return [] }
+        let edits = tab.edits
+        var rows: [ResultRowEdit] = []
+        for id in edits.deleted.sorted() {
+            if let row = result.rows[safe: id] { rows.append(ResultRowEdit(values: row.values, delete: true)) }
+        }
+        for (id, cells) in edits.updates.sorted(by: { $0.key < $1.key }) where !edits.deleted.contains(id) {
+            if let row = result.rows[safe: id] { rows.append(ResultRowEdit(values: row.values, set: cells)) }
+        }
+        return rows
     }
 
-    /// Saves every pending edit in one transaction, then reloads the rows. Throws (leaving the
+    func previewEdits(_ tab: any EditableRows) throws -> [EditStatement] {
+        switch tab {
+        case let tab as TableTab:
+            guard let columns = tab.data.value?.columns else { return [] }
+            return try driver(for: tab.connection).previewChanges(of: tab.table, columns: columns, changes: changes(in: tab))
+        case let tab as ScriptTab:
+            guard let sources = tab.sources else { return [] }
+            return try driver(for: tab.connection).previewResultEdits(sources, edits: resultEdits(in: tab))
+        default:
+            return []
+        }
+    }
+
+    /// Saves every pending edit in one transaction, then shows the saved rows. Throws (leaving the
     /// edits in place) if anything fails: then nothing was saved.
-    func saveEdits(_ tab: TableTab) async throws {
-        guard let columns = tab.data.value?.columns, !tab.edits.isEmpty else { return }
-        let changes = changes(in: tab)
-        _ = try await driver(for: tab.connection).applyChanges(to: tab.table, columns: columns, changes: changes)
-        tab.edits = PendingEdits()
-        tab.isReviewingEdits = false
-        await load(tab)
+    func saveEdits(_ tab: any EditableRows) async throws {
+        guard !tab.edits.isEmpty else { return }
+        switch tab {
+        case let tab as TableTab:
+            guard let columns = tab.data.value?.columns else { return }
+            let changes = changes(in: tab)
+            _ = try await driver(for: tab.connection).applyChanges(to: tab.table, columns: columns, changes: changes)
+            tab.edits = PendingEdits()
+            tab.isReviewingEdits = false
+            await load(tab)
+        case let tab as ScriptTab:
+            guard let sources = tab.sources, let result = tab.loadedRows else { return }
+            _ = try await driver(for: tab.connection).applyResultEdits(sources, edits: resultEdits(in: tab))
+            // Not re-run: the script may do more than select (`update …; select …`). The saved
+            // values are shown as typed instead.
+            tab.result = .loaded(Self.applying(tab.edits, to: result))
+            tab.runCount += 1
+            tab.edits = PendingEdits()
+            tab.isReviewingEdits = false
+        default:
+            break
+        }
+    }
+
+    /// `result` with saved edits written into its rows (deleted rows dropped, ids renumbered).
+    private static func applying(_ edits: PendingEdits, to result: QueryResult) -> QueryResult {
+        var saved = result
+        var rows: [Row] = []
+        for row in result.rows where !edits.deleted.contains(row.id) {
+            var values = row.values
+            for (column, value) in edits.updates[row.id] ?? [:] where values.indices.contains(column) {
+                switch value {
+                case .null: values[column] = .null
+                case .default: break
+                case .text(let text): values[column] = DBValue(typed: text, like: values[column])
+                }
+            }
+            rows.append(Row(id: rows.count, values: values))
+        }
+        saved.rows = rows
+        return saved
     }
 
     /// Closing a tab from the UI asks first if it has unsaved edits.
     func requestClose(_ id: UUID) {
-        if case .table(let t)? = tabs.first(where: { $0.id == id }), !confirmDiscardingEdits(in: t) { return }
+        if let rows = tabs.first(where: { $0.id == id })?.editableRows, !confirmDiscardingEdits(in: rows) { return }
         close(id)
     }
 
     var activeTableTab: TableTab? {
         if case .table(let t) = activeTab { t } else { nil }
+    }
+
+    /// The active tab's editable rows: a table tab's, or a script's results.
+    var activeEditableRows: (any EditableRows)? {
+        switch activeTab {
+        case .table(let t): t
+        case .script(let s): s
+        default: nil
+        }
     }
 
     func retryLoadMore(_ tab: TableTab) {
@@ -1168,18 +1374,21 @@ final class AppModel {
     }
 
     func run(_ tab: ScriptTab) async {
-        guard !tab.result.isLoading else { return }
+        guard !tab.result.isLoading, confirmDiscardingEdits(in: tab) else { return }
         tab.result = .loading
         tab.runCount += 1
         tab.wasCancelled = false
+        tab.sources = nil
         let clock = ContinuousClock()
         let start = clock.now
         do {
             let sql = tab.sqlToRun
+            tab.lastRunSQL = sql
             let result = try await driver(for: tab.connection).execute(sql, maxRows: scriptRowLimit)
             tab.lastDuration = clock.now - start
             tab.result = .loaded(result)
             if sql.contains(Self.ddl) { await schemaMayHaveChanged(tab.connection) }
+            await describeResult(of: tab)
         } catch DatabaseError.cancelled {
             tab.lastDuration = clock.now - start
             tab.result = .idle
@@ -1189,6 +1398,15 @@ final class AppModel {
             tab.result = .failed(error.localizedDescription)
         }
         await updateConnectionState(tab.connection.id)
+    }
+
+    /// Finds which tables a script's rows come from, for editing them and following their foreign
+    /// keys. Shown rows stay read-only (and unlinked) if this fails.
+    private func describeResult(of tab: ScriptTab) async {
+        guard let result = tab.loadedRows, !result.origins.isEmpty else { return }
+        let run = tab.runCount
+        let sources = try? await driver(for: tab.connection).describeResult(result)
+        if tab.runCount == run { tab.sources = sources }
     }
 
     /// Stops the script running in `tab` (server-side cancel).

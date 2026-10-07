@@ -44,12 +44,13 @@ struct TableTabView: View {
                 ),
                 sorting: GridSorting(keys: tab.sort) { model.toggleSort(tab, column: $0) },
                 editing: tab.readOnlyReason == nil ? editing : nil,
-                foreignKeys: GridForeignKeys(
-                    keys: tab.foreignKeys, referencedBy: tab.referencedBy, schema: tab.table.schema,
-                    primaryKey: tab.structure.value?.primaryKey ?? [],
-                    open: { model.openReferencedRow($0, values: $1, from: tab) },
-                    openReferencing: { model.openReferencingRows($0, values: $1, from: tab) }
-                ),
+                foreignKeys: model.linkSources(for: tab).map { sources in
+                    GridForeignKeys(
+                        sources: sources,
+                        open: { model.openReferencedRow($0, values: $1, from: tab.connection) },
+                        openReferencing: { model.openReferencingRows($0, values: $1, from: tab.connection) }
+                    )
+                },
                 focus: GridFocus(
                     initial: { tab.focusedCell },
                     changed: { tab.focusedCell = $0 },
@@ -131,7 +132,7 @@ struct RowToolbarButtons: View {
 /// and Save (⌘S, no review).
 struct PendingChangesButtons: View {
     @Environment(AppModel.self) private var model
-    let tab: TableTab
+    let tab: any EditableRows
 
     var body: some View {
         Button { model.discardEdits(tab) } label: {
@@ -163,10 +164,10 @@ struct PendingChangesButtons: View {
 }
 
 /// The exact statements that will run, and Save. Errors keep the sheet (and the edits) open.
-private struct ReviewChangesSheet: View {
+struct ReviewChangesSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-    let tab: TableTab
+    let tab: any EditableRows
     @State private var statements: [EditStatement] = []
     @State private var error: String?
     @State private var saving = false
@@ -174,7 +175,7 @@ private struct ReviewChangesSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Save Changes to “\(tab.table.name)”?").font(.headline)
+                Text("Save Changes to \(tab.editTarget)?").font(.headline)
                 Text("\(tab.edits.summary). These statements run in one transaction: if any fails, or a row changed since it was loaded, nothing is saved.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

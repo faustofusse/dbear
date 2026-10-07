@@ -32,7 +32,7 @@ struct WorkspaceView: View {
                 if #available(macOS 26.0, *) {
                     ToolbarSpacer(.flexible)
                 }
-                if let tab = model.activeTableTab, !tab.edits.isEmpty {
+                if let tab = model.activeEditableRows, !tab.edits.isEmpty {
                     ToolbarItemGroup { PendingChangesButtons(tab: tab) }
                     if #available(macOS 26.0, *) {
                         ToolbarSpacer(.fixed)

@@ -102,6 +102,35 @@ final class RustDriver: DatabaseDriver {
         return QueryResult(try await bridged { try await connection.execute(sql: sql, maxRows: limit) }, firstRowID: 0)
     }
 
+    func describeResult(_ result: QueryResult) async throws -> ResultSources {
+        let origins = result.origins.map { $0.map { DBCoreFFI.ColumnOrigin(schema: $0.schema, table: $0.table, column: $0.column) } }
+        let inner = try await bridged { try await connection.describeResult(origins: origins) }
+        return ResultSources(inner, columnCount: result.columns.count)
+    }
+
+    func tableSources(_ table: TableInfo, columns: [ColumnInfo], structure: TableStructure) -> ResultSources {
+        let inner = DBCoreFFI.tableResultSources(
+            table: DBCoreFFI.TableInfo(table), columns: columns.map(DBCoreFFI.ColumnInfo.init),
+            structure: DBCoreFFI.TableStructure(structure))
+        return ResultSources(inner, columnCount: columns.count)
+    }
+
+    func previewResultEdits(_ sources: ResultSources, edits: [ResultRowEdit]) throws -> [EditStatement] {
+        do {
+            return try connection.previewResultEdits(sources: sources.inner, edits: edits.map(DBCoreFFI.RowEdit.init))
+                .map { EditStatement(sql: $0.sql, expectOneRow: $0.expectOneRow, target: $0.target) }
+        } catch let error as DBCoreFFI.DbError {
+            throw DatabaseError(error)
+        }
+    }
+
+    func applyResultEdits(_ sources: ResultSources, edits: [ResultRowEdit]) async throws -> Int {
+        let affected = try await bridged {
+            try await connection.applyResultEdits(sources: sources.inner, edits: edits.map(DBCoreFFI.RowEdit.init))
+        }
+        return Int(clamping: affected)
+    }
+
     func cancel() async {
         await connection.cancel()
     }
@@ -449,7 +478,8 @@ extension QueryResult {
             rows: r.rows.enumerated().map { Row(id: firstRowID + $0.offset, values: $0.element.map(DBValue.init)) },
             totalCount: r.totalCount.map { Int(clamping: $0) },
             rowsAffected: r.rowsAffected.map { Int(clamping: $0) },
-            truncated: r.truncated
+            truncated: r.truncated,
+            origins: r.origins.map { $0.map { ColumnOrigin(schema: $0.schema, table: $0.table, column: $0.column) } }
         )
     }
 }
@@ -764,5 +794,83 @@ extension DatabaseLevelContext {
 extension DBCoreFFI.DatabaseLevelContext {
     init(_ c: DatabaseLevelContext) {
         self.init(database: c.database, level: DBCoreFFI.DatabaseLevel(c.level), privileges: DBCoreFFI.PrivilegeSet(c.privileges), schemas: c.schemas, owners: c.owners)
+    }
+}
+
+// MARK: - Result sources
+
+/// What a grid's columns are, from the tables they read (`dbcore::results`): which cells can be
+/// edited, which foreign keys link where, which tables reference a row. Made by the driver.
+public final class ResultSources: @unchecked Sendable {
+    let inner: DBCoreFFI.ResultSources
+    public let foreignKeys: [ForeignKeyLink]
+    public let referencedBy: [ReferenceLink]
+    /// Tables edits are saved to (for the review sheet).
+    public let editableTables: [String]
+    public let canDeleteRows: Bool
+    /// Why no cell can be edited (`nil`: some can).
+    public let summaryReason: String?
+    private let reasons: [String?]
+
+    init(_ inner: DBCoreFFI.ResultSources, columnCount: Int) {
+        self.inner = inner
+        foreignKeys = inner.foreignKeys().map {
+            ForeignKeyLink(columns: $0.columns.map(Int.init), schema: $0.schema, table: $0.table,
+                           targetColumns: $0.targetColumns, label: $0.label)
+        }
+        referencedBy = inner.referencedBy().map {
+            ReferenceLink(values: $0.values.map(Int.init), schema: $0.schema, table: $0.table, columns: $0.columns, label: $0.label)
+        }
+        editableTables = inner.editableTables()
+        canDeleteRows = inner.canDeleteRows()
+        summaryReason = inner.summaryReason()
+        reasons = (0..<columnCount).map { inner.readOnlyReason(column: UInt32($0)) }
+    }
+
+    /// Why cells of `column` can't be edited (`nil`: they can).
+    public func readOnlyReason(column: Int) -> String? {
+        reasons.indices.contains(column) ? reasons[column] : "Unknown column."
+    }
+
+    public var isEditable: Bool { summaryReason == nil }
+}
+
+extension DBCoreFFI.RowEdit {
+    init(_ edit: ResultRowEdit) {
+        let set = edit.set.sorted { $0.key < $1.key }.map { column, value in
+            let value: DBCoreFFI.EditValue = switch value {
+            case .null: .null
+            case .default: .default
+            case .text(let text): .text(text: text)
+            }
+            return DBCoreFFI.ResultCellEdit(column: UInt32(column), value: value)
+        }
+        self.init(values: edit.values.map(DBCoreFFI.Value.init), set: set, delete: edit.delete)
+    }
+}
+
+extension DBCoreFFI.TableStructure {
+    init(_ s: TableStructure) {
+        self.init(
+            columns: s.columns.map {
+                DBCoreFFI.ColumnDetail(name: $0.name, typeName: $0.typeName, isNullable: $0.isNullable,
+                                       defaultValue: $0.defaultValue, isPrimaryKey: $0.isPrimaryKey, comment: $0.comment)
+            },
+            primaryKey: s.primaryKey,
+            indexes: s.indexes.map {
+                DBCoreFFI.IndexInfo(name: $0.name, columns: $0.columns, isUnique: $0.isUnique, isPrimary: $0.isPrimary,
+                                    definition: $0.definition)
+            },
+            foreignKeys: s.foreignKeys.map {
+                DBCoreFFI.ForeignKeyInfo(name: $0.name, columns: $0.columns, referencedSchema: $0.referencedSchema,
+                                         referencedTable: $0.referencedTable, referencedColumns: $0.referencedColumns,
+                                         onUpdate: $0.onUpdate, onDelete: $0.onDelete)
+            },
+            referencedBy: s.referencedBy.map {
+                DBCoreFFI.ReferencingKey(schema: $0.schema, table: $0.table, name: $0.name, columns: $0.columns,
+                                         referencedColumns: $0.referencedColumns)
+            },
+            ddl: s.ddl
+        )
     }
 }

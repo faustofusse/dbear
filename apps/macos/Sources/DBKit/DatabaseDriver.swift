@@ -55,6 +55,15 @@ public protocol DatabaseDriver: Sendable {
     func applyChanges(to table: TableInfo, columns: [ColumnInfo], changes: [RowChange]) async throws -> Int
     /// Runs a script keeping at most `maxRows` rows (nil = all); see `QueryResult.truncated`.
     func execute(_ sql: String, maxRows: Int?) async throws -> QueryResult
+    /// What a script result's columns are, from the tables they read: which cells can be edited,
+    /// which foreign keys link where (describes those tables).
+    func describeResult(_ result: QueryResult) async throws -> ResultSources
+    /// A table's own rows as `ResultSources` (for their links).
+    func tableSources(_ table: TableInfo, columns: [ColumnInfo], structure: TableStructure) -> ResultSources
+    /// The SQL `applyResultEdits` would run, in order.
+    func previewResultEdits(_ sources: ResultSources, edits: [ResultRowEdit]) throws -> [EditStatement]
+    /// Saves edits made in a script's results (to one or more tables) in one transaction.
+    func applyResultEdits(_ sources: ResultSources, edits: [ResultRowEdit]) async throws -> Int
     /// Stops the running `execute`, which then throws `DatabaseError.cancelled`.
     func cancel() async
     /// Users and roles on the server, system ones included (see `Access.features`).

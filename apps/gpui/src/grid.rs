@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use dbcore::export::{self, CopyFormat, Target};
 use dbcore::edit::{CellEdit, EditValue, KeyValue, RowChange, is_binary};
+use dbcore::results::{ResultSources, RowEdit};
 use dbcore::{
-    ColumnInfo, Connection, DatabaseKind, ForeignKeyInfo, PageCursor, ReferencingKey, RowPage, RowQuery, SortKey, TableInfo,
+    ColumnInfo, Connection, DatabaseKind, PageCursor, RowPage, RowQuery, SortKey, TableInfo,
     TableKind, Value,
 };
 use gpui_kit::component::input::{Input, InputState};
@@ -73,11 +74,6 @@ impl PendingEdits {
 /// Starts editing a cell (the table tab owns the input). Set by the tab, called from the menu.
 pub type BeginEdit = Rc<dyn Fn(usize, usize, &mut Window, &mut App)>;
 
-/// The table's foreign keys and the keys in other tables that point at it (from `describe_table`).
-pub struct Relations {
-    pub foreign_keys: Vec<ForeignKeyInfo>,
-    pub referenced_by: Vec<ReferencingKey>,
-}
 
 /// Rows of another table to open: those whose `columns` equal `values`. Empty `columns`: the
 /// table's primary key (SQLite foreign keys can reference it implicitly).
@@ -98,8 +94,10 @@ pub struct RowsDelegate {
     /// The cell being edited and its input.
     pub editing: Option<(usize, usize, Entity<InputState>)>,
     pub begin_edit: Option<BeginEdit>,
-    /// Foreign keys, for the links in their cells and the menu (loaded after the rows).
-    pub relations: Option<Relations>,
+    /// What the columns are, from the tables they read (a table's own structure, or a script
+    /// result's tables): foreign key links by column index, and, for script results, which cells
+    /// can be edited. Loaded after the rows.
+    pub links: Option<ResultSources>,
     pub open_related: Option<OpenRelated>,
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Vec<Value>>,
@@ -116,6 +114,8 @@ pub struct RowsDelegate {
     /// For copying as `INSERT`s: the database kind and the table (none for script results).
     kind: Option<DatabaseKind>,
     source: Option<(Arc<Connection>, TableInfo)>,
+    /// Where the rows were read (script results save their edits through it).
+    connection: Option<Arc<Connection>>,
     next: Option<PageCursor>,
     /// Bumped whenever the rows are replaced, so a page for the previous query is dropped.
     generation: u64,
@@ -132,6 +132,7 @@ impl RowsDelegate {
         self.rows.clear();
         self.total = None;
         self.source = None;
+        self.connection = None;
         self.next = None;
         self.loading_more = false;
         self.load_more_error = None;
@@ -142,12 +143,14 @@ impl RowsDelegate {
     }
 
     /// Shows a script's result: all of it at once, no paging or sorting.
-    pub fn show_result(&mut self, kind: DatabaseKind, result: dbcore::QueryResult) {
+    pub fn show_result(&mut self, connection: Arc<Connection>, result: dbcore::QueryResult) {
         self.clear();
-        self.kind = Some(kind);
+        self.kind = Some(connection.config().kind);
+        self.connection = Some(connection);
         self.columns = result.columns;
         self.rows = result.rows;
         self.total = result.total_count;
+        self.links = None;
     }
 
     /// Shows the first page of `table`, read with `query`; later pages load on scroll.
@@ -159,7 +162,8 @@ impl RowsDelegate {
         self.rows = page.result.rows;
         self.total = page.result.total_count;
         self.next = page.next;
-        self.source = Some((connection, table));
+        self.source = Some((connection.clone(), table));
+        self.connection = Some(connection);
     }
 
     /// The table's rows can be sorted and filtered (script results can't).
@@ -220,7 +224,13 @@ impl RowsDelegate {
 
     /// Why these rows can't be edited, or `None` when they can.
     pub fn read_only_reason(&self) -> Option<String> {
-        let Some((_, table)) = &self.source else { return Some("Script results are read-only.".into()) };
+        let Some((_, table)) = &self.source else {
+            // Script results: cells of tables whose primary key is in the result.
+            return match &self.links {
+                Some(links) => links.summary_reason(),
+                None => Some("Script results are read-only until the tables they come from are known.".into()),
+            };
+        };
         if table.kind == TableKind::View {
             return Some("Views are read-only.".into());
         }
@@ -231,11 +241,35 @@ impl RowsDelegate {
     }
 
     pub fn is_editable(&self, col: usize) -> bool {
-        self.read_only_reason().is_none() && self.columns.get(col).is_some_and(|c| !is_binary(c))
+        self.cell_read_only_reason(col).is_none()
+    }
+
+    /// Why `col`'s cells can't be edited (`None`: they can).
+    pub fn cell_read_only_reason(&self, col: usize) -> Option<String> {
+        if let Some(reason) = self.read_only_reason() {
+            return Some(reason);
+        }
+        let column = self.columns.get(col)?;
+        if is_binary(column) {
+            return Some("Binary values can’t be edited here.".into());
+        }
+        match (&self.source, &self.links) {
+            (None, Some(links)) => links.read_only_reason(col),
+            _ => None,
+        }
+    }
+
+    /// Rows can be deleted: a table's, or script results from one editable table.
+    pub fn can_delete_rows(&self) -> bool {
+        self.read_only_reason().is_none() && (self.source.is_some() || self.links.as_ref().is_some_and(|l| l.can_delete_rows()))
     }
 
     pub fn source(&self) -> Option<&(Arc<Connection>, TableInfo)> {
         self.source.as_ref()
+    }
+
+    pub fn connection(&self) -> Option<&Arc<Connection>> {
+        self.connection.as_ref()
     }
 
     /// The value a cell shows: the pending edit, else the loaded value (`None`: out of range).
@@ -345,6 +379,48 @@ impl RowsDelegate {
         changes
     }
 
+    /// A script result's pending edits, row by row (the core groups them by table).
+    pub fn result_edits(&self) -> Vec<RowEdit> {
+        let mut edits: Vec<RowEdit> = self
+            .edits
+            .deleted
+            .iter()
+            .filter_map(|&row| Some(RowEdit { values: self.rows.get(row)?.clone(), set: Vec::new(), delete: true }))
+            .collect();
+        for (&row, cells) in &self.edits.updates {
+            if self.edits.deleted.contains(&row) {
+                continue;
+            }
+            let Some(values) = self.rows.get(row) else { continue };
+            let set = cells.iter().map(|(&col, value)| (col, value.clone())).collect();
+            edits.push(RowEdit { values: values.clone(), set, delete: false });
+        }
+        edits
+    }
+
+    /// After saving a script result's edits: the rows as saved (deleted ones dropped), without
+    /// re-running the script, which may do more than select.
+    pub fn apply_saved_edits(&mut self) {
+        let edits = std::mem::take(&mut self.edits);
+        for (&row, cells) in &edits.updates {
+            let Some(values) = self.rows.get_mut(row) else { continue };
+            for (&col, value) in cells {
+                let Some(cell) = values.get_mut(col) else { continue };
+                match value {
+                    EditValue::Null => *cell = Value::Null,
+                    EditValue::Default => {}
+                    EditValue::Text(text) => *cell = typed_like(text, cell),
+                }
+            }
+        }
+        for &row in edits.deleted.iter().rev() {
+            if row < self.rows.len() {
+                self.rows.remove(row);
+            }
+        }
+        self.editing = None;
+    }
+
     /// Rows touched by the table's selection (a row, or a cell's row).
     pub fn selected_row(selection: TableSelection) -> Option<usize> {
         match selection {
@@ -373,76 +449,50 @@ impl RowsDelegate {
 
     // MARK: foreign keys
 
-    /// The loaded values of `columns` in `row`; `None` when one is NULL (it points nowhere), a
-    /// column is missing, or the row is new.
-    fn key_values(&self, row: usize, columns: &[String]) -> Option<Vec<Value>> {
+    /// The loaded values of result columns `indexes` in `row`; `None` when one is NULL (it points
+    /// nowhere), a column is missing, or the row is new.
+    fn key_values(&self, row: usize, indexes: &[usize]) -> Option<Vec<Value>> {
         let values = self.rows.get(row)?;
-        columns
-            .iter()
-            .map(|name| {
-                let col = self.columns.iter().position(|c| c.name == *name)?;
-                values.get(col).filter(|v| !v.is_null()).cloned()
-            })
-            .collect()
+        if indexes.is_empty() {
+            return None;
+        }
+        indexes.iter().map(|&i| values.get(i).filter(|v| !v.is_null()).cloned()).collect()
     }
 
     /// The rows `row`'s foreign keys point at, with a menu label each.
     pub fn outgoing(&self, row: usize) -> Vec<(String, RelatedRows)> {
-        let Some(relations) = &self.relations else { return Vec::new() };
-        let keys = &relations.foreign_keys;
-        keys.iter()
+        let Some(links) = &self.links else { return Vec::new() };
+        links
+            .foreign_keys
+            .iter()
             .filter_map(|fk| {
                 let values = self.key_values(row, &fk.columns)?;
-                // Two keys to the same table: say which columns each one follows.
-                let twice = keys.iter().filter(|k| k.referenced_table == fk.referenced_table).count() > 1;
-                let label = if twice {
-                    format!("Open {} Row ({})", fk.referenced_table, fk.columns.join(", "))
-                } else {
-                    format!("Open {} Row", fk.referenced_table)
-                };
-                let related = RelatedRows {
-                    schema: fk.referenced_schema.clone(),
-                    table: fk.referenced_table.clone(),
-                    columns: fk.referenced_columns.clone(),
-                    values,
-                };
-                Some((label, related))
+                let related = RelatedRows { schema: fk.schema.clone(), table: fk.table.clone(), columns: fk.target_columns.clone(), values };
+                Some((fk.label.clone(), related))
             })
             .collect()
     }
 
-    /// The link shown in a cell: the row its column's foreign key points at.
+    /// The link shown in a cell: the row its column's foreign key points at (single-column keys first).
     fn cell_link(&self, row: usize, col: usize) -> Option<RelatedRows> {
-        let name = &self.columns.get(col)?.name;
-        let fk = self.relations.as_ref()?.foreign_keys.iter().find(|fk| fk.columns.contains(name))?;
+        let links = self.links.as_ref()?;
+        let mut keys: Vec<_> = links.foreign_keys.iter().filter(|fk| fk.columns.contains(&col)).collect();
+        keys.sort_by_key(|fk| fk.columns.len());
+        let fk = keys.first()?;
         let values = self.key_values(row, &fk.columns)?;
-        Some(RelatedRows {
-            schema: fk.referenced_schema.clone(),
-            table: fk.referenced_table.clone(),
-            columns: fk.referenced_columns.clone(),
-            values,
-        })
+        Some(RelatedRows { schema: fk.schema.clone(), table: fk.table.clone(), columns: fk.target_columns.clone(), values })
     }
 
     /// The rows in other tables whose foreign keys point at `row`, with a menu label each.
     pub fn incoming(&self, row: usize) -> Vec<(String, RelatedRows)> {
-        let Some(relations) = &self.relations else { return Vec::new() };
-        let own_schema = self.source.as_ref().map(|(_, t)| t.schema.as_str());
-        let primary_key: Vec<String> = self.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect();
-        relations
+        let Some(links) = &self.links else { return Vec::new() };
+        links
             .referenced_by
             .iter()
             .filter_map(|key| {
-                // An implicit reference (SQLite) points at the primary key.
-                let own = if key.referenced_columns.is_empty() { &primary_key } else { &key.referenced_columns };
-                if own.is_empty() {
-                    return None;
-                }
-                let values = self.key_values(row, own)?;
-                let table =
-                    if Some(key.schema.as_str()) == own_schema { key.table.clone() } else { format!("{}.{}", key.schema, key.table) };
-                let label = format!("{table} ({})", key.columns.join(", "));
-                Some((label, RelatedRows { schema: key.schema.clone(), table: key.table.clone(), columns: key.columns.clone(), values }))
+                let values = self.key_values(row, &key.values)?;
+                let related = RelatedRows { schema: key.schema.clone(), table: key.table.clone(), columns: key.columns.clone(), values };
+                Some((key.label.clone(), related))
             })
             .collect()
     }
@@ -650,6 +700,7 @@ pub fn row_menu(
 ) -> PopupMenu {
     let rows = grid.read(cx).delegate();
     let editable = rows.read_only_reason().is_none();
+    let can_delete = rows.can_delete_rows();
     let editable_cell = cell.filter(|&c| rows.is_editable(c));
     let begin_edit = rows.begin_edit.clone();
     let deleted = rows.is_deleted(row_ix);
@@ -683,8 +734,11 @@ pub fn row_menu(
                     default(cx, &|g| g.set_cell(row_ix, col, EditValue::Default))
                 }));
         }
-        let label = if deleted { "Restore Row" } else { "Delete Row" };
-        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| edit(cx, &|g| g.toggle_delete(row_ix)))).separator();
+        if can_delete {
+            let label = if deleted { "Restore Row" } else { "Delete Row" };
+            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| edit(cx, &|g| g.toggle_delete(row_ix))));
+        }
+        menu = menu.separator();
     }
     if let Some(open) = open_related {
         let related = !outgoing.is_empty() || !incoming.is_empty();
@@ -737,4 +791,19 @@ pub fn row_menu(
     });
     menu.item(PopupMenuItem::submenu("Copy Row As", row_formats))
         .item(PopupMenuItem::submenu(format!("Copy All {loaded} Loaded Rows As"), all_formats))
+}
+
+/// Text saved into a cell, shown like the value it replaced (until the rows are read again).
+fn typed_like(text: &str, original: &Value) -> Value {
+    match original {
+        Value::Int(_) => text.parse().map(Value::Int).unwrap_or_else(|_| Value::Text(text.into())),
+        Value::Float(_) => text.parse().map(Value::Float).unwrap_or_else(|_| Value::Text(text.into())),
+        Value::Decimal(_) if text.parse::<f64>().is_ok() => Value::Decimal(text.into()),
+        Value::Bool(_) => match text.to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" | "yes" => Value::Bool(true),
+            "false" | "f" | "0" | "no" => Value::Bool(false),
+            _ => Value::Text(text.into()),
+        },
+        _ => Value::Text(text.into()),
+    }
 }

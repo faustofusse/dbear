@@ -52,7 +52,18 @@ copies the focused value. The context menu also copies rows as CSV, JSON, a Mark
 the value.
 
 **Run SQL.** ⌘T opens a new SQL script with syntax highlighting. ⌘↩ runs the script, or only the
-selected text, and ⌘. stops it. For SQL Server, scripts are split on `GO` lines.
+selected text, and ⌘. stops it. ⇧⌘↩ runs it in a new results tab instead, and the script's
+**Open in New Tab** button moves the rows it shows to one, so the next run doesn't replace them.
+Results tabs can be re-run (⌘↩) but aren't reopened at launch. For SQL Server, scripts are split
+on `GO` lines.
+
+On Postgres, MySQL and SQLite, script results work like a table's rows wherever a column is read
+straight from a table, including through joins and aliases. Foreign-key cells link to their row,
+and rows list the tables that reference them. You can edit cells of a table whose primary key is
+in the results, and save them like table edits. Deleting rows works when every column comes from
+one table. Computed columns, and tables whose primary key you didn't select, stay read-only, and
+the inspector says why. Saving doesn't re-run the script, because a script can do more than
+select.
 
 **Dump and restore.** **Dump Database…** (also available per schema or per table) writes a plain
 SQL file, optionally gzipped, that `psql`, `mysql`, `sqlite3` or `sqlcmd` can load.
@@ -74,6 +85,7 @@ passwords masked. Only privileges granted directly to a role are listed; inherit
 | ⇧⌘N / ⇧⌘E | New / edit connection |
 | ⌘T | New SQL script |
 | ⌘↩ / ⌘. | Run / stop script |
+| ⇧⌘↩ | Run script in a new results tab |
 | ⌥⌘1 / ⌥⌘2 | Data / Structure |
 | ⌥⌘N | Add row |
 | ⌘S / ⇧⌘S | Save changes / review changes |
