@@ -700,3 +700,44 @@ fn creates_a_database() {
     block_on(conn.execute("drop database if exists \"dbear create test\"".into())).unwrap();
     assert!(listed.contains(&"dbear create test".to_string()), "{listed:?}");
 }
+
+#[test]
+fn script_results_know_their_tables_and_save_edits() {
+    use dbcore::results::RowEdit;
+    if !enabled() {
+        return;
+    }
+    let db = dev();
+    block_on(db.execute("drop table if exists dbear_res_orders, dbear_res_users; create table dbear_res_users (id int primary key, name text); create table dbear_res_orders (id int primary key, user_id int references dbear_res_users (id), total numeric); insert into dbear_res_users values (1, 'Ada'); insert into dbear_res_orders values (10, 1, 5.5)".into())).unwrap();
+    let result = block_on(db.execute(
+        "select o.id, o.total, u.id as uid, u.name, o.total * 2 as twice from dbear_res_orders o join dbear_res_users u on u.id = o.user_id".into(),
+    ))
+    .unwrap();
+    let origins: Vec<_> = result.origins.iter().map(|o| o.as_ref().map(|o| (o.schema.as_str(), o.table.as_str(), o.column.as_str()))).collect();
+    assert_eq!(
+        origins,
+        [
+            Some(("public", "dbear_res_orders", "id")),
+            Some(("public", "dbear_res_orders", "total")),
+            Some(("public", "dbear_res_users", "id")),
+            Some(("public", "dbear_res_users", "name")),
+            None,
+        ]
+    );
+    let sources = block_on(db.describe_result(result.origins.clone())).unwrap();
+    assert_eq!((sources.read_only_reason(1), sources.read_only_reason(3)), (None, None));
+    assert!(sources.read_only_reason(4).is_some());
+    let links: Vec<_> = sources.referenced_by.iter().map(|r| (r.table.as_str(), r.values.clone())).collect();
+    assert_eq!(links, [("dbear_res_orders", vec![2])]);
+
+    let edit = RowEdit {
+        values: result.rows[0].clone(),
+        set: vec![(1, EditValue::Text("7".into())), (3, EditValue::Text("Grace".into()))],
+        delete: false,
+    };
+    let changes = sources.changes(&[edit]).unwrap();
+    assert_eq!(block_on(db.apply_result_changes(changes)).unwrap(), 2);
+    let after = block_on(db.execute("select u.name from dbear_res_users u".into())).unwrap();
+    assert_eq!(after.rows[0][0], Value::Text("Grace".into()));
+    block_on(db.execute("drop table dbear_res_orders; drop table dbear_res_users".into())).unwrap();
+}

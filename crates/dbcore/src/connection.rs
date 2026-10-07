@@ -11,7 +11,8 @@ use crate::driver::{Driver, Error, Result};
 use crate::dialect::normalize_filter;
 use crate::edit::{self, EditStatement, RowChange};
 use crate::keyset::{PageCursor, RowPage};
-use crate::model::{ColumnInfo, ConnectionConfig, QueryResult, RowQuery, Schema, TableColumns, TableInfo, TableStructure};
+use crate::results::{self, ResultSources, TableChanges};
+use crate::model::{ColumnInfo, ColumnOrigin, ConnectionConfig, QueryResult, RowQuery, Schema, TableColumns, TableInfo, TableStructure};
 use crate::libsql::LibsqlDriver;
 use crate::mock::{self, MockDriver};
 use crate::model::DatabaseKind;
@@ -150,6 +151,36 @@ impl Connection {
     /// columns as loaded (they carry the primary key). Returns the number of rows affected.
     pub async fn apply_changes(&self, table: TableInfo, columns: Vec<ColumnInfo>, changes: Vec<RowChange>) -> Result<u64> {
         let statements = self.preview_changes(&table, &columns, &changes)?;
+        if statements.is_empty() {
+            return Ok(0);
+        }
+        let d = self.driver.clone();
+        on_runtime(async move { d.apply(&statements).await }).await
+    }
+
+    /// What a script result's columns are, from the tables they read (see [`crate::results`]).
+    /// Tables that can't be described (dropped meanwhile, no access…) are left out: their columns
+    /// stay read-only and unlinked.
+    pub async fn describe_result(&self, origins: Vec<Option<ColumnOrigin>>) -> Result<ResultSources> {
+        let mut described = Vec::new();
+        for table in results::tables_to_describe(&origins) {
+            match self.describe_table(table.clone()).await {
+                Ok(structure) => described.push((table, structure)),
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(_) => {}
+            }
+        }
+        Ok(ResultSources::new(&origins, &described))
+    }
+
+    /// The SQL that `apply_result_changes` would run, for review.
+    pub fn preview_result_changes(&self, changes: &[TableChanges]) -> Result<Vec<EditStatement>> {
+        results::statements(self.config().kind, changes)
+    }
+
+    /// Saves edits made in a script's results, to one or more tables, in one transaction.
+    pub async fn apply_result_changes(&self, changes: Vec<TableChanges>) -> Result<u64> {
+        let statements = self.preview_result_changes(&changes)?;
         if statements.is_empty() {
             return Ok(0);
         }

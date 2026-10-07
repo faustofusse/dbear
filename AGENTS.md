@@ -96,6 +96,12 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
 - Edits: `dbcore::edit::statements` generates the SQL. The driver runs it in one transaction on its
   own session and rolls back if a statement fails or an UPDATE/DELETE doesn't match exactly one row.
   Values are sent as string literals and cast by the database.
+- Script results: drivers fill `QueryResult::origins` (the table column each result column reads:
+  Postgres from `prepare`'s table OID and column number, MySQL from `org_table`/`org_name`, SQLite
+  from rusqlite's `column_metadata`). `dbcore::results::ResultSources` turns origins and the tables'
+  structures into links and editability by column index. Both apps use it for script grids, and
+  for a table tab's links (`ResultSources::for_table`). A table is editable when its whole primary
+  key is in the result exactly once. Saving doesn't re-run the script.
 - Copy/inspect: `dbcore::export::format_rows`; `export::pretty_json` keeps key order and digits.
 - Users & roles: `dbcore::access` generates the SQL, run in one transaction where the database allows
   (Postgres). Postgres privileges are listed for the connection's current database. Access levels

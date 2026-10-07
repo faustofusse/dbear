@@ -22,6 +22,7 @@ pub mod model;
 pub mod mysql;
 pub mod paths;
 pub mod restore;
+pub mod results;
 pub mod secrets;
 pub mod postgres;
 pub mod sqlite;

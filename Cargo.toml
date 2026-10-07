@@ -24,7 +24,7 @@ webpki-roots = "1"
 # MySQL/MariaDB: rustls with the ring provider (no aws-lc / cmake), pure-Rust zlib
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 # SQLite: compiles the bundled amalgamation, no system libsqlite3 needed
-rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "column_metadata"] }
 # Importing DBeaver connections: its credentials file is AES-128-CBC encrypted
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }

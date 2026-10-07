@@ -590,12 +590,44 @@ async fn run_script(client: &Client, sql: &str, max_rows: Option<u32>) -> Result
     match client.prepare(sql).await {
         Ok(statement) => {
             let types: Vec<Type> = statement.columns().iter().map(|c| c.type_().clone()).collect();
-            collect(client, sql, Some(&types), max_rows, true).await
+            let mut result = collect(client, sql, Some(&types), max_rows, true).await?;
+            if !result.columns.is_empty() {
+                result.origins = origins(client, statement.columns()).await;
+            }
+            Ok(result)
         }
         // Several statements can't be prepared; run them as-is with values left as text.
         Err(e) if is_multi_statement_error(&e) => collect(client, sql, None, max_rows, true).await,
         Err(e) => Err(query_error(&e, Some(sql))),
     }
+}
+
+/// Where each column of a prepared statement comes from: the server names a table OID and column
+/// number for plain column references; one catalog query turns those into names. Empty if that
+/// fails (the result is then read-only, as before).
+async fn origins(client: &Client, columns: &[tokio_postgres::Column]) -> Vec<Option<ColumnOrigin>> {
+    let id = |c: &tokio_postgres::Column| Some((c.table_oid().filter(|&o| o != 0)?, c.column_id().filter(|&n| n > 0)?));
+    let tables: std::collections::BTreeSet<u32> = columns.iter().filter_map(id).map(|(table, _)| table).collect();
+    if tables.is_empty() {
+        return Vec::new();
+    }
+    let list = tables.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "select a.attrelid::int8, a.attnum::int4, n.nspname, c.relname, a.attname
+         from pg_attribute a
+         join pg_class c on c.oid = a.attrelid
+         join pg_namespace n on n.oid = c.relnamespace
+         where a.attrelid in ({list}) and a.attnum > 0 and not a.attisdropped"
+    );
+    let Ok(rows) = client.query(&sql, &[]).await else { return Vec::new() };
+    let names: std::collections::HashMap<(u32, i16), ColumnOrigin> = rows
+        .iter()
+        .map(|r| {
+            let key = (r.get::<_, i64>(0) as u32, r.get::<_, i32>(1) as i16);
+            (key, ColumnOrigin { schema: r.get(2), table: r.get(3), column: r.get(4) })
+        })
+        .collect();
+    columns.iter().map(|c| id(c).and_then(|key| names.get(&key).cloned())).collect()
 }
 
 fn is_multi_statement_error(e: &tokio_postgres::Error) -> bool {

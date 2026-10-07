@@ -11,6 +11,7 @@ uniffi::setup_scaffolding!();
 mod access;
 mod dump;
 mod import;
+mod results;
 
 // MARK: Records & enums
 
@@ -196,6 +197,8 @@ pub struct QueryResult {
     pub total_count: Option<u64>,
     pub rows_affected: Option<u64>,
     pub truncated: bool,
+    /// Script results: the table column each column reads (`None`: an expression). Empty when unknown.
+    pub origins: Vec<Option<results::ColumnOrigin>>,
 }
 
 /// One page of a table and an opaque token for the next one (`None`: last page).
@@ -848,6 +851,11 @@ impl From<dbcore::QueryResult> for QueryResult {
             total_count: r.total_count,
             rows_affected: r.rows_affected,
             truncated: r.truncated,
+            origins: r
+                .origins
+                .into_iter()
+                .map(|o| o.map(|o| results::ColumnOrigin { schema: o.schema, table: o.table, column: o.column }))
+                .collect(),
         }
     }
 }

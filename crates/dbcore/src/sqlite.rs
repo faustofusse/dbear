@@ -644,7 +644,19 @@ fn run_script(conn: &rusqlite::Connection, sql: &str, max_rows: Option<u32>) -> 
                 is_nullable: true,
             })
             .collect();
-        let mut result = QueryResult { columns, ..Default::default() };
+        // The database, table and column a plain column reference reads (none for expressions).
+        let origins = stmt
+            .columns_with_metadata()
+            .iter()
+            .map(|c| {
+                Some(ColumnOrigin {
+                    schema: c.database_name()?.to_string(),
+                    table: c.table_name()?.to_string(),
+                    column: c.origin_name()?.to_string(),
+                })
+            })
+            .collect();
+        let mut result = QueryResult { columns, origins, ..Default::default() };
         let mut rows = stmt.raw_query();
         while let Some(row) = rows.next().map_err(|e| query_error(e, Some(sql)))? {
             if result.rows.len() < max_rows {

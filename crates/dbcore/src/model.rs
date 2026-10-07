@@ -325,4 +325,15 @@ pub struct QueryResult {
     pub truncated: bool,
     /// For statements that return no rows (INSERT/UPDATE/DDL…): rows affected, as reported by the server.
     pub rows_affected: Option<u64>,
+    /// Script results: where each column comes from, in `columns` order (`None` for expressions).
+    /// Empty when the driver can't tell. See [`crate::results`].
+    pub origins: Vec<Option<ColumnOrigin>>,
+}
+
+/// The table column a result column reads, unchanged (not an expression of it).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ColumnOrigin {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
 }

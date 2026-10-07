@@ -407,8 +407,7 @@ impl Driver for MockDriver {
             columns: spec.columns.clone(),
             rows,
             total_count: Some(spec.rows),
-            rows_affected: None,
-            truncated: false,
+            ..Default::default()
         })
     }
 
@@ -505,6 +504,8 @@ impl Driver for MockDriver {
         let mut full = self.fetch_rows(&TableInfo::new(schema, spec.name), &RowQuery::default(), kept as u32, 0).await?;
         full.truncated = kept < wanted;
         full.total_count = full.truncated.then_some(wanted);
+        let origin = |c: &ColumnInfo| Some(ColumnOrigin { schema: schema.into(), table: spec.name.into(), column: c.name.clone() });
+        full.origins = full.columns.iter().map(origin).collect();
 
         let select_list = caps[1].trim();
         if select_list == "*" {
@@ -523,6 +524,7 @@ impl Driver for MockDriver {
         Ok(QueryResult {
             columns: indices.iter().map(|&i| full.columns[i].clone()).collect(),
             rows: full.rows.iter().map(|r| indices.iter().map(|&i| r[i].clone()).collect()).collect(),
+            origins: indices.iter().map(|&i| full.origins[i].clone()).collect(),
             ..full
         })
     }

@@ -868,6 +868,16 @@ async fn run_script(conn: &mut Conn, sql: &str, max_rows: Option<u32>) -> std::r
                 is_primary_key: false,
                 is_nullable: true,
             }).collect(),
+            // The server names the table and column a plain column reference reads (empty for
+            // expressions); `org_*` are the real names behind aliases.
+            origins: columns.iter().map(|c| {
+                let (schema, table, column) = (c.schema_str(), c.org_table_str(), c.org_name_str());
+                (!schema.is_empty() && !table.is_empty() && !column.is_empty()).then(|| ColumnOrigin {
+                    schema: schema.into_owned(),
+                    table: table.into_owned(),
+                    column: column.into_owned(),
+                })
+            }).collect(),
             ..Default::default()
         };
         result = stream
