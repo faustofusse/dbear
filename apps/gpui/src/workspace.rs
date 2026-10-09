@@ -1,9 +1,10 @@
 //! The main window: connections | schemas and tables | tabs (tables and SQL scripts), like the macOS app.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dbcore::dialect::Dialect;
 use dbcore::secrets::{self, KeyringSecretStore, SecretStore as _};
@@ -29,7 +30,8 @@ use crate::import_dialog::ImportDialog;
 use crate::new_database::{CreateRequested, NewDatabaseDialog};
 use crate::grid::{RelatedRows, copy};
 use crate::users::{self, RoleCreated, UsersState, UsersTab};
-use crate::tabs::{EditorFontSize, History, OpenResults, ResultTab, ScriptTab, TabEvent, TableTab, count, plural};
+use crate::menus::MenuState;
+use crate::tabs::{AddRow, EditorFontSize, History, OpenResults, ResultTab, ScriptTab, ShowData, ShowStructure, TabEvent, TableTab, count, plural};
 
 enum Load<T> {
     Idle,
@@ -43,8 +45,26 @@ type TargetKey = (String, String);
 
 actions!(
     dbear,
-    [NewScript, CloseTab, PreviousTab, NextTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, LastTab]
+    [
+        NewScript, CloseTab, PreviousTab, NextTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+        SelectTab7, SelectTab8, LastTab, NewConnection, EditConnection, ImportConnections, ShowUsers, ToggleSidebar,
+        SelectPrevious, SelectNext, DeleteSelected
+    ]
 );
+
+/// A list whose selection the arrow keys move, and which scrolls to it afterwards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum List {
+    Connections,
+    Tables,
+    Roles,
+}
+
+/// A row of the connections list: a connection, or one of its databases.
+type SidebarRow = (String, Option<String>);
+
+/// How often open connections are asked whether the server still has them (no network I/O).
+const MONITOR_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A tab being dragged to a new place in the tab bar.
 #[derive(Clone)]
@@ -137,6 +157,20 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-7", SelectTab7, Some("Workspace")),
         KeyBinding::new("secondary-8", SelectTab8, Some("Workspace")),
         KeyBinding::new("secondary-9", LastTab, Some("Workspace")),
+        // The macOS app's File and View menus.
+        KeyBinding::new("shift-secondary-n", NewConnection, Some("Workspace")),
+        KeyBinding::new("shift-secondary-e", EditConnection, Some("Workspace")),
+        KeyBinding::new("shift-secondary-u", ShowUsers, Some("Workspace")),
+        KeyBinding::new("secondary-b", ToggleSidebar, Some("Workspace")),
+        // Arrow keys move through the connections, tables and roles lists, once one was clicked.
+        KeyBinding::new("up", SelectPrevious, Some("ConnectionList")),
+        KeyBinding::new("down", SelectNext, Some("ConnectionList")),
+        KeyBinding::new("backspace", DeleteSelected, Some("ConnectionList")),
+        KeyBinding::new("delete", DeleteSelected, Some("ConnectionList")),
+        KeyBinding::new("up", SelectPrevious, Some("TableList")),
+        KeyBinding::new("down", SelectNext, Some("TableList")),
+        KeyBinding::new("up", SelectPrevious, Some("RoleList")),
+        KeyBinding::new("down", SelectNext, Some("RoleList")),
     ]);
 }
 
@@ -223,6 +257,29 @@ pub struct Workspace {
     database: String,
     schemas: Load<Vec<Schema>>,
     collapsed: HashSet<String>,
+    /// Collapsed connection groups (Local, Production…) in the sidebar.
+    collapsed_groups: HashSet<String>,
+    /// Connections whose databases are listed under them in the sidebar.
+    expanded: HashSet<String>,
+    /// Open connections the server closed (they reconnect when next used): no green light.
+    lost: HashSet<String>,
+    /// Connections whose last attempt failed: a warning instead of the light.
+    failed: HashSet<String>,
+    /// "New SQL Script" on a connection that wasn't open yet: opens once it is.
+    script_after_connect: Option<TargetKey>,
+    sidebar_visible: bool,
+    /// The menu bar drawn in the window (Linux, Windows); macOS has its own.
+    menu_bar: Option<Entity<gpui_kit::component::menu::AppMenuBar>>,
+    connections_focus: FocusHandle,
+    tables_focus: FocusHandle,
+    roles_focus: FocusHandle,
+    connections_scroll: ScrollHandle,
+    tables_scroll: ScrollHandle,
+    roles_scroll: ScrollHandle,
+    /// The list whose selection the arrow keys just moved: scrolled to it on the next render.
+    reveal: Cell<Option<List>>,
+    _monitor: Task<()>,
+    _inspector_shown: Subscription,
     /// The tables column hides views.
     tables_only: bool,
     /// The middle column lists users instead of tables (Postgres, MySQL).
@@ -288,6 +345,10 @@ impl Workspace {
             this.save_session(cx);
             async {}
         });
+        crate::menus::install(MenuState { sidebar: true, inspector: crate::inspector::is_shown(cx) }, cx);
+        let menu_bar = (!cfg!(target_os = "macos")).then(|| gpui_kit::component::menu::AppMenuBar::new(cx));
+        let inspector_shown = cx.observe_global::<crate::inspector::ShowInspector>(|this, cx| this.refresh_menus(cx));
+        let monitor = cx.spawn(async move |this, cx| Self::monitor(this, cx).await);
         Self {
             store,
             state,
@@ -310,6 +371,22 @@ impl Workspace {
             database: String::new(),
             schemas: Load::Idle,
             collapsed: HashSet::new(),
+            collapsed_groups: HashSet::new(),
+            expanded: HashSet::new(),
+            lost: HashSet::new(),
+            failed: HashSet::new(),
+            script_after_connect: None,
+            sidebar_visible: true,
+            menu_bar,
+            connections_focus: cx.focus_handle(),
+            tables_focus: cx.focus_handle(),
+            roles_focus: cx.focus_handle(),
+            connections_scroll: ScrollHandle::new(),
+            tables_scroll: ScrollHandle::new(),
+            roles_scroll: ScrollHandle::new(),
+            reveal: Cell::new(None),
+            _monitor: monitor,
+            _inspector_shown: inspector_shown,
             tables_only: false,
             users_mode: false,
             users: HashMap::new(),
@@ -358,6 +435,9 @@ impl Workspace {
         self.schema_cache.retain(|(cached, _), _| cached != id);
         self.databases.remove(id);
         self.users.remove(id);
+        self.expanded.remove(id);
+        self.lost.remove(id);
+        self.failed.remove(id);
     }
 
     // MARK: editing connections
@@ -1002,13 +1082,17 @@ impl Workspace {
                 }
                 match result {
                     Ok(schemas) => {
+                        this.failed.remove(&key.0);
                         this.open.insert(key.clone(), connection);
                         this.schema_cache.insert(key.clone(), schemas.clone());
                         this.schemas = Load::Loaded(schemas);
                     }
                     // A background refresh: keep the list it couldn't replace.
                     Err(e) if quiet && matches!(this.schemas, Load::Loaded(_)) => log::warn!("couldn’t list the tables again: {e}"),
-                    Err(e) => this.schemas = Load::Failed(e.to_string()),
+                    Err(e) => {
+                        this.failed.insert(key.0.clone());
+                        this.schemas = Load::Failed(e.to_string());
+                    }
                 }
                 if let Some(databases) = databases {
                     let (id, database) = key;
@@ -1486,6 +1570,203 @@ impl Workspace {
         cx.notify();
     }
 
+    // MARK: menus, sidebar and keyboard
+
+    /// Sets the menus again (what they show checked changed).
+    fn refresh_menus(&self, cx: &mut Context<Self>) {
+        crate::menus::install(MenuState { sidebar: self.sidebar_visible, inspector: crate::inspector::is_shown(cx) }, cx);
+        if let Some(bar) = &self.menu_bar {
+            bar.update(cx, |bar, cx| bar.reload(cx));
+        }
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.refresh_menus(cx);
+        cx.notify();
+    }
+
+    /// Asks the open connections, every few seconds, whether the server still has them, so the
+    /// green light goes out when it closed one (like the macOS app). They reconnect when next used.
+    async fn monitor(this: WeakEntity<Self>, cx: &mut AsyncApp) {
+        loop {
+            cx.background_executor().timer(MONITOR_INTERVAL).await;
+            let Ok(open) = this.update(cx, |w, _| w.open.iter().map(|((id, _), c)| (id.clone(), c.clone())).collect::<Vec<_>>())
+            else {
+                return;
+            };
+            let mut alive: HashMap<String, bool> = HashMap::new();
+            for (id, connection) in open {
+                let connected = connection.is_connected().await;
+                *alive.entry(id).or_default() |= connected;
+            }
+            let lost: HashSet<String> = alive.into_iter().filter(|(_, connected)| !connected).map(|(id, _)| id).collect();
+            let updated = this.update(cx, |w, cx| {
+                if w.lost != lost {
+                    w.lost = lost;
+                    cx.notify();
+                }
+            });
+            if updated.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Opens a script on a connection (and database), connecting first when needed.
+    fn new_script_on(&mut self, id: String, database: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_connection(id, cx);
+        if let Some(database) = database {
+            self.select_database(database, cx);
+        }
+        if self.open_connection().is_some() {
+            self.new_script(&NewScript, window, cx);
+        } else {
+            self.script_after_connect = self.target().map(|(_, key)| key);
+        }
+    }
+
+    /// The pending "New SQL Script", once its connection is open (or dropped when it failed).
+    fn open_pending_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.script_after_connect.clone() else { return };
+        if self.target().map(|(_, k)| k).as_ref() != Some(&key) || matches!(self.schemas, Load::Failed(_)) {
+            self.script_after_connect = None;
+        } else if self.open.contains_key(&key) {
+            self.script_after_connect = None;
+            self.new_script(&NewScript, window, cx);
+        }
+    }
+
+    /// The databases listed under `config` in the sidebar: once listed, and only when there's a choice.
+    fn sidebar_databases(&self, config: &ConnectionConfig) -> Option<&Vec<String>> {
+        self.databases.get(&config.id).filter(|d| d.len() > 1 && Self::browses_databases(config))
+    }
+
+    fn shows_databases(&self, config: &ConnectionConfig) -> bool {
+        self.expanded.contains(&config.id) && self.sidebar_databases(config).is_some()
+    }
+
+    /// The highlighted sidebar row: the shown database's while its connection is expanded.
+    fn selected_row(&self) -> Option<SidebarRow> {
+        let config = self.selected_connection()?;
+        let database = self.sidebar_databases(config).filter(|d| self.shows_databases(config) && d.contains(&self.database));
+        Some((config.id.clone(), database.map(|_| self.database.clone())))
+    }
+
+    /// The connections in sidebar order, by group (empty group: "Connections").
+    fn grouped_connections(&self) -> Vec<(String, Vec<&ConnectionConfig>)> {
+        let mut groups: Vec<(String, Vec<&ConnectionConfig>)> = Vec::new();
+        for c in &self.connections {
+            match groups.iter_mut().find(|(g, _)| *g == c.group) {
+                Some((_, list)) => list.push(c),
+                None => groups.push((c.group.clone(), vec![c])),
+            }
+        }
+        groups
+    }
+
+    fn visible_sidebar_rows(&self) -> Vec<SidebarRow> {
+        let mut rows = Vec::new();
+        for (group, connections) in self.grouped_connections() {
+            if self.collapsed_groups.contains(&group) {
+                continue;
+            }
+            for c in connections {
+                rows.push((c.id.clone(), None));
+                if self.shows_databases(c) {
+                    rows.extend(self.sidebar_databases(c).into_iter().flatten().map(|d| (c.id.clone(), Some(d.clone()))));
+                }
+            }
+        }
+        rows
+    }
+
+    fn select_row(&mut self, (id, database): SidebarRow, cx: &mut Context<Self>) {
+        self.select_connection(id, cx);
+        if let Some(database) = database {
+            self.select_database(database, cx);
+        }
+        cx.notify();
+    }
+
+    /// The tables the tables column shows, in order.
+    fn visible_tables(&self) -> Vec<TableInfo> {
+        let Load::Loaded(schemas) = &self.schemas else { return Vec::new() };
+        schemas
+            .iter()
+            .filter(|s| !self.collapsed.contains(&s.name))
+            .flat_map(|s| s.tables.iter().filter(|t| !self.tables_only || t.kind == TableKind::Table))
+            .cloned()
+            .collect()
+    }
+
+    /// The table of the active tab, when it's on the shown connection and database.
+    fn active_table(&self, cx: &App) -> Option<TableInfo> {
+        self.tabs.get(self.active).filter(|tab| self.target().is_some_and(|(_, key)| key == tab.key)).and_then(|tab| tab.table(cx))
+    }
+
+    /// ↑ / ↓ in the focused list.
+    fn move_selection(&mut self, list: List, offset: isize, window: &mut Window, cx: &mut Context<Self>) {
+        fn step<T: PartialEq + Clone>(items: &[T], current: Option<&T>, offset: isize) -> Option<T> {
+            let ix = match current.and_then(|c| items.iter().position(|i| i == c)) {
+                Some(ix) => ix.checked_add_signed(offset).filter(|&ix| ix < items.len())?,
+                None if offset > 0 => 0,
+                None => items.len().checked_sub(1)?,
+            };
+            items.get(ix).cloned()
+        }
+        match list {
+            List::Connections => {
+                let rows = self.visible_sidebar_rows();
+                let Some(next) = step(&rows, self.selected_row().as_ref(), offset) else { return };
+                self.select_row(next, cx);
+            }
+            List::Tables => {
+                let tables = self.visible_tables();
+                let Some(next) = step(&tables, self.active_table(cx).as_ref(), offset) else { return };
+                self.open_table(next, false, window, cx);
+                // Opening the tab focuses its grid: the arrows stay with the list.
+                self.tables_focus.focus(window, cx);
+            }
+            List::Roles => {
+                let Some(state) = self.selected_connection().and_then(|c| self.users_shown(c, cx)) else { return };
+                let roles: Vec<_> = state.read(cx).visible_roles(cx).iter().map(|r| r.reference()).collect();
+                let Some(next) = step(&roles, state.read(cx).selected.as_ref(), offset) else { return };
+                self.show_role(next, window, cx);
+                self.roles_focus.focus(window, cx);
+            }
+        }
+        self.reveal.set(Some(list));
+        cx.notify();
+    }
+
+    /// Scrolls `list` to child `ix` when the arrow keys just moved its selection there.
+    fn reveal_child(&self, list: List, ix: Option<usize>) {
+        if let (true, Some(ix)) = (self.reveal.get() == Some(list), ix) {
+            self.reveal.set(None);
+            let handle = match list {
+                List::Connections => &self.connections_scroll,
+                List::Tables => &self.tables_scroll,
+                List::Roles => &self.roles_scroll,
+            };
+            handle.scroll_to_item(ix);
+        }
+    }
+
+    /// Handles a File/View menu action meant for the active table tab.
+    fn with_active_table(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut TableTab, &mut Window, &mut Context<TableTab>)) {
+        if let Some(TabView::Table(tab)) = self.tabs.get(self.active).map(|t| &t.view) {
+            tab.clone().update(cx, |tab, cx| f(tab, window, cx));
+        }
+    }
+
+    fn show_users(&mut self, _: &ShowUsers, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_connection().is_some_and(|c| dbcore::access::features(c.kind).is_some()) {
+            self.users_mode = true;
+            cx.notify();
+        }
+    }
+
     fn toggle_schema(&mut self, name: &str, cx: &mut Context<Self>) {
         if !self.collapsed.remove(name) {
             self.collapsed.insert(name.to_string());
@@ -1571,7 +1852,19 @@ impl Workspace {
         let selected = s.selected.clone().filter(|_| tab_active);
         let show_system = s.show_system;
         let empty = if s.search.read(cx).value().trim().is_empty() { format!("No {}s", users::noun(kind)) } else { "No Matches".to_string() };
-        let mut list = v_flex().id("roles").size_full().p_2().gap_px().overflow_y_scrollbar();
+        let mut list = v_flex()
+            .id("roles")
+            .size_full()
+            .p_2()
+            .gap_px()
+            .key_context("RoleList")
+            .track_focus(&self.roles_focus)
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| this.move_selection(List::Roles, -1, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| this.move_selection(List::Roles, 1, window, cx)))
+            .overflow_y_scroll()
+            .track_scroll(&self.roles_scroll);
+        let selected_ix = roles.iter().position(|r| selected.as_ref() == Some(&r.reference()));
+        self.reveal_child(List::Roles, selected_ix);
         for role in &roles {
             let reference = role.reference();
             let is_selected = selected.as_ref() == Some(&reference);
@@ -1589,7 +1882,10 @@ impl Workspace {
                     .when(role.is_superuser, |r| r.child(Icon::new(AssetIcon::Zap).xsmall().text_color(theme.warning)))
                     .on_click({
                         let reference = reference.clone();
-                        cx.listener(move |this, _, window, cx| this.show_role(reference.clone(), window, cx))
+                        cx.listener(move |this, _, window, cx| {
+                            this.show_role(reference.clone(), window, cx);
+                            this.roles_focus.focus(window, cx);
+                        })
                     })
                     .context_menu({
                         let (this, state, role) = (cx.entity().downgrade(), state.clone(), role.clone());
@@ -1647,125 +1943,69 @@ impl Workspace {
                             }),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(list))
+            .child(div().flex_1().min_h_0().child(list.vertical_scrollbar(&self.roles_scroll)))
             .into_any_element()
     }
 
     // MARK: columns
 
     fn render_connections(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let mut groups: Vec<(String, Vec<&ConnectionConfig>)> = Vec::new();
-        for c in &self.connections {
-            match groups.iter_mut().find(|(g, _)| *g == c.group) {
-                Some((_, list)) => list.push(c),
-                None => groups.push((c.group.clone(), vec![c])),
+        let theme = cx.theme().clone();
+        let theme = &theme;
+        let selected_row = self.selected_row();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        // The selected row's index among `rows`, to scroll to it after an arrow key.
+        let mut selected_ix = None;
+        for (group, connections) in self.grouped_connections() {
+            let collapsed = self.collapsed_groups.contains(&group);
+            let title = if group.is_empty() { "Connections".to_string() } else { group.clone() };
+            rows.push(group_header(title, collapsed, theme).on_click(cx.listener(move |this, _, _, cx| {
+                if !this.collapsed_groups.remove(&group) {
+                    this.collapsed_groups.insert(group.clone());
+                }
+                cx.notify();
+            })).into_any_element());
+            if collapsed {
+                continue;
             }
-        }
-        let mut list = v_flex().id("connections").size_full().p_2().gap_px().overflow_y_scrollbar();
-        for (group, connections) in groups {
-            let title = if group.is_empty() { "Connections".to_string() } else { group };
-            list = list.child(section_header(title, theme.muted_foreground));
             for c in connections {
-                let selected = self.selected.as_deref() == Some(c.id.as_str());
-                let connected = self.open.keys().any(|(id, _)| *id == c.id);
-                let id = c.id.clone();
-                list = list.child(
-                    row(SharedString::from(format!("conn-{}", c.id)), selected, cx)
-                        .child(crate::assets::kind_icon(c.kind).small().text_color(if selected {
-                            theme.primary
-                        } else {
-                            theme.muted_foreground
-                        }))
-                        .child(div().flex_1().truncate().child(c.name.clone()))
-                        .when(connected, |row| row.child(connected_indicator(SharedString::from(format!("lit-{}", c.id)), theme.green)))
-                        .tooltip({
-                            let summary = SharedString::from(c.summary());
-                            move |window, cx| Tooltip::new(summary.clone()).build(window, cx)
-                        })
-                        .on_click({
-                            let id = id.clone();
-                            cx.listener(move |this, _, _, cx| this.select_connection(id.clone(), cx))
-                        })
-                        .context_menu({
-                            let this = cx.entity().downgrade();
-                            let config = c.clone();
-                            move |menu, _, _| {
-                                let (edit, delete) = (this.clone(), this.clone());
-                                let (connect, duplicate, copy_url, refresh) = (this.clone(), this.clone(), this.clone(), this.clone());
-                                let (config, id) = (config.clone(), config.id.clone());
-                                let import = this.clone();
-                                let (connect_id, refresh_id) = (id.clone(), id.clone());
-                                let (duplicate_config, url_config) = (config.clone(), config.clone());
-                                let menu = if connected {
-                                    menu.item(PopupMenuItem::new("Disconnect").on_click(move |_, _, cx| {
-                                        connect.update(cx, |w, cx| w.disconnect(&connect_id, cx)).ok();
-                                    }))
-                                    .item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
-                                        let id = refresh_id.clone();
-                                        refresh.update(cx, |w, cx| {
-                                            w.select_connection(id, cx);
-                                            w.load_schemas_with(true, false, cx);
-                                        })
-                                        .ok();
-                                    }))
-                                } else {
-                                    menu.item(PopupMenuItem::new("Connect").on_click(move |_, _, cx| {
-                                        let id = connect_id.clone();
-                                        connect.update(cx, |w, cx| w.connect(id, cx)).ok();
-                                    }))
-                                };
-                                let new_database = this.clone();
-                                let new_database_config = config.clone();
-                                let (dump_this, dump_config) = (this.clone(), config.clone());
-                                let menu = menu.when(config.supports_multiple_databases(), |menu| {
-                                    menu.item(PopupMenuItem::new("New Database…").on_click(move |_, window, cx| {
-                                        let config = new_database_config.clone();
-                                        new_database.update(cx, |w, cx| w.open_new_database(config, window, cx)).ok();
-                                    }))
-                                });
-                                menu.separator()
-                                .item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
-                                    let config = config.clone();
-                                    edit.update(cx, |w, cx| w.open_editor(Some(config), window, cx)).ok();
-                                }))
-                                .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
-                                    let config = duplicate_config.clone();
-                                    duplicate.update(cx, |w, cx| w.duplicate(config, cx)).ok();
-                                }))
-                                .item(PopupMenuItem::new("Copy URL").on_click(move |_, _, cx| {
-                                    let config = url_config.clone();
-                                    copy_url.update(cx, |w, cx| w.copy_url(config, cx)).ok();
-                                }))
-                                .separator()
-                                .item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
-                                    let id = id.clone();
-                                    delete.update(cx, |w, cx| w.confirm_delete(id, window, cx)).ok();
-                                }))
-                                .separator()
-                                .item(PopupMenuItem::new("Dump Database…").on_click({
-                                    let (this, config) = (dump_this.clone(), dump_config.clone());
-                                    move |_, window, cx| {
-                                        let config = config.clone();
-                                        this.update(cx, |w, cx| w.open_dump(config, DumpPreset::Database, window, cx)).ok();
-                                    }
-                                }))
-                                .item(PopupMenuItem::new("Restore from File…").on_click({
-                                    let (this, config) = (dump_this.clone(), dump_config.clone());
-                                    move |_, window, cx| {
-                                        let config = config.clone();
-                                        this.update(cx, |w, cx| w.open_restore(config, window, cx)).ok();
-                                    }
-                                }))
-                                .separator()
-                                .item(PopupMenuItem::new("Import from DBeaver…").on_click(move |_, window, cx| {
-                                    import.update(cx, |w, cx| w.open_import(window, cx)).ok();
-                                }))
-                            }
-                        }),
-                );
+                let row_id: SidebarRow = (c.id.clone(), None);
+                let selected = selected_row.as_ref() == Some(&row_id);
+                if selected {
+                    selected_ix = Some(rows.len());
+                }
+                rows.push(self.connection_row(c, selected, cx).into_any_element());
+                if !self.shows_databases(c) {
+                    continue;
+                }
+                for database in self.sidebar_databases(c).into_iter().flatten() {
+                    let row_id: SidebarRow = (c.id.clone(), Some(database.clone()));
+                    let selected = selected_row.as_ref() == Some(&row_id);
+                    if selected {
+                        selected_ix = Some(rows.len());
+                    }
+                    rows.push(self.database_row(c, database, selected, cx).into_any_element());
+                }
             }
         }
+        self.reveal_child(List::Connections, selected_ix);
+        let mut list = v_flex()
+            .id("connections")
+            .size_full()
+            .p_2()
+            .gap_px()
+            .key_context("ConnectionList")
+            .track_focus(&self.connections_focus)
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| this.move_selection(List::Connections, -1, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| this.move_selection(List::Connections, 1, window, cx)))
+            .on_action(cx.listener(|this, _: &DeleteSelected, window, cx| {
+                if let (Some(id), false) = (this.selected.clone(), this.showing_samples) {
+                    this.confirm_delete(id, window, cx);
+                }
+            }))
+            .overflow_y_scroll()
+            .track_scroll(&self.connections_scroll)
+            .children(rows);
         let notices = self
             .showing_samples
             .then(|| "No saved connections yet; showing the samples.".to_string())
@@ -1785,6 +2025,7 @@ impl Workspace {
                 ),
             );
         }
+        let list = list.vertical_scrollbar(&self.connections_scroll);
         v_flex().size_full().bg(theme.sidebar).child(div().flex_1().min_h_0().child(list)).child(
             h_flex().p_2().border_t_1().border_color(theme.sidebar_border).child(
                 Button::new("new-connection")
@@ -1804,6 +2045,168 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, window, cx| this.open_import(window, cx))),
             ),
         )
+    }
+
+    /// A connection in the sidebar: engine logo, name, then two fixed slots so status lights and
+    /// warnings line up in one column: the status, and the chevron that lists its databases.
+    fn connection_row(&self, c: &ConnectionConfig, selected: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme().clone();
+        let connected = self.open.keys().any(|(id, _)| *id == c.id);
+        let lit = connected && !self.lost.contains(&c.id);
+        let failed = !connected && self.failed.contains(&c.id);
+        let expandable = self.sidebar_databases(c).is_some();
+        let expanded = self.expanded.contains(&c.id);
+        let id = c.id.clone();
+        let status = div()
+            .flex_shrink_0()
+            .w(px(18.))
+            .flex()
+            .justify_center()
+            .when(lit, |slot| slot.child(connected_indicator(SharedString::from(format!("lit-{}", c.id)), theme.green)))
+            .when(failed, |slot| slot.child(Icon::new(IconName::TriangleAlert).xsmall().text_color(theme.muted_foreground)));
+        let chevron = div().flex_shrink_0().w(px(16.)).flex().justify_center().when(expandable, |slot| {
+            let id = id.clone();
+            slot.child(
+                Button::new(SharedString::from(format!("expand-{id}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }).text_color(theme.muted_foreground))
+                    .tooltip(if expanded { "Hide Databases" } else { "Show Databases" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if !this.expanded.remove(&id) {
+                            this.expanded.insert(id.clone());
+                        }
+                        cx.notify();
+                    })),
+            )
+        });
+        row(SharedString::from(format!("conn-{}", c.id)), selected, cx)
+            .child(crate::assets::kind_icon(c.kind).small().text_color(if selected { theme.primary } else { theme.muted_foreground }))
+            .child(div().flex_1().truncate().child(c.name.clone()))
+            .child(status)
+            .child(chevron)
+            .tooltip({
+                let summary = SharedString::from(if failed { format!("{} · Couldn’t connect", c.summary()) } else { c.summary() });
+                move |window, cx| Tooltip::new(summary.clone()).build(window, cx)
+            })
+            .on_click({
+                let id = id.clone();
+                cx.listener(move |this, _, window, cx| {
+                    this.select_connection(id.clone(), cx);
+                    this.connections_focus.focus(window, cx);
+                    cx.notify();
+                })
+            })
+            .context_menu({
+                let this = cx.entity().downgrade();
+                let config = c.clone();
+                move |menu, _, _| {
+                    let (edit, delete) = (this.clone(), this.clone());
+                    let (connect, duplicate, copy_url, refresh) = (this.clone(), this.clone(), this.clone(), this.clone());
+                    let (config, id) = (config.clone(), config.id.clone());
+                    let import = this.clone();
+                    let (connect_id, refresh_id, script_id) = (id.clone(), id.clone(), id.clone());
+                    let script = this.clone();
+                    let (duplicate_config, url_config) = (config.clone(), config.clone());
+                    let menu = if connected {
+                        menu.item(PopupMenuItem::new("Disconnect").on_click(move |_, _, cx| {
+                            connect.update(cx, |w, cx| w.disconnect(&connect_id, cx)).ok();
+                        }))
+                        .item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
+                            let id = refresh_id.clone();
+                            refresh
+                                .update(cx, |w, cx| {
+                                    w.select_connection(id, cx);
+                                    w.load_schemas_with(true, false, cx);
+                                })
+                                .ok();
+                        }))
+                    } else {
+                        menu.item(PopupMenuItem::new("Connect").on_click(move |_, _, cx| {
+                            let id = connect_id.clone();
+                            connect.update(cx, |w, cx| w.connect(id, cx)).ok();
+                        }))
+                    };
+                    let menu = menu.item(PopupMenuItem::new("New SQL Script").on_click(move |_, window, cx| {
+                        let id = script_id.clone();
+                        script.update(cx, |w, cx| w.new_script_on(id, None, window, cx)).ok();
+                    }));
+                    let new_database = this.clone();
+                    let new_database_config = config.clone();
+                    let (dump_this, dump_config) = (this.clone(), config.clone());
+                    let menu = menu.when(config.supports_multiple_databases(), |menu| {
+                        menu.item(PopupMenuItem::new("New Database…").on_click(move |_, window, cx| {
+                            let config = new_database_config.clone();
+                            new_database.update(cx, |w, cx| w.open_new_database(config, window, cx)).ok();
+                        }))
+                    });
+                    menu.separator()
+                        .item(PopupMenuItem::new("Edit…").on_click(move |_, window, cx| {
+                            let config = config.clone();
+                            edit.update(cx, |w, cx| w.open_editor(Some(config), window, cx)).ok();
+                        }))
+                        .item(PopupMenuItem::new("Duplicate").on_click(move |_, _, cx| {
+                            let config = duplicate_config.clone();
+                            duplicate.update(cx, |w, cx| w.duplicate(config, cx)).ok();
+                        }))
+                        .item(PopupMenuItem::new("Copy URL").on_click(move |_, _, cx| {
+                            let config = url_config.clone();
+                            copy_url.update(cx, |w, cx| w.copy_url(config, cx)).ok();
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
+                            let id = id.clone();
+                            delete.update(cx, |w, cx| w.confirm_delete(id, window, cx)).ok();
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new("Dump Database…").on_click({
+                            let (this, config) = (dump_this.clone(), dump_config.clone());
+                            move |_, window, cx| {
+                                let config = config.clone();
+                                this.update(cx, |w, cx| w.open_dump(config, DumpPreset::Database, window, cx)).ok();
+                            }
+                        }))
+                        .item(PopupMenuItem::new("Restore from File…").on_click({
+                            let (this, config) = (dump_this.clone(), dump_config.clone());
+                            move |_, window, cx| {
+                                let config = config.clone();
+                                this.update(cx, |w, cx| w.open_restore(config, window, cx)).ok();
+                            }
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new("Import from DBeaver…").on_click(move |_, window, cx| {
+                            import.update(cx, |w, cx| w.open_import(window, cx)).ok();
+                        }))
+                }
+            })
+    }
+
+    /// One of an expanded connection's databases, under it in the sidebar.
+    fn database_row(&self, c: &ConnectionConfig, database: &str, selected: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme().clone();
+        let tooltip = SharedString::from(if database == c.default_database() { format!("{database} (default)") } else { database.to_string() });
+        let row_id: SidebarRow = (c.id.clone(), Some(database.to_string()));
+        let script_row = row_id.clone();
+        row(SharedString::from(format!("db-{}-{database}", c.id)), selected, cx)
+            .pl(px(28.))
+            .child(Icon::new(AssetIcon::Database).small().text_color(if selected { theme.primary } else { theme.muted_foreground }))
+            .child(div().flex_1().truncate().child(database.to_string()))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_row(row_id.clone(), cx);
+                this.connections_focus.focus(window, cx);
+            }))
+            .context_menu({
+                let this = cx.entity().downgrade();
+                move |menu, _, _| {
+                    let (this, (id, database)) = (this.clone(), script_row.clone());
+                    menu.item(PopupMenuItem::new("New SQL Script").on_click(move |_, window, cx| {
+                        let (id, database) = (id.clone(), database.clone());
+                        this.update(cx, |w, cx| w.new_script_on(id, database, window, cx)).ok();
+                    }))
+                }
+            })
     }
 
     fn render_tables(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1867,11 +2270,7 @@ impl Workspace {
             None => div().font_semibold().truncate().child(connection.name.clone()).into_any_element(),
         };
         let connected = self.open_connection().is_some();
-        let active_table = self
-            .tabs
-            .get(self.active)
-            .filter(|tab| self.target().is_some_and(|(_, key)| key == tab.key))
-            .and_then(|tab| tab.table(cx));
+        let active_table = self.active_table(cx);
         let header = v_flex()
             .px_3()
             .py_2()
@@ -1983,7 +2382,19 @@ impl Workspace {
                 .child(div().text_sm().text_color(theme.muted_foreground).text_center().child(message.clone()))
                 .into_any_element(),
             Load::Loaded(schemas) => {
-                let mut list = v_flex().id("tables").size_full().p_2().gap_px().overflow_y_scrollbar();
+                let mut list = v_flex()
+                    .id("tables")
+                    .size_full()
+                    .p_2()
+                    .gap_px()
+                    .key_context("TableList")
+                    .track_focus(&self.tables_focus)
+                    .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| this.move_selection(List::Tables, -1, window, cx)))
+                    .on_action(cx.listener(|this, _: &SelectNext, window, cx| this.move_selection(List::Tables, 1, window, cx)))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.tables_scroll);
+                let mut children = 0;
+                let mut selected_ix = None;
                 for schema in schemas {
                     let collapsed = self.collapsed.contains(&schema.name);
                     let name = schema.name.clone();
@@ -2010,11 +2421,16 @@ impl Workspace {
                                 }
                             }),
                     );
+                    children += 1;
                     if collapsed {
                         continue;
                     }
                     for table in schema.tables.iter().filter(|t| !self.tables_only || t.kind == TableKind::Table) {
                         let selected = active_table.as_ref() == Some(table);
+                        if selected {
+                            selected_ix = Some(children);
+                        }
+                        children += 1;
                         let open = table.clone();
                         let icon = if table.kind == TableKind::View { IconName::Eye } else { IconName::FileText };
                         list = list.child(
@@ -2029,7 +2445,12 @@ impl Workspace {
                                     div().text_xs().text_color(theme.muted_foreground).child(count(n))
                                 }))
                                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                                    this.open_table(open.clone(), event.click_count() >= 2, window, cx)
+                                    this.open_table(open.clone(), event.click_count() >= 2, window, cx);
+                                    // A single click keeps the arrow keys on the list; a double click
+                                    // (keep the tab open) goes to its rows.
+                                    if event.click_count() < 2 {
+                                        this.tables_focus.focus(window, cx);
+                                    }
                                 }))
                                 .context_menu({
                                     let (this, config, table) = (cx.entity().downgrade(), connection.clone(), table.clone());
@@ -2044,7 +2465,8 @@ impl Workspace {
                         );
                     }
                 }
-                list.into_any_element()
+                self.reveal_child(List::Tables, selected_ix);
+                list.vertical_scrollbar(&self.tables_scroll).into_any_element()
             }
         };
         v_flex().size_full().bg(theme.background).child(header).child(div().flex_1().min_h_0().child(body))
@@ -2121,7 +2543,8 @@ impl Render for Workspace {
         if self.users_mode {
             self.sync_users(window, cx);
         }
-        div()
+        self.open_pending_script(window, cx);
+        v_flex()
             .size_full()
             .relative()
             .key_context("Workspace")
@@ -2142,13 +2565,34 @@ impl Render for Workspace {
                 let last = this.tabs.len().saturating_sub(1);
                 this.select_tab(last, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &NewConnection, window, cx| this.open_editor(None, window, cx)))
+            .on_action(cx.listener(|this, _: &EditConnection, window, cx| {
+                if let Some(config) = this.selected_connection().cloned() {
+                    this.open_editor(Some(config), window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ImportConnections, window, cx| this.open_import(window, cx)))
+            .on_action(cx.listener(Self::show_users))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(|this, _: &ShowData, window, cx| this.with_active_table(window, cx, |t, w, cx| t.show_structure(false, w, cx))))
+            .on_action(cx.listener(|this, _: &ShowStructure, window, cx| this.with_active_table(window, cx, |t, w, cx| t.show_structure(true, w, cx))))
+            .on_action(cx.listener(|this, _: &AddRow, window, cx| this.with_active_table(window, cx, |t, w, cx| t.add_row_from_menu(w, cx))))
+            .children(self.menu_bar.clone().map(|bar| {
+                div().flex_shrink_0().h(px(30.)).px_1().border_b_1().border_color(cx.theme().border).bg(cx.theme().title_bar).child(bar)
+            }))
             .child(
-                h_resizable("workspace")
-                    .child(
-                        resizable_panel().size(px(240.)).size_range(px(180.)..px(400.)).child(self.render_connections(cx)),
-                    )
-                    .child(resizable_panel().size(px(300.)).size_range(px(200.)..px(520.)).child(self.render_tables(cx)))
-                    .child(resizable_panel().child(self.render_tabs(cx))),
+                div().flex_1().min_h_0().child(
+                    h_resizable("workspace")
+                        .child(
+                            resizable_panel()
+                                .visible(self.sidebar_visible)
+                                .size(px(240.))
+                                .size_range(px(180.)..px(400.))
+                                .child(self.render_connections(cx)),
+                        )
+                        .child(resizable_panel().size(px(300.)).size_range(px(200.)..px(520.)).child(self.render_tables(cx)))
+                        .child(resizable_panel().child(self.render_tabs(cx))),
+                ),
             )
             // Running and finished dumps/restores, over the bottom-right corner.
             .child(div().absolute().bottom_4().right_4().child(self.backups.clone()))
@@ -2163,8 +2607,25 @@ fn open_store() -> dbcore::Result<ConnectionStore> {
     }
 }
 
-fn section_header(title: String, color: Hsla) -> impl IntoElement {
-    div().mt_3().mb_1().px_2().text_xs().font_semibold().text_color(color).child(title)
+/// A sidebar group's header (Local, Production…). Clicking it folds the group, like Mail's; the
+/// chevron shows on hover, and stays while the group is folded.
+fn group_header(title: String, collapsed: bool, theme: &gpui_kit::component::Theme) -> Stateful<Div> {
+    let group = SharedString::from(format!("group-{title}"));
+    h_flex()
+        .id(group.clone())
+        .group(group.clone())
+        .mt_3()
+        .mb_1()
+        .px_2()
+        .text_xs()
+        .font_semibold()
+        .text_color(theme.muted_foreground)
+        .child(div().flex_1().truncate().child(title))
+        .child(
+            div()
+                .when(!collapsed, |d| d.invisible().group_hover(group, |s| s.visible()))
+                .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).xsmall()),
+        )
 }
 
 /// A selectable list row, Mail-style: soft background when selected.

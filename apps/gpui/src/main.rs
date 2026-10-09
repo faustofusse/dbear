@@ -7,6 +7,7 @@ mod connection_editor;
 mod grid;
 mod inspector;
 mod keys;
+mod menus;
 mod new_database;
 mod highlight;
 mod import_dialog;

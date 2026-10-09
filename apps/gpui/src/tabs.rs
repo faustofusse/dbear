@@ -54,7 +54,11 @@ actions!(
         CancelScript,
         CopySelection,
         CopySelectionWithHeaders,
+        CopyValue,
         ToggleInspector,
+        ShowData,
+        ShowStructure,
+        AddRow,
         CancelEdit,
         DeleteRow,
         SaveEdits,
@@ -98,6 +102,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-.", CancelScript, Some("ResultTab")),
         KeyBinding::new("secondary-c", CopySelection, Some("DataTable")),
         KeyBinding::new("shift-secondary-c", CopySelectionWithHeaders, Some("DataTable")),
+        KeyBinding::new("alt-secondary-c", CopyValue, Some("DataTable")),
+        // Like the macOS app's View and File menus; the workspace hands them to the active table tab.
+        KeyBinding::new("alt-secondary-1", ShowData, Some("Workspace")),
+        KeyBinding::new("alt-secondary-2", ShowStructure, Some("Workspace")),
+        KeyBinding::new("alt-secondary-n", AddRow, Some("Workspace")),
         KeyBinding::new("alt-secondary-i", ToggleInspector, None),
         KeyBinding::new("escape", CancelEdit, Some("CellEditor > Input")),
         KeyBinding::new("enter", StartEdit, Some("DataTable")),
@@ -106,6 +115,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-backspace", DeleteRow, Some("DataTable")),
         KeyBinding::new("secondary-s", SaveEdits, Some("TableTab")),
         KeyBinding::new("secondary-s", SaveEdits, Some("Results")),
+        KeyBinding::new("shift-secondary-s", SaveEdits, Some("TableTab")),
+        KeyBinding::new("shift-secondary-s", SaveEdits, Some("Results")),
         KeyBinding::new("secondary-=", ZoomIn, Some("ScriptTab")),
         KeyBinding::new("secondary-+", ZoomIn, Some("ScriptTab")),
         KeyBinding::new("secondary--", ZoomOut, Some("ScriptTab")),
@@ -125,6 +136,18 @@ fn copy_selection(grid: &Entity<TableState<RowsDelegate>>, headers: bool, cx: &m
     let text = match state.selection() {
         gpui_kit::component::table::TableSelection::Cell(row, col) if !headers => rows.value_text(row, col),
         selection => RowsDelegate::selected_row(selection).map(|row| rows.format(&[row], CopyFormat::Tsv, headers)),
+    };
+    if let Some(text) = text {
+        copy(text, cx);
+    }
+}
+
+/// ⌥⌘C: the selected cell's value, also when the whole row is selected (its first column then).
+fn copy_value(grid: &Entity<TableState<RowsDelegate>>, cx: &mut App) {
+    let state = grid.read(cx);
+    let text = match state.selection() {
+        gpui_kit::component::table::TableSelection::Cell(row, col) => state.delegate().value_text(row, col),
+        selection => RowsDelegate::selected_row(selection).and_then(|row| state.delegate().value_text(row, 0)),
     };
     if let Some(text) = text {
         copy(text, cx);
@@ -452,6 +475,23 @@ impl TableTab {
         self.editor.focus_grid(window, cx);
     }
 
+    /// Adds a row (⌥⌘N), switching to the data first. Nothing when the table can't be edited.
+    pub fn add_row_from_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editable = matches!(self.rows, Load::Loaded) && self.grid.read(cx).delegate().read_only_reason().is_none();
+        if !editable {
+            return;
+        }
+        if self.mode != Mode::Data {
+            self.set_mode(Mode::Data, window, cx);
+        }
+        self.add_row(window, cx);
+    }
+
+    /// ⌥⌘1 / ⌥⌘2: the rows or the table's structure.
+    pub fn show_structure(&mut self, structure: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(if structure { Mode::Structure } else { Mode::Data }, window, cx);
+    }
+
     fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (row, col) = self.grid.update(cx, |state, cx| {
             let grid = state.delegate_mut();
@@ -722,6 +762,7 @@ impl Render for TableTab {
             .key_context("TableTab")
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| copy_selection(&this.grid, false, cx)))
             .on_action(cx.listener(|this, _: &CopySelectionWithHeaders, _, cx| copy_selection(&this.grid, true, cx)))
+            .on_action(cx.listener(|this, _: &CopyValue, _, cx| copy_value(&this.grid, cx)))
             .on_action(cx.listener(|this, _: &CancelEdit, window, cx| this.editor.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &StartEdit, window, cx| {
                 if this.editor.start(window, cx, |this: &mut Self| &mut this.editor) {
@@ -1337,6 +1378,7 @@ impl Render for Results {
             .key_context("Results")
             .on_action(cx.listener(|this, _: &CopySelection, _, cx| copy_selection(&this.grid, false, cx)))
             .on_action(cx.listener(|this, _: &CopySelectionWithHeaders, _, cx| copy_selection(&this.grid, true, cx)))
+            .on_action(cx.listener(|this, _: &CopyValue, _, cx| copy_value(&this.grid, cx)))
             .on_action(cx.listener(|this, _: &CancelEdit, window, cx| this.editor.cancel(window, cx)))
             .on_action(cx.listener(|this, _: &StartEdit, window, cx| {
                 this.editor.start(window, cx, |this: &mut Self| &mut this.editor);
