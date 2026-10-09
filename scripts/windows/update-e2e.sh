@@ -18,7 +18,8 @@ PORT="${PORT:-18732}"
 OLD=8.9.0
 NEW=9.0.0
 FEED="http://127.0.0.1:$PORT"
-APP="$INSTALL_WIN\\dbear.exe"
+# Git Bash would turn /S, /D=… and /v into paths.
+export MSYS_NO_PATHCONV=1
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 run() { if [[ -n "$RUN" ]]; then "$RUN" "$@"; else "$@"; fi; }
@@ -27,6 +28,10 @@ posix() {
     if [[ -n "$RUN" ]]; then winepath -u "$1" 2>/dev/null
     else cygpath -u "$1"; fi
 }
+dir="$(posix "$INSTALL_WIN")"
+# The installed app, as this shell runs it (Wine takes the Windows path).
+if [[ -n "$RUN" ]]; then APP="$INSTALL_WIN\\dbear.exe"; UNINSTALL="$INSTALL_WIN\\uninstall.exe"
+else APP="$dir/dbear.exe"; UNINSTALL="$dir/uninstall.exe"; fi
 version() { run "$APP" --version 2>/dev/null | tr -d '\r' | sed -n 's/^dbear //p'; }
 registry_version() {
     run reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\dbear' /v DisplayVersion 2>/dev/null |
@@ -41,16 +46,13 @@ sleep 1
 NO_INSTALLER="${NO_INSTALLER:-0}"
 if [[ $NO_INSTALLER == 1 ]]; then
     echo "== install $OLD (copy; no 32-bit installer here)"
-    run cmd /c "mkdir $INSTALL_WIN" >/dev/null 2>&1 || true
-    dir="$(posix "$INSTALL_WIN")"
+    mkdir -p "$dir"
     cp "$WORK/old.exe" "$dir/dbear.exe"
     : >"$dir/uninstall.exe"
     [[ "$(version)" == "$OLD" ]] || fail "installed version: '$(version)'"
 else
     echo "== install $OLD (silent, per user)"
-    # MSYS would turn /S and /D=… into paths; keep them as they are.
-    MSYS_NO_PATHCONV=1 run "$WORK/old-setup.exe" /S "/D=$INSTALL_WIN"
-    dir="$(posix "$INSTALL_WIN")"
+    run "$WORK/old-setup.exe" /S "/D=$INSTALL_WIN"
     for _ in $(seq 30); do [[ -f "$dir/dbear.exe" && -f "$dir/uninstall.exe" ]] && break; sleep 1; done
     [[ -f "$dir/uninstall.exe" ]] || fail "installer didn't write $INSTALL_WIN"
     [[ "$(version)" == "$OLD" ]] || fail "installed version: '$(version)'"
@@ -59,8 +61,8 @@ fi
 echo "   ok: $(version) in $INSTALL_WIN"
 
 update() { # <feed dir> → exit code of dbear --update
-    local code attempt
-    for attempt in 1 2 3; do
+    local code
+    for _ in 1 2 3; do
         code=0
         DBEAR_UPDATE_FEED="$FEED/$1/dbear-update-windows.json" run "$APP" --update >"$WORK/$1.log" 2>&1 || code=$?
         sed 's/^/   | /' "$WORK/$1.log"
@@ -90,7 +92,7 @@ echo "== portable copy"
 portable="$WORK/portable"
 mkdir -p "$portable" && cp "$dir/dbear.exe" "$portable/dbear.exe"
 code=0; DBEAR_UPDATE_FEED="$FEED/good/dbear-update-windows.json" run "$portable/dbear.exe" --update >"$WORK/portable.log" 2>&1 || code=$?
-[[ $code == 1 ]] && grep -q portable "$WORK/portable.log" || fail "portable: exit $code: $(cat "$WORK/portable.log")"
+if [[ $code != 1 ]] || ! grep -q portable "$WORK/portable.log"; then fail "portable: exit $code: $(cat "$WORK/portable.log")"; fi
 echo "   ok: doesn't install"
 
 echo "== good update"
@@ -115,7 +117,7 @@ code=0; update good || code=$?
 echo "   ok"
 
 echo "== uninstall"
-MSYS_NO_PATHCONV=1 run "$INSTALL_WIN\\uninstall.exe" /S
+run "$UNINSTALL" /S
 for _ in $(seq 60); do [[ ! -f "$dir/dbear.exe" ]] && break; sleep 1; done
 [[ ! -f "$dir/dbear.exe" ]] || fail "uninstall left dbear.exe"
 [[ -z "$(registry_version)" ]] || fail "uninstall left the registry entry"

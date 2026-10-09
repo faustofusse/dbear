@@ -1,0 +1,54 @@
+# Windows checks for the GPUI app: clippy, the update crate's tests, and the end-to-end update test
+# (scripts/test-update-windows.sh: install an old build with its installer, update it from a local
+# feed signed with a throwaway key, reject tampered and wrongly signed updates, uninstall).
+name: Windows
+
+on:
+  pull_request:
+    paths:
+      - "apps/gpui/**"
+      - "crates/**"
+      - "packaging/**"
+      - "scripts/*windows*"
+      - "scripts/windows/**"
+      - "Cargo.lock"
+      - ".github/workflows/windows.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/gpui/**"
+      - "crates/update/**"
+      - "packaging/**"
+      - "scripts/*windows*"
+      - "scripts/windows/**"
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  update:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: NSIS
+        run: |
+          if ! command -v makensis >/dev/null; then
+            [[ -x "/c/Program Files (x86)/NSIS/makensis.exe" ]] || choco install nsis -y --no-progress
+            echo "C:\\Program Files (x86)\\NSIS" >>"$GITHUB_PATH"
+          fi
+      - name: Clippy
+        run: cargo clippy --locked -p dbear-gpui -p dbear-update --all-targets
+      - name: Update crate tests
+        run: cargo test --locked -p dbear-update
+      - name: End-to-end update
+        run: ./scripts/test-update-windows.sh --keep
+      - name: Logs
+        if: failure()
+        run: tail -n +1 build/windows-update-test/*.log || true

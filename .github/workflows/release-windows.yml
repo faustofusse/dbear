@@ -1,0 +1,203 @@
+# Builds the Windows release of the GPUI app (apps/gpui) and attaches it to the GitHub release.
+#
+# On a pushed tag v<version> (scripts/release-mac.sh pushes it and creates the release): builds
+# x64 (and arm64), packages the per-user NSIS installer and a portable zip, signs the update
+# manifest (dbear-update-windows.json) and uploads all of it to the tag's release. The installed
+# apps read the manifest from releases/latest/download/dbear-update-windows.json.
+#
+# Run it by hand (Actions ▸ Release (Windows) ▸ Run workflow) to build a version without
+# publishing anything: the files are kept as the run's artifacts.
+#
+# Secrets:
+#   DBEAR_UPDATE_PRIVATE_KEY      required to publish: the ed25519 update key (base64 seed from
+#                                 `cargo run -p dbear-update -- keygen`). Its public half must be
+#                                 in packaging/update-public-key, which release builds embed.
+#   WINDOWS_CERTIFICATE           optional: Authenticode code-signing certificate, base64 of a .pfx.
+#   WINDOWS_CERTIFICATE_PASSWORD  optional: its password.
+# Without a certificate the files aren't Authenticode-signed: SmartScreen warns on first download,
+# but updates are still verified with the update key.
+name: Release (Windows)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (no publishing), e.g. 0.2.0-test.1"
+        required: true
+        default: "0.0.0-dev"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  PUBLISH: ${{ github.event_name == 'push' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: windows-latest
+    # arm64 is cross-compiled on x64 and isn't tested on hardware: it must not hold up x64.
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        run: |
+          if [[ "$PUBLISH" == true ]]; then v="${GITHUB_REF_NAME#v}"; else v="${{ inputs.version }}"; fi
+          v="${v#v}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "bad version: $v"; exit 1; }
+          echo "VERSION=$v" >>"$GITHUB_ENV"
+          key="$(grep -v '^[[:space:]]*#' packaging/update-public-key | tr -d '[:space:]' || true)"
+          if [[ -z "$key" ]]; then
+            if [[ "$PUBLISH" == true ]]; then
+              echo "::error::packaging/update-public-key has no key: released apps couldn't update"; exit 1
+            fi
+            echo "::warning::packaging/update-public-key has no key: this build won't check for updates"
+          fi
+
+      - name: Rust
+        run: |
+          rustup show active-toolchain
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          DBEAR_VERSION: ${{ env.VERSION }}
+        run: cargo build --release --locked -p dbear-gpui --target ${{ matrix.target }}
+
+      - name: NSIS
+        run: |
+          if ! command -v makensis >/dev/null; then
+            [[ -x "/c/Program Files (x86)/NSIS/makensis.exe" ]] || choco install nsis -y --no-progress
+            echo "C:\\Program Files (x86)\\NSIS" >>"$GITHUB_PATH"
+          fi
+
+      - name: Authenticode certificate (optional)
+        env:
+          CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          if [[ -z "$CERT" ]]; then echo "no WINDOWS_CERTIFICATE secret: not Authenticode-signing"; exit 0; fi
+          printf '%s' "$CERT" | base64 -d >"$RUNNER_TEMP/cert.pfx"
+          signtool="$(printf '%s\n' "/c/Program Files (x86)/Windows Kits/10/bin/"10.*/x64/signtool.exe | sort -V | tail -1)"
+          [[ -x "$signtool" ]] || { echo "signtool not found"; exit 1; }
+          # package-windows.sh appends the file to sign; the password comes from the Package step's env.
+          echo "DBEAR_SIGN_COMMAND=\"$signtool\" sign /f \"$(cygpath -w "$RUNNER_TEMP/cert.pfx")\" /p \"\$WINDOWS_CERTIFICATE_PASSWORD\" /fd sha256 /tr http://timestamp.digicert.com /td sha256 /d dbear" >>"$GITHUB_ENV"
+
+      - name: Package
+        env:
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: ./scripts/package-windows.sh "$VERSION" ${{ matrix.arch }} "target/${{ matrix.target }}/release/dbear.exe" dist
+
+      - name: Smoke test (x64)
+        if: matrix.arch == 'x64'
+        run: |
+          set -x
+          [[ "$(target/${{ matrix.target }}/release/dbear.exe --version | tr -d '\r')" == "dbear $VERSION" ]]
+          # The installer, silently, into a throwaway folder, then its uninstaller.
+          dir="$(cygpath -w "$RUNNER_TEMP")\\dbear-install"
+          MSYS_NO_PATHCONV=1 "dist/dbear-$VERSION-windows-x64-setup.exe" /S "/D=$dir"
+          installed="$(cygpath -u "$dir")"
+          [[ "$("$installed/dbear.exe" --version | tr -d '\r')" == "dbear $VERSION" ]]
+          [[ -f "$installed/uninstall.exe" ]]
+          MSYS_NO_PATHCONV=1 reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\dbear' /v DisplayVersion | grep -q "$VERSION"
+          MSYS_NO_PATHCONV=1 "$installed/uninstall.exe" /S
+          for _ in $(seq 30); do [[ -f "$installed/dbear.exe" ]] || break; sleep 1; done
+          [[ ! -f "$installed/dbear.exe" ]]
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # Runs even when the arm64 build failed (continue-on-error); needs at least x64's files.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: dist
+          merge-multiple: true
+
+      - name: Version
+        run: |
+          if [[ "$PUBLISH" == true ]]; then v="${GITHUB_REF_NAME#v}"; else v="${{ inputs.version }}"; fi
+          echo "VERSION=${v#v}" >>"$GITHUB_ENV"
+          echo "TAG=v${v#v}" >>"$GITHUB_ENV"
+          ls -l dist
+          [[ -f "dist/dbear-${v#v}-windows-x64-setup.exe" ]] || { echo "::error::no x64 installer"; exit 1; }
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Wait for the release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # scripts/release-mac.sh creates the release (as a draft) right after pushing the tag.
+          # Without a Mac release, create a draft here after half an hour.
+          for _ in $(seq 60); do
+            gh release view "$TAG" >/dev/null 2>&1 && exit 0
+            sleep 30
+          done
+          gh release create "$TAG" --draft --title "dbear $VERSION" --generate-notes --verify-tag
+
+      - name: Update manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DBEAR_UPDATE_PRIVATE_KEY: ${{ secrets.DBEAR_UPDATE_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$DBEAR_UPDATE_PRIVATE_KEY" ]]; then
+            if [[ "$PUBLISH" == true ]]; then echo "::error::the DBEAR_UPDATE_PRIVATE_KEY secret isn't set"; exit 1; fi
+            echo "::warning::no DBEAR_UPDATE_PRIVATE_KEY: no update manifest"; exit 0
+          fi
+          cargo build --release --locked -p dbear-update
+          notes=""
+          if [[ "$PUBLISH" == true ]]; then
+            gh release view "$TAG" --json body --jq .body >"$RUNNER_TEMP/notes.md" && notes="$RUNNER_TEMP/notes.md"
+          fi
+          url="https://github.com/${GITHUB_REPOSITORY}"
+          DBEAR_UPDATE_TOOL=target/release/dbear-update ./scripts/write-update-manifest.sh "$VERSION" dist \
+            "$url/releases/download/$TAG" "$notes" "$url/releases/tag/$TAG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist/*
+
+      - name: Upload to the release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The manifest last: apps only see a release through it, so its installers come first.
+          gh release upload "$TAG" --clobber dist/*.exe dist/*.zip dist/*.sha256
+          gh release upload "$TAG" --clobber dist/dbear-update-windows.json

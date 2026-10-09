@@ -28,10 +28,14 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 cp "$EXE" "$STAGE/dbear.exe"
 
+# shellcheck disable=SC2034 # `file` is used by the eval
 sign() {
     [[ -n "${DBEAR_SIGN_COMMAND:-}" ]] || return 0
     echo "signing $(basename "$1")"
-    eval "$DBEAR_SIGN_COMMAND \"\$1\""
+    local file="$1"
+    # Git Bash: hand Windows tools a Windows path, and keep MSYS from rewriting /f, /p… into paths.
+    if command -v cygpath >/dev/null; then file="$(cygpath -w "$1")"; fi
+    (export MSYS_NO_PATHCONV=1; eval "$DBEAR_SIGN_COMMAND \"\$file\"")
 }
 sha() {
     if command -v sha256sum >/dev/null; then (cd "$(dirname "$1")" && sha256sum "$(basename "$1")" >"$1.sha256")

@@ -66,12 +66,24 @@ fi
 
 git tag -a "$TAG" -m "dbear $VERSION"
 git push origin "$TAG"
-gh release create "$TAG" "$ZIP" "$ZIP.sha256" --draft --title "dbear $VERSION" --generate-notes --notes "$(cat <<'EOF'
-Apple silicon, macOS 15 or later.
+NOTES_TEXT="$(cat <<'EOF'
+**macOS** (Apple silicon, macOS 15 or later): download the `macos-arm64` zip, unzip it and move
+`dbear.app` to `/Applications`.
 
-Download the zip, unzip it and move `dbear.app` to `/Applications`. Later versions update themselves.
+**Windows** (10 or later): run `dbear-…-windows-x64-setup.exe` (installs for your user, no
+administrator needed), or unzip the portable `windows-x64` zip. The release workflow adds the
+Windows files a few minutes after the release appears.
+
+Later versions update themselves.
 EOF
 )"
+if gh release view "$TAG" >/dev/null 2>&1; then
+  # .github/workflows/release-windows.yml creates a draft when the Mac release doesn't show up.
+  gh release upload "$TAG" "$ZIP" "$ZIP.sha256" --clobber
+  gh release edit "$TAG" --title "dbear $VERSION" --notes "$NOTES_TEXT"
+else
+  gh release create "$TAG" "$ZIP" "$ZIP.sha256" --draft --title "dbear $VERSION" --generate-notes --notes "$NOTES_TEXT"
+fi
 # The appcast carries the release notes (markdown, shown by Check for Updates…).
 NOTES=build/release-notes.md
 gh release view "$TAG" --json body --jq .body >"$NOTES"
