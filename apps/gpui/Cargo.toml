@@ -1,6 +1,6 @@
 [package]
 name = "dbear-gpui"
-description = "dbear's GPUI frontend: the Linux app (also runs on macOS and Windows for development)."
+description = "dbear's GPUI frontend: the Windows and Linux app (also runs on macOS for development)."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

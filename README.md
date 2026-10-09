@@ -2,10 +2,12 @@
 
 <img src="assets/logo.svg" width="96" alt="dbear">
 
-A fast, native database client for macOS. It works with **PostgreSQL**, **MySQL**, **SQLite**,
+A fast, native database client for macOS and Windows. It works with **PostgreSQL**, **MySQL**, **SQLite**,
 **SQL Server** and **Turso / libSQL**. A Linux version is planned.
 
 ## Install
+
+### macOS
 
 Download the latest `dbear-*-macos-arm64.zip` from
 [Releases](https://github.com/faustofusse/dbear/releases/latest), unzip it and move `dbear.app` to
@@ -14,6 +16,24 @@ Applications. It needs macOS 15 or later on Apple silicon.
 dbear updates itself. It checks once a day, downloads updates in the background and installs them
 when you quit. When an update is ready, **Restart to Update** appears in the app menu. You can turn
 this off in Settings (⌘,).
+
+### Windows
+
+Download `dbear-*-windows-x64-setup.exe` from
+[Releases](https://github.com/faustofusse/dbear/releases/latest) and run it. It installs dbear for
+your user only (in `%LOCALAPPDATA%\Programs\dbear`), so it doesn't need administrator rights.
+Uninstall it from **Settings ▸ Apps**. It needs Windows 10 or later. The installer isn't
+code-signed yet, so SmartScreen may warn you: click **More info ▸ Run anyway**.
+
+The installed app checks for updates at launch and once a day. It downloads them in the background
+and installs them when you quit. Updates are signed, and dbear won't install one whose signature
+doesn't match. When an update is ready, an **Update** button appears at the bottom of the
+connections list. Click it to restart now. The button next to it (⬆) opens the Updates dialog,
+where you can check now or turn automatic checks and installs off.
+
+There's also a portable `dbear-*-windows-x64.zip`. It doesn't update itself, but it tells you
+when a new version is out. On Windows, passwords are stored in the Credential Manager and
+everything else in `%APPDATA%\dbear`. Shortcuts use Ctrl where the macOS app uses ⌘.
 
 ## Connecting
 
