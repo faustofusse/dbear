@@ -39,10 +39,16 @@ registry_version() {
         tr -d '\r' | awk '/DisplayVersion/ {print $NF}'
 }
 
-python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$WORK/www" >"$WORK/http.log" 2>&1 &
+# Windows' Python doesn't understand Git Bash paths (/d/a/…): give it a Windows one.
+WWW="$WORK/www"
+command -v cygpath >/dev/null && WWW="$(cygpath -w "$WWW")"
+python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$WWW" >"$WORK/http.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null || true' EXIT
-sleep 1
+# Wait until it serves the feed (Python on a fresh runner can take a while to start).
+served() { python3 -c "import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2)" "$FEED/good/dbear-update-windows.json" 2>/dev/null; }
+for _ in $(seq 1 30); do served && break; sleep 1; done
+served || { cat "$WORK/http.log" >&2; fail "the local feed isn't being served"; }
 
 NO_INSTALLER="${NO_INSTALLER:-0}"
 if [[ $NO_INSTALLER == 1 ]]; then
