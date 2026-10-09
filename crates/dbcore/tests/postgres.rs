@@ -245,11 +245,24 @@ fn cancels_running_query() {
         return;
     }
     let conn = dev();
+    let observer = dev();
     block_on(conn.connect()).unwrap();
+    let marker = "dbear_cancel_test_marker";
     let started = Instant::now();
     let (result, ()) = block_on(async {
-        tokio::join!(conn.execute("select pg_sleep(10)".into()), async {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::join!(conn.execute(format!("select pg_sleep(10) as {marker}")), async {
+            // Cancel once the server runs it: a cancel that arrives earlier (while the query is still
+            // being prepared, on a busy machine) finds nothing to stop.
+            let running = format!(
+                "select count(*) from pg_stat_activity where state = 'active' and query like '%{marker}%' and pid <> pg_backend_pid()"
+            );
+            while started.elapsed() < Duration::from_secs(5) {
+                let r = observer.execute(running.clone()).await.unwrap();
+                if r.rows[0][0] != Value::Int(0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             conn.cancel().await;
         })
     });
@@ -634,22 +647,28 @@ fn sets_database_levels_in_another_database() {
     if !enabled() {
         return;
     }
-    let conn = dev(); // app_dev; the levels are set in `postgres`
-    let other = Connection::new(dev_config().with_database("postgres"));
+    // The levels are set in a database of the test's own: granting on all tables of a schema
+    // while other tests create and drop tables there fails ("tuple concurrently deleted").
+    let database = "dbear_test_levels";
+    let conn = dev(); // app_dev
     let name = "dbear_test_level";
     let me = RoleRef::new(name, None);
     let cleanup = || {
+        let other = Connection::new(dev_config().with_database(database));
         for c in [&conn, &other] {
             let _ = block_on(c.execute(format!("do $$ begin if exists (select from pg_roles where rolname = '{name}') then execute 'drop owned by {name}'; end if; end $$")));
         }
-        let _ = block_on(other.execute("drop table if exists public.dbear_level_a, public.dbear_level_b".into()));
+        block_on(other.disconnect());
+        let _ = block_on(conn.execute(format!("drop database if exists {database} with (force)")));
         let _ = block_on(conn.execute(format!("drop role if exists {name}")));
     };
     cleanup();
+    block_on(conn.execute(format!("create database {database}"))).unwrap();
+    let other = Connection::new(dev_config().with_database(database));
     block_on(other.execute("create table public.dbear_level_a (id int); insert into public.dbear_level_a values (1)".into())).unwrap();
 
-    // Create the role and give it read-only access to `postgres`, in one call (two databases).
-    let ctx = block_on(conn.database_level(me.clone(), "postgres".into())).unwrap();
+    // Create the role and give it read-only access to that database, in one call (two databases).
+    let ctx = block_on(conn.database_level(me.clone(), database.into())).unwrap();
     assert_eq!(ctx.level, DatabaseLevel::NoAccess);
     assert!(ctx.schemas.contains(&"public".to_string()) && ctx.owners.contains(&"postgres".to_string()), "{ctx:?}");
     assert!(!ctx.owners.iter().any(|o| o.starts_with("pg_")), "{ctx:?}");
@@ -659,12 +678,12 @@ fn sets_database_levels_in_another_database() {
         AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::ReadOnly },
     ]))
     .unwrap();
-    let ctx = block_on(conn.database_level(me.clone(), "postgres".into())).unwrap();
+    let ctx = block_on(conn.database_level(me.clone(), database.into())).unwrap();
     assert_eq!(ctx.level, DatabaseLevel::ReadOnly);
 
     // A table created afterwards is readable too (default privileges); writing isn't allowed.
     block_on(other.execute("create table public.dbear_level_b (id int); insert into public.dbear_level_b values (2)".into())).unwrap();
-    let mut login = dev_config().with_database("postgres");
+    let mut login = dev_config().with_database(database);
     login.user = Some(name.into());
     login.password = Some("pw".into());
     let as_role = Connection::new(login.clone());
@@ -675,16 +694,17 @@ fn sets_database_levels_in_another_database() {
 
     // Up to read and write, then down to no access.
     block_on(conn.apply_access(vec![AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::ReadWrite }])).unwrap();
-    let ctx = block_on(conn.database_level(me.clone(), "postgres".into())).unwrap();
+    let ctx = block_on(conn.database_level(me.clone(), database.into())).unwrap();
     assert_eq!(ctx.level, DatabaseLevel::ReadWrite);
     let as_role = Connection::new(login);
     block_on(as_role.execute("insert into public.dbear_level_b values (3)".into())).unwrap();
     block_on(as_role.disconnect());
     block_on(conn.apply_access(vec![AccessChange::SetDatabaseLevel { role: me.clone(), context: ctx, level: DatabaseLevel::NoAccess }])).unwrap();
-    assert_eq!(block_on(conn.database_level(me.clone(), "postgres".into())).unwrap().level, DatabaseLevel::NoAccess);
+    assert_eq!(block_on(conn.database_level(me.clone(), database.into())).unwrap().level, DatabaseLevel::NoAccess);
     let access = block_on(conn.list_database_access(me)).unwrap();
     assert!(access.iter().all(|a| a.privileges.privileges.is_empty()));
 
+    block_on(other.disconnect());
     cleanup();
 }
 
