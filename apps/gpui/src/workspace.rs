@@ -456,7 +456,11 @@ impl Workspace {
                     let editor = editor.clone();
                     move |_, _, cx| editor.update(cx, |e, cx| e.test(cx))
                 }))
-                .child(div().flex_1())
+                // The test result (or why saving failed), always in view below a long form.
+                .child(match editor.read(cx).status_line(cx) {
+                    Some(status) => status.into_any_element(),
+                    None => div().flex_1().into_any_element(),
+                })
                 .child(Button::new("cancel").label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
                 .child(Button::new("save").primary().label("Save").on_click({
                     let editor = editor.clone();
@@ -467,7 +471,6 @@ impl Workspace {
                         }
                     }
                 }));
-            let _ = cx;
             dialog.title(title).w(px(560.)).child(editor).footer(footer)
         });
     }

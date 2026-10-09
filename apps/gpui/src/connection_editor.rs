@@ -323,6 +323,28 @@ impl ConnectionEditor {
         cx.notify();
     }
 
+    /// "Connecting…", "Connected" or why not, for the dialog's footer: the form can be taller than
+    /// the dialog, and the result of Test Connection (or a failed save) must be in view.
+    pub fn status_line(&self, cx: &App) -> Option<impl IntoElement + use<>> {
+        let (text, color) = match self.status.as_ref()? {
+            Status::Testing => ("Connecting…".to_string(), cx.theme().muted_foreground),
+            Status::Ok(text) => (text.clone(), cx.theme().green),
+            Status::Error(text) => (text.clone(), cx.theme().red),
+        };
+        let tooltip = SharedString::from(text.clone());
+        Some(
+            div()
+                .id("editor-status")
+                .min_w_0()
+                .flex_1()
+                .text_sm()
+                .text_color(color)
+                .line_clamp(2)
+                .child(text)
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)),
+        )
+    }
+
     fn field(label: &str, input: impl IntoElement, cx: &App) -> impl IntoElement {
         h_flex()
             .gap_3()
@@ -371,14 +393,6 @@ impl Render for ConnectionEditor {
 
         let sqlite = kind == DatabaseKind::Sqlite;
         let libsql = kind == DatabaseKind::Libsql;
-        let status = self.status.as_ref().map(|status| {
-            let (text, color) = match status {
-                Status::Testing => ("Connecting…".to_string(), cx.theme().muted_foreground),
-                Status::Ok(text) => (text.clone(), cx.theme().green),
-                Status::Error(text) => (text.clone(), cx.theme().red),
-            };
-            div().text_sm().text_color(color).child(text)
-        });
 
         v_flex()
             .gap_3()
@@ -482,6 +496,5 @@ impl Render for ConnectionEditor {
                     cx,
                 ))
             })
-            .children(status)
     }
 }
