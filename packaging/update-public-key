@@ -2,3 +2,4 @@
 # two while rotating). Compiled into the app by apps/gpui/build.rs. Empty: builds don't update.
 # Generate with `cargo run -p dbear-update -- keygen`; the private half goes into the GitHub secret
 # DBEAR_UPDATE_PRIVATE_KEY (see .github/workflows/release-windows.yml).
+mtMqCID2z+qMm4BoZjjDH3YzVFn8E5Xq/ZbrIsWkbcg=
