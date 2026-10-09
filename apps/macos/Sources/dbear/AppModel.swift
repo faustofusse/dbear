@@ -376,6 +376,12 @@ final class AppModel {
 
     private let store: ConnectionStore?
     private let secrets: any SecretStore
+    /// Open tabs and query history (`state.db`, beside the connection store). See `AppModel+Session.swift`.
+    @ObservationIgnored private(set) var state: StateStore?
+    /// Bumped when the query history changes, so the History menus read it again.
+    var historyVersion = 0
+    /// Reopening last session's tabs: nothing is saved meanwhile.
+    @ObservationIgnored var isRestoringSession = false
 
     init(store: ConnectionStore? = nil, secrets: any SecretStore = KeychainSecretStore()) {
         self.secrets = secrets
@@ -388,8 +394,15 @@ final class AppModel {
             self.store = nil
             storeError = error.localizedDescription
         }
+        // Losing it only loses history and the open tabs: not worth an error in the window.
+        state = self.store.flatMap { try? StateStore.open(besideStoreAt: $0.path) }
         // A restore may have created or dropped tables.
         backups.onRestored = { [weak self] target in Task { await self?.schemaMayHaveChanged(target) } }
+        restoreSession()
+        // Script text isn't saved as you type: the last of it is saved when the app quits.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.saveSession() }
+        }
     }
     var selectedConnectionID: ConnectionConfig.ID? {
         // Show the new connection's cached tables, or a spinner (never the previous connection's).
@@ -397,6 +410,7 @@ final class AppModel {
             guard selectedConnectionID != oldValue else { return }
             selectedDatabase = selectedConnectionID.flatMap { rememberedDatabase(of: $0) }
             showCachedSchemas()
+            saveSession()
         }
     }
     /// Database shown for the selected connection; `nil` means the connection's own `database`.
@@ -405,7 +419,10 @@ final class AppModel {
             if let id = selectedConnectionID, selectedDatabase != rememberedDatabase(of: id) {
                 remember(database: selectedDatabase, of: id)
             }
-            if selectedDatabase != oldValue { showCachedSchemas() }
+            if selectedDatabase != oldValue {
+                showCachedSchemas()
+                saveSession()
+            }
         }
     }
 
@@ -441,8 +458,12 @@ final class AppModel {
     /// Connections with an open server connection (green dot in the sidebar).
     var openConnections: Set<ConnectionConfig.ID> = []
 
-    var tabs: [WorkspaceTab] = []
-    var activeTabID: UUID?
+    var tabs: [WorkspaceTab] = [] {
+        didSet { saveSession() }
+    }
+    var activeTabID: UUID? {
+        didSet { if activeTabID != oldValue { saveSession() } }
+    }
 
     /// What the middle column lists: tables, or users and roles (toolbar switch).
     var browseMode = BrowseMode.tables
@@ -478,7 +499,8 @@ final class AppModel {
     static let editorFontSizes: ClosedRange<CGFloat> = 8...40
 
     private var drivers: [DriverKey: any DatabaseDriver] = [:]
-    private var scriptCounter = 0
+    /// Scripts made so far, for their names ("Script 1", "Script 2"…).
+    var scriptCounter = 0
 
     /// Built once per database and reused on every keystroke for SQL completion.
     /// `nil` while loading or if it failed (completion is then just unavailable, nothing fatal).
@@ -643,6 +665,7 @@ final class AppModel {
         }
         resetConnection(config.id)
         secrets.deletePassword(for: config.id)
+        clearHistory(of: config.id)
         connections = store.connections()
         failedConnections.remove(config.id)
         if selectedConnectionID == config.id {
@@ -870,7 +893,10 @@ final class AppModel {
         }
         // The middle column follows the tab: its table, or its role.
         switch tab {
-        case .table: browseMode = .tables
+        case .table(let t):
+            browseMode = .tables
+            // Tabs reopened at launch load when first shown.
+            if case .idle = t.data { Task { await load(t) } }
         case .users: browseMode = .users
         case .script: break
         }
@@ -978,8 +1004,43 @@ final class AppModel {
     }
 
     func closeOthers(than id: UUID) {
-        tabs.removeAll { $0.id != id }
-        activate(id)
+        requestClose(tabs.map(\.id).filter { $0 != id })
+    }
+
+    /// Closes the tabs after `id` in the tab strip.
+    func closeTabs(toTheRightOf id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        requestClose(tabs[(index + 1)...].map(\.id))
+    }
+
+    func closeAllTabs() {
+        requestClose(tabs.map(\.id))
+    }
+
+    /// Closes several tabs, asking once first when any has unsaved edits.
+    func requestClose(_ ids: [UUID]) {
+        let closing = tabs.filter { ids.contains($0.id) }
+        let unsaved = closing.compactMap(\.editableRows).filter { !$0.edits.isEmpty }
+        if !unsaved.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = unsaved.count == 1
+                ? "Discard unsaved changes to \(unsaved[0].editTarget)?"
+                : "Discard unsaved changes in \(unsaved.count) tabs?"
+            alert.informativeText = "Closing the tabs throws these changes away."
+            alert.addButton(withTitle: "Discard Changes")
+            alert.addButton(withTitle: "Cancel")
+            alert.buttons[0].hasDestructiveAction = true
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        let wasActive = activeTabID.map(ids.contains) ?? false
+        let activeIndex = tabs.firstIndex { $0.id == activeTabID } ?? 0
+        tabs.removeAll { ids.contains($0.id) }
+        guard wasActive else { return }
+        if tabs.isEmpty {
+            activeTabID = nil
+        } else {
+            activate(tabs[min(activeIndex, tabs.count - 1)].id)
+        }
     }
 
     /// Moves a tab to `index` (its position after the move), e.g. while dragging it in the tab strip.
@@ -1387,6 +1448,8 @@ final class AppModel {
             let result = try await driver(for: tab.connection).execute(sql, maxRows: scriptRowLimit)
             tab.lastDuration = clock.now - start
             tab.result = .loaded(result)
+            let rows = (result.columns.isEmpty ? result.rowsAffected : result.totalCount ?? result.rows.count).map { UInt64(max(0, $0)) }
+            recordHistory(of: tab, sql: sql, rows: rows, error: nil)
             if sql.contains(Self.ddl) { await schemaMayHaveChanged(tab.connection) }
             await describeResult(of: tab)
         } catch DatabaseError.cancelled {
@@ -1396,6 +1459,7 @@ final class AppModel {
         } catch {
             tab.lastDuration = clock.now - start
             tab.result = .failed(error.localizedDescription)
+            recordHistory(of: tab, sql: tab.lastRunSQL ?? "", rows: nil, error: error.localizedDescription)
         }
         await updateConnectionState(tab.connection.id)
     }

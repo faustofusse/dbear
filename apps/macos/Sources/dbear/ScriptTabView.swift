@@ -107,6 +107,7 @@ struct ScriptTabView: View {
         HStack(spacing: 8) {
             connectionLabel
             Spacer()
+            HistoryMenu(tab: tab)
             if tab.hasRows && !tab.result.isLoading {
                 Button {
                     model.openResultsInNewTab(tab)
@@ -210,5 +211,48 @@ struct ScriptTabView: View {
             canAddRows: false,
             canDeleteRows: sources.canDeleteRows
         )
+    }
+}
+
+/// The connection's recent queries: picking one puts it in the script (after what's there).
+/// Its own view so the history is only read when it changes, not on every keystroke.
+private struct HistoryMenu: View {
+    @Environment(AppModel.self) private var model
+    let tab: ScriptTab
+
+    var body: some View {
+        let entries = model.history(of: tab.connection.id)
+        Menu {
+            if entries.isEmpty {
+                Text("No queries yet")
+            }
+            ForEach(entries) { entry in
+                Button {
+                    model.insertFromHistory(entry.sql, into: tab)
+                } label: {
+                    Text(Self.label(entry))
+                }
+                .help(entry.sql)
+            }
+            if !entries.isEmpty {
+                Divider()
+                Button("Clear History") { model.clearHistory(of: tab.connection.id) }
+            }
+        } label: {
+            Label("History", systemImage: "clock.arrow.circlepath")
+                .labelStyle(.iconOnly)
+        }
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Recent Queries on This Connection")
+        .accessibilityLabel("History")
+    }
+
+    /// One line, at most 70 characters; "· failed" for runs that failed.
+    private static func label(_ entry: QueryHistoryEntry) -> String {
+        let line = entry.sql.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        var label = line.count > 70 ? String(line.prefix(70)) + "…" : line
+        if entry.error != nil { label += "  · failed" }
+        return label
     }
 }

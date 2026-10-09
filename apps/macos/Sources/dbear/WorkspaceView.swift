@@ -304,6 +304,9 @@ private struct TabItem: View {
             Button("Close Tab") { model.requestClose(tab.id) }
             Button("Close Other Tabs") { model.closeOthers(than: tab.id) }
                 .disabled(model.tabs.count < 2)
+            Button("Close Tabs to the Right") { model.closeTabs(toTheRightOf: tab.id) }
+                .disabled(model.tabs.last?.id == tab.id)
+            Button("Close All Tabs") { model.closeAllTabs() }
         }
     }
 

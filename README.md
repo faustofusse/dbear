@@ -55,7 +55,11 @@ the value.
 selected text, and ⌘. stops it. ⇧⌘↩ runs it in a new results tab instead, and the script's
 **Open in New Tab** button moves the rows it shows to one, so the next run doesn't replace them.
 Results tabs can be re-run (⌘↩) but aren't reopened at launch. For SQL Server, scripts are split
-on `GO` lines.
+on `GO` lines. The **History** menu above the editor lists the connection's recent queries; picking
+one adds it to the script.
+
+**Tabs reopen at launch**, with the connection you had selected and your scripts' text. Tables load
+when you first show them.
 
 On Postgres, MySQL and SQLite, script results work like a table's rows wherever a column is read
 straight from a table, including through joins and aliases. Foreign-key cells link to their row,
