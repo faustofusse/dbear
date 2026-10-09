@@ -14,12 +14,8 @@ struct WorkspaceView: View {
                     .inspectorColumnWidth(min: 220, ideal: 300, max: 640)
             }
             .toolbar {
-                // [New Script]  [Data | Structure]  [+ −] ……… [Discard] [Review] [Save]  [Refresh]
-                ToolbarItem { newScriptButton }
+                // [Data | Structure]  [+ −] ……… [Discard] [Review] [Save]  [New Script]  [Refresh]  [Inspector]
                 if let tab = model.activeTableTab {
-                    if #available(macOS 26.0, *) {
-                        ToolbarSpacer(.fixed)
-                    }
                     ToolbarItem { TableModePicker(tab: tab) }
                     if tab.mode == .data {
                         if #available(macOS 26.0, *) {
@@ -37,6 +33,10 @@ struct WorkspaceView: View {
                     if #available(macOS 26.0, *) {
                         ToolbarSpacer(.fixed)
                     }
+                }
+                ToolbarItem { newScriptButton }
+                if #available(macOS 26.0, *) {
+                    ToolbarSpacer(.fixed)
                 }
                 ToolbarItem { RefreshButton() }
                 ToolbarItem {
