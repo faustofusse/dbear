@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Local databases for development and integration tests (Apple `container` CLI for servers).
-#   scripts/dev-db.sh up    [postgres|mysql|sqlite|libsql|sqlserver]   start / create (seeds on first boot); default: all
-#   scripts/dev-db.sh down  [postgres|mysql|sqlite|libsql|sqlserver]   stop and delete (data is discarded)
-#   scripts/dev-db.sh reset [postgres|mysql|sqlite|libsql|sqlserver]   down + up
+#   scripts/dev-db.sh up    [postgres|mysql|sqlite|libsql|sqlserver|ssh]   start / create (seeds on first boot); default: all
+#   scripts/dev-db.sh down  [postgres|mysql|sqlite|libsql|sqlserver|ssh]   stop and delete (data is discarded)
+#   scripts/dev-db.sh reset [postgres|mysql|sqlite|libsql|sqlserver|ssh]   down + up
 #   scripts/dev-db.sh shell  postgres|mysql|sqlite|sqlserver           open psql / mysql / sqlite3 / sqlcmd
-#   scripts/dev-db.sh logs   postgres|mysql|libsql|sqlserver           container logs
+#   scripts/dev-db.sh logs   postgres|mysql|libsql|sqlserver|ssh       container logs
+#   scripts/dev-db.sh ip     postgres|mysql|sqlserver|ssh               address on the containers' network
 #
 # "all" leaves SQL Server out: it's an amd64 image run under Rosetta in a 4 GB VM. Start it by name.
+# It leaves the SSH server out too (for tunnel tests: user dbear, password dbear, keys in dev/ssh;
+# it reaches the other containers by their IP, see `ip_of`).
 #
 # Connections (non-default ports so they don't clash with servers already running):
 #   postgres://postgres:postgres@localhost:54329/app_dev
@@ -14,6 +17,7 @@
 #   sqlite://$PWD/dev/sqlite/app.db
 #   libsql://localhost:18080?tls=0&authToken=$(cat dev/libsql/dev_token)   (Turso's sqld, seeded like SQLite)
 #   sqlserver://sa:Dbear_dev1@localhost:14339/app_dev?sslmode=require
+#   ssh://dbear:dbear@localhost:22229                                        (SSH server for tunnels)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,6 +26,7 @@ MY_NAME=dbear-mysql MY_IMAGE=mysql:8.4 MY_PORT=33069
 SS_NAME=dbear-sqlserver SS_IMAGE=mcr.microsoft.com/mssql/server:2022-latest SS_PORT=14339 SS_PASSWORD=Dbear_dev1
 SQLITE_FILE=dev/sqlite/app.db
 LIBSQL_NAME=dbear-libsql LIBSQL_IMAGE=ghcr.io/tursodatabase/libsql-server:latest LIBSQL_PORT=18080
+SSH_NAME=dbear-ssh SSH_IMAGE=alpine:3.22 SSH_PORT=22229
 
 wait_for() { # name, ready-check command, seed-error pattern, url
   local name=$1 check=$2 error_pattern=$3 url=$4
@@ -138,12 +143,36 @@ up_libsql() {
   return 0
 }
 
+# The SSH server: Alpine with OpenSSH, port forwarding on, user dbear (password dbear) with the
+# dev keys in dev/ssh authorized. OpenSSH is installed when the container starts.
+up_ssh() {
+  start_container "$SSH_NAME" \
+    -p "127.0.0.1:$SSH_PORT:22" \
+    -v "$PWD/dev/ssh:/seed:ro" \
+    "$SSH_IMAGE" sh -c '
+      set -e
+      apk add --no-cache openssh-server >/dev/null
+      ssh-keygen -A >/dev/null
+      id dbear >/dev/null 2>&1 || { adduser -D -s /bin/sh dbear; echo dbear:dbear | chpasswd >/dev/null; }
+      mkdir -p /home/dbear/.ssh
+      cat /seed/*.pub > /home/dbear/.ssh/authorized_keys
+      chown -R dbear:dbear /home/dbear/.ssh && chmod 700 /home/dbear/.ssh && chmod 600 /home/dbear/.ssh/authorized_keys
+      exec /usr/sbin/sshd -D -e -o AllowTcpForwarding=yes -o PasswordAuthentication=yes'
+  wait_for "$SSH_NAME" "container logs $SSH_NAME | grep 'Server listening' >/dev/null" 'ERROR|apk: ' \
+    "ssh://dbear:dbear@localhost:$SSH_PORT"
+}
+
+# A running container's address on the containers' network (what the SSH server reaches it at).
+ip_of() {
+  container inspect "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["status"]["networks"][0]["ipv4Address"].split("/")[0])'
+}
+
 for_each() { # action, target
   local action=$1 target=${2:-all}
   case "$target" in
-    postgres|mysql|sqlite|libsql|sqlserver) "${action}_$target" ;;
+    postgres|mysql|sqlite|libsql|sqlserver|ssh) "${action}_$target" ;;
     all) "${action}_postgres"; "${action}_mysql"; "${action}_sqlite"; "${action}_libsql" ;;
-    *) echo "unknown database: $target (postgres|mysql|sqlite|libsql|sqlserver)" >&2; exit 2 ;;
+    *) echo "unknown database: $target (postgres|mysql|sqlite|libsql|sqlserver|ssh)" >&2; exit 2 ;;
   esac
 }
 
@@ -152,6 +181,7 @@ down_mysql() { remove_container "$MY_NAME"; }
 down_sqlite() { rm -f "$SQLITE_FILE"; }
 down_libsql() { remove_container "$LIBSQL_NAME"; }
 down_sqlserver() { remove_container "$SS_NAME"; }
+down_ssh() { remove_container "$SSH_NAME"; }
 
 case "${1:-up}" in
   up) for_each up "${2:-}" ;;
@@ -164,12 +194,14 @@ case "${1:-up}" in
       sqlite) sqlite3 "$SQLITE_FILE" ;;
       sqlserver) container exec -it "$SS_NAME" /opt/mssql-tools18/bin/sqlcmd -C -I -S localhost -U sa -P "$SS_PASSWORD" -d app_dev ;;
     esac ;;
+  ip) ip_of "dbear-${2:-postgres}" ;;
   logs)
     case "${2:-postgres}" in
+      ssh) container logs "$SSH_NAME" ;;
       mysql) container logs "$MY_NAME" ;;
       libsql) container logs "$LIBSQL_NAME" ;;
       sqlserver) container logs "$SS_NAME" ;;
       *) container logs "$PG_NAME" ;;
     esac ;;
-  *) echo "usage: $0 up|down|reset|shell|logs [postgres|mysql|sqlite|libsql|sqlserver]" >&2; exit 2 ;;
+  *) echo "usage: $0 up|down|reset|shell|logs|ip [postgres|mysql|sqlite|libsql|sqlserver|ssh]" >&2; exit 2 ;;
 esac

@@ -142,9 +142,18 @@ impl MysqlDriver {
 
 fn opts(config: &ConnectionConfig, tls: Option<SslOpts>, found_rows: bool) -> Opts {
     let database = config.database.trim();
+    // Through an SSH tunnel: connect to its local end, and check the certificate against the
+    // server's name rather than 127.0.0.1.
+    let (host, port, tls) = match config.tunneled_port() {
+        Some(port) => {
+            let server = config.host.trim().to_string();
+            ("127.0.0.1".to_string(), port, tls.map(|t| t.with_danger_tls_hostname_override(Some(server))))
+        }
+        None => (config.host.trim().to_string(), config.port.unwrap_or(3306), tls),
+    };
     OptsBuilder::default()
-        .ip_or_hostname(config.host.trim())
-        .tcp_port(config.port.unwrap_or(3306))
+        .ip_or_hostname(host)
+        .tcp_port(port)
         .user(Some(config.user.as_deref().unwrap_or("root")))
         .pass(config.password.clone())
         .db_name((!database.is_empty()).then(|| database.to_string()))

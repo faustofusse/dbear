@@ -219,7 +219,7 @@ extension AppModel {
         var first: ConnectionConfig?
         // Imported configs have no id yet, so each one is added (never replaces an existing one).
         for config in configs {
-            let saved = try save(config, password: config.password)
+            let saved = try save(config, password: config.password, sshSecret: config.ssh?.secret)
             first = first ?? saved
         }
         if let first { selectedConnectionID = first.id }

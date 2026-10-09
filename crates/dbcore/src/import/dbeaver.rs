@@ -13,7 +13,7 @@ use serde_json::Value as Json;
 use super::{ImportScan, ImportedConnection, SkippedConnection};
 use crate::config::sql_server_ssl_mode;
 use crate::driver::{Error, Result};
-use crate::model::{ConnectionConfig, DatabaseKind, SslMode};
+use crate::model::{ConnectionConfig, DatabaseKind, SshAuth, SshTunnel, SslMode};
 
 /// DBeaver's built-in key for `credentials-config.json`.
 const CREDENTIALS_KEY: [u8; 16] = [
@@ -101,6 +101,9 @@ fn project_name(file: &Path) -> Option<String> {
 pub(crate) struct Credentials {
     pub user: Option<String>,
     pub password: Option<String>,
+    /// The SSH tunnel's user and password (or key passphrase), under `network/ssh_tunnel`.
+    pub ssh_user: Option<String>,
+    pub ssh_password: Option<String>,
 }
 
 /// Users and passwords by connection id. A missing or unreadable file means none were saved.
@@ -119,9 +122,14 @@ pub(crate) fn decrypt_credentials(bytes: &[u8]) -> Option<HashMap<String, Creden
         json.as_object()?
             .iter()
             .map(|(id, entry)| {
-                let connection = &entry["#connection"];
-                let field = |k: &str| connection[k].as_str().filter(|s| !s.is_empty()).map(String::from);
-                (id.clone(), Credentials { user: field("user"), password: field("password") })
+                let field = |section: &str, k: &str| entry[section][k].as_str().filter(|s| !s.is_empty()).map(String::from);
+                let credentials = Credentials {
+                    user: field("#connection", "user"),
+                    password: field("#connection", "password"),
+                    ssh_user: field("network/ssh_tunnel", "user"),
+                    ssh_password: field("network/ssh_tunnel", "password"),
+                };
+                (id.clone(), credentials)
             })
             .collect(),
     )
@@ -203,9 +211,11 @@ fn convert(id: &str, source: &Json, credentials: Option<&Credentials>, project: 
     }
 
     let mut warnings = Vec::new();
-    let handler_enabled = |name: &str| conf["handlers"][name]["enabled"].as_bool() == Some(true);
-    if handler_enabled("ssh_tunnel") {
-        warnings.push("Uses an SSH tunnel, which dbear doesn’t support yet.".into());
+    let tunnel = &conf["handlers"]["ssh_tunnel"];
+    if tunnel["enabled"].as_bool() == Some(true) && kind != DatabaseKind::Sqlite {
+        config.ssh = Some(ssh_tunnel(tunnel, credentials, &mut warnings));
+    } else if conf["network-profile"].as_str().is_some_and(|p| !p.is_empty()) {
+        warnings.push("Uses a shared network profile (SSH or proxy), which isn’t imported; set up the tunnel in dbear.".into());
     }
     let proxy = conf["handlers"].as_object().is_some_and(|h| h.iter().any(|(k, v)| k.contains("proxy") && v["enabled"].as_bool() == Some(true)));
     if proxy {
@@ -219,6 +229,40 @@ fn convert(id: &str, source: &Json, credentials: Option<&Credentials>, project: 
         warnings.push("No saved password.".into());
     }
     Ok(ImportedConnection { config, source_id: id.to_string(), warnings, already_added: false })
+}
+
+/// DBeaver's `ssh_tunnel` handler: the SSH server in `properties`, its user and password (or key
+/// passphrase) in the credentials file.
+fn ssh_tunnel(handler: &Json, credentials: Option<&Credentials>, warnings: &mut Vec<String>) -> SshTunnel {
+    let props = &handler["properties"];
+    let text = |v: &Json| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let number = |v: &Json| v.as_u64().and_then(|n| u16::try_from(n).ok()).or_else(|| text(v).and_then(|s| s.parse().ok()));
+    let auth = match text(&props["authType"]).as_deref() {
+        Some("PUBLIC_KEY") => SshAuth::PrivateKey,
+        Some("AGENT") => SshAuth::Agent,
+        _ => SshAuth::Password,
+    };
+    let mut tunnel = SshTunnel {
+        host: text(&props["host"]).unwrap_or_default(),
+        port: number(&props["port"]).filter(|&p| p != SshTunnel::DEFAULT_PORT),
+        user: credentials.and_then(|c| c.ssh_user.clone()).or_else(|| text(&props["user"])).unwrap_or_default(),
+        auth,
+        key_path: if auth == SshAuth::PrivateKey { text(&props["keyPath"]).unwrap_or_default() } else { String::new() },
+        secret: None,
+        forwarded_port: None,
+    };
+    if auth != SshAuth::Agent && handler["save-password"].as_bool() != Some(false) {
+        tunnel.secret = credentials.and_then(|c| c.ssh_password.clone());
+    }
+    if props["jumpServers"].as_array().is_some_and(|j| !j.is_empty()) || text(&props["jumpServer"]).is_some() {
+        warnings.push("Its SSH tunnel goes through jump servers, which dbear doesn’t support yet.".into());
+    }
+    if tunnel.host.is_empty() || tunnel.user.is_empty() {
+        warnings.push("Its SSH tunnel has no host or user; fill them in before connecting.".into());
+    } else if auth == SshAuth::Password && tunnel.secret.is_none() {
+        warnings.push("No saved SSH password.".into());
+    }
+    tunnel
 }
 
 /// DBeaver's LibSQL driver (`libsql_jdbc`, Turso or sqld). The server URL is in the JDBC URL
@@ -435,7 +479,8 @@ mod tests {
                     "configuration": {
                         "url": "jdbc:mysql://shop.internal:3307/shop?useSSL=false&serverTimezone=UTC", "configurationType": "URL",
                         "provider-properties": {"@dbeaver-show-all-dbs@": "false"},
-                        "handlers": {"ssh_tunnel": {"type": "TUNNEL", "enabled": true}}
+                        "handlers": {"ssh_tunnel": {"type": "TUNNEL", "enabled": true, "save-password": true,
+                            "properties": {"host": "bastion.example.com", "port": 2222, "authType": "PUBLIC_KEY", "keyPath": "/Users/me/.ssh/id_ed25519"}}}
                     }
                 },
                 "mariaDB-3": {
@@ -480,20 +525,26 @@ mod tests {
 
     #[test]
     fn decrypts_credentials() {
-        let file = encrypt(r##"{"postgres-jdbc-1":{"#connection":{"user":"app","password":"s3cret"}},"mysql8-2":{"#connection":{"user":"root"}}}"##);
+        let file = encrypt(r##"{"postgres-jdbc-1":{"#connection":{"user":"app","password":"s3cret"}},"mysql8-2":{"#connection":{"user":"root"},"network/ssh_tunnel":{"user":"deploy","password":"pw"}}}"##);
         let creds = decrypt_credentials(&file).unwrap();
-        assert_eq!(creds["postgres-jdbc-1"], Credentials { user: Some("app".into()), password: Some("s3cret".into()) });
+        assert_eq!(creds["postgres-jdbc-1"], Credentials { user: Some("app".into()), password: Some("s3cret".into()), ..Default::default() });
         assert_eq!(creds["mysql8-2"].password, None);
+        assert_eq!((creds["mysql8-2"].ssh_user.as_deref(), creds["mysql8-2"].ssh_password.as_deref()), (Some("deploy"), Some("pw")));
         assert!(decrypt_credentials(b"too short").is_none());
     }
 
     #[test]
     fn converts_supported_connections_and_explains_the_rest() {
         let creds = HashMap::from([
-            ("postgres-jdbc-1".to_string(), Credentials { user: Some("app".into()), password: Some("s3cret".into()) }),
-            ("mysql8-2".to_string(), Credentials { user: Some("root".into()), password: Some("pw".into()) }),
-            ("mariaDB-3".to_string(), Credentials { user: Some("old".into()), password: Some("ignored".into()) }),
-            ("libsql_jdbc-5".to_string(), Credentials { user: None, password: Some("eyJ.token".into()) }),
+            ("postgres-jdbc-1".to_string(), Credentials { user: Some("app".into()), password: Some("s3cret".into()), ..Default::default() }),
+            ("mysql8-2".to_string(), Credentials {
+                user: Some("root".into()),
+                password: Some("pw".into()),
+                ssh_user: Some("deploy".into()),
+                ssh_password: Some("key-pass".into()),
+            }),
+            ("mariaDB-3".to_string(), Credentials { user: Some("old".into()), password: Some("ignored".into()), ..Default::default() }),
+            ("libsql_jdbc-5".to_string(), Credentials { user: None, password: Some("eyJ.token".into()), ..Default::default() }),
         ]);
         let scan = parse_data_sources(&sample(), &creds, None);
         let by_name = |n: &str| scan.connections.iter().find(|c| c.config.name == n).unwrap_or_else(|| panic!("{n}"));
@@ -507,7 +558,12 @@ mod tests {
         let my = by_name("Shop");
         assert_eq!((my.config.kind, my.config.host.as_str(), my.config.port, my.config.database.as_str()), (DatabaseKind::Mysql, "shop.internal", Some(3307), "shop"));
         assert_eq!((my.config.ssl_mode, my.config.show_all_databases), (SslMode::Disable, false));
-        assert!(my.warnings.iter().any(|w| w.contains("SSH tunnel")));
+        let tunnel = my.config.ssh.as_ref().expect("the SSH tunnel is imported");
+        assert_eq!(
+            (tunnel.host.as_str(), tunnel.port, tunnel.user.as_str(), tunnel.auth, tunnel.key_path.as_str(), tunnel.secret.as_deref()),
+            ("bastion.example.com", Some(2222), "deploy", SshAuth::PrivateKey, "/Users/me/.ssh/id_ed25519", Some("key-pass"))
+        );
+        assert!(my.warnings.is_empty(), "{:?}", my.warnings);
 
         let maria = by_name("Legacy");
         assert_eq!((maria.config.password.as_deref(), maria.config.ssl_mode), (None, SslMode::Require));

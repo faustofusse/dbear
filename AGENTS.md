@@ -55,6 +55,7 @@ cargo test -p dbcore              # core (Postgres tests skip without a database
 ./scripts/test-postgres.sh        # core against the dev database
 ./scripts/test-linux.sh [--windows] [--gpui] # core on Linux in an Apple container (running dev DBs forwarded); --windows cross-checks x86_64-pc-windows-gnu, --gpui builds apps/gpui
 ./scripts/test-libsql.sh          # core against the dev libSQL server (container dbear-libsql)
+./scripts/test-ssh.sh             # SSH tunnels: dev Postgres and MySQL through the dev SSH server (container dbear-ssh)
 ./scripts/test-sqlserver.sh       # core against the dev SQL Server (amd64 image under Rosetta, 4 GB)
 (cd apps/macos && swift test)     # Swift ⇄ Rust bridge
 ```
@@ -116,6 +117,15 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   skipping what the file header lists. `dbcore::restore` also handles `COPY … FROM stdin` blocks.
   CLI: `cargo run -p dbcore --example dump -- dump <url> out.sql.gz`. Round trips are tested in
   `crates/dbcore/tests/dump_*.rs` (fixtures in `dev/dump/`).
+- SSH tunnels: `dbcore::ssh` ([russh](https://github.com/warp-tech/russh) on ring). A connection
+  with `ssh` gets a `TunneledDriver`: it opens the tunnel on first use (and again after the SSH
+  session drops), listens on a free local port and forwards each connection to `host:port` as seen
+  from the SSH server (`direct-tcpip`). Drivers connect to `127.0.0.1:<forwarded_port>` but keep
+  `host` for TLS (Postgres `hostaddr`, MySQL hostname override). Dumps and restores open their own
+  tunnel (`ssh::route`). Host keys: the user's `~/.ssh/known_hosts` is read, never written; unknown
+  hosts are trusted once and recorded in `<app data>/dbear/known_hosts` (`DBEAR_KNOWN_HOSTS`
+  overrides it, for tests). The SSH password or passphrase is a keychain entry of its own, account
+  `<id>:ssh` (`secrets::ssh_account`). Dev server: `./scripts/dev-db.sh up ssh` (keys in `dev/ssh`).
 - SQL Server: [tiberius](https://github.com/prisma/tiberius), vendored with a small patch
   (`vendor/README.md`): rustls on ring, row counts for scripts, exact MONEY. Each `GO` batch runs on
   the script session, so temp tables and `SET` options persist. SSL "Disable" (shown as "Login Only")

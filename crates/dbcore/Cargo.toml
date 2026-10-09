@@ -34,6 +34,7 @@ reqwest.workspace = true
 base64.workspace = true
 flate2.workspace = true
 bytes.workspace = true
+russh.workspace = true
 keyring-core = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

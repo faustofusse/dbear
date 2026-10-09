@@ -51,6 +51,8 @@ bytes = "1"
 tree-sitter = "0.27"
 tree-sitter-sequel = "0.3"
 tree-sitter-json = "0.24"
+# SSH tunnels: pure-Rust client on ring (its default aws-lc-rs backend needs cmake on Linux).
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
 # OS credential stores (dbcore's `os-keyring` feature; the macOS app uses its own Swift Keychain code).
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }

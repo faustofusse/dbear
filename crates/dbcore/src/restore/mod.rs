@@ -93,6 +93,8 @@ async fn run(
     if crate::mock::is_mock(&config) {
         return Err(Error::Unsupported("sample connections can’t be restored into".into()));
     }
+    // Through an SSH server: one tunnel for the whole restore.
+    let (_tunnel, config) = crate::ssh::route(config).await?;
     let total = std::fs::metadata(&path).map_err(|e| read_error(&path, &e))?.len();
     let read = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel(256);

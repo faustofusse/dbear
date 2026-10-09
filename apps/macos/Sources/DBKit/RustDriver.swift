@@ -250,8 +250,36 @@ extension ConnectionConfig {
             id: c.id, name: c.name, group: c.group, kind: DatabaseKind(c.kind),
             host: c.host, port: c.port.map(Int.init), database: c.database, user: c.user,
             password: c.password, sslMode: SslMode(c.sslMode), showAllDatabases: c.showAllDatabases,
-            summary: DBCoreFFI.connectionSummary(config: c)
+            ssh: c.ssh.map(SshTunnel.init), summary: DBCoreFFI.connectionSummary(config: c)
         )
+    }
+}
+
+extension SshTunnel {
+    /// The Keychain account of a connection's SSH password or passphrase, beside its own password
+    /// (named by the core, so the GPUI app reads the same entry).
+    public static func secretAccount(for connectionID: String) -> String {
+        DBCoreFFI.sshSecretAccount(connectionId: connectionID)
+    }
+
+    init(_ s: DBCoreFFI.SshTunnel) {
+        let auth: SshAuth = switch s.auth {
+        case .password: .password
+        case .privateKey: .privateKey
+        case .agent: .agent
+        }
+        self.init(host: s.host, port: s.port.map(Int.init), user: s.user, auth: auth, keyPath: s.keyPath, secret: s.secret)
+    }
+}
+
+extension DBCoreFFI.SshTunnel {
+    init(_ s: SshTunnel) {
+        let auth: DBCoreFFI.SshAuth = switch s.auth {
+        case .password: .password
+        case .privateKey: .privateKey
+        case .agent: .agent
+        }
+        self.init(host: s.host, port: s.port.map { UInt16(clamping: $0) }, user: s.user, auth: auth, keyPath: s.keyPath, secret: s.secret)
     }
 }
 
@@ -260,7 +288,8 @@ extension DBCoreFFI.ConnectionConfig {
         self.init(
             id: c.id, name: c.name, group: c.group, kind: DBCoreFFI.DatabaseKind(c.kind),
             host: c.host, port: c.port.map { UInt16(clamping: $0) }, database: c.database, user: c.user,
-            password: c.password, sslMode: DBCoreFFI.SslMode(c.sslMode), showAllDatabases: c.showAllDatabases
+            password: c.password, sslMode: DBCoreFFI.SslMode(c.sslMode), showAllDatabases: c.showAllDatabases,
+            ssh: c.ssh.map(DBCoreFFI.SshTunnel.init)
         )
     }
 }

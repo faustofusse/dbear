@@ -14,6 +14,10 @@ struct ConnectionEditor: View {
     /// The password field was touched; otherwise the Keychain copy is kept as is.
     @State private var passwordEdited = false
     @State private var hasSavedPassword = false
+    /// The SSH password or key passphrase, handled like `password` (Keychain, untouched = kept).
+    @State private var sshSecret = ""
+    @State private var sshSecretEdited = false
+    @State private var hasSavedSSHSecret = false
     @State private var url = ""
     @State private var urlError: String?
     @State private var test: TestState = .idle
@@ -48,6 +52,7 @@ struct ConnectionEditor: View {
                 } else {
                     serverSection
                     authSection
+                    sshSection
                 }
             }
             .formStyle(.grouped)
@@ -56,13 +61,17 @@ struct ConnectionEditor: View {
         }
         .frame(width: 520)
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear { hasSavedPassword = model.hasSavedPassword(draft.id) }
+        .onAppear {
+            hasSavedPassword = model.hasSavedPassword(draft.id)
+            hasSavedSSHSecret = model.hasSavedSSHSecret(draft.id)
+        }
         .onChange(of: draft) { test = .idle; saveError = nil }
         .onChange(of: draft.kind) { old, new in kindChanged(from: old, to: new) }
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.item]) { result in
             if case .success(let url) = result { draft.database = url.path }
         }
         .onChange(of: password) { test = .idle }
+        .onChange(of: sshSecret) { test = .idle }
     }
 
     // MARK: Sections
@@ -204,6 +213,90 @@ struct ConnectionEditor: View {
         }
     }
 
+    /// Reach the server through an SSH server (`ssh -L`): its address, user and how to sign in.
+    private var sshSection: some View {
+        Section {
+            Toggle("Connect through SSH", isOn: usesSSH)
+            if draft.ssh != nil {
+                TextField("SSH Host", text: sshField(\.host), prompt: Text(verbatim: "bastion.example.com"))
+                TextField("SSH Port", value: sshPort, format: .number.grouping(.never), prompt: Text(verbatim: "22"))
+                TextField("SSH User", text: sshField(\.user), prompt: Text("Required"))
+                Picker("Sign In With", selection: sshField(\.auth)) {
+                    Text("Password").tag(SshAuth.password)
+                    Text("Private Key").tag(SshAuth.privateKey)
+                    Text("SSH Agent").tag(SshAuth.agent)
+                }
+                switch draft.ssh?.auth {
+                case .password:
+                    SecureField("SSH Password", text: $sshSecret, prompt: Text(sshSecretPrompt))
+                        .onChange(of: sshSecret) { sshSecretEdited = true }
+                case .privateKey:
+                    LabeledContent("Key File") {
+                        HStack(spacing: 6) {
+                            TextField("Key File", text: sshField(\.keyPath), prompt: Text(verbatim: "~/.ssh/id_ed25519"))
+                                .labelsHidden()
+                                .truncationMode(.head)
+                            Button("Choose…") { chooseKeyFile() }
+                        }
+                    }
+                    SecureField("Passphrase", text: $sshSecret, prompt: Text(sshSecretPrompt))
+                        .onChange(of: sshSecret) { sshSecretEdited = true }
+                default:
+                    EmptyView()
+                }
+            }
+        } header: {
+            Text("SSH Tunnel")
+        } footer: {
+            if draft.ssh != nil {
+                Text("Host and port above are as seen from the SSH server. The first time a server is used its host key is remembered, and a different key later is refused.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var usesSSH: Binding<Bool> {
+        Binding(get: { draft.ssh != nil }, set: { on in
+            draft.ssh = on ? (original?.ssh ?? SshTunnel(user: NSUserName())) : nil
+        })
+    }
+
+    private func sshField<T>(_ field: WritableKeyPath<SshTunnel, T>) -> Binding<T> {
+        Binding(
+            get: { (draft.ssh ?? SshTunnel())[keyPath: field] },
+            set: { draft.ssh?[keyPath: field] = $0 }
+        )
+    }
+
+    private var sshPort: Binding<Int?> {
+        Binding(get: { draft.ssh?.port }, set: { draft.ssh?.port = $0 })
+    }
+
+    private var sshSecretPrompt: String {
+        if hasSavedSSHSecret && !sshSecretEdited { return "Saved in Keychain" }
+        return draft.ssh?.auth == .privateKey ? "None" : "Required"
+    }
+
+    /// The SSH secret to connect with: what was typed, or the saved one if untouched.
+    private var effectiveSSHSecret: String? {
+        if sshSecretEdited { return sshSecret.isEmpty ? nil : sshSecret }
+        return hasSavedSSHSecret ? model.savedSSHSecret(draft.id) : nil
+    }
+
+    /// An open panel that starts in ~/.ssh and shows hidden files (keys live in a hidden folder).
+    private func chooseKeyFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+        panel.message = "Choose the private key to sign in to the SSH server with."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        draft.ssh?.keyPath = url.path.hasPrefix(home + "/") ? "~" + url.path.dropFirst(home.count) : url.path
+    }
+
     private var footer: some View {
         HStack(spacing: 8) {
             Button("Test Connection") { Task { await runTest() } }
@@ -292,6 +385,7 @@ struct ConnectionEditor: View {
         if (old == .sqlite) != (new == .sqlite) { draft.database = "" }
         if new != .sqlite, draft.host.trimmingCharacters(in: .whitespaces).isEmpty { draft.host = "localhost" }
         if draft.port == old.defaultPort { draft.port = nil }
+        if !draft.supportsSSH { draft.ssh = nil }
         // Turso: a remote host (not localhost), no user or database, certificate verified.
         if new == .libsql {
             if draft.host == "localhost" { draft.host = "" }
@@ -307,13 +401,15 @@ struct ConnectionEditor: View {
         test = .running
         var config = draft
         config.password = effectivePassword
+        if config.ssh?.auth != .agent { config.ssh?.secret = effectiveSSHSecret }
         let error = await model.test(config)
         test = error.map(TestState.failed) ?? .succeeded
     }
 
     private func save() {
         do {
-            let saved = try model.save(draft, password: passwordEdited ? password : nil)
+            let saved = try model.save(
+                draft, password: passwordEdited ? password : nil, sshSecret: sshSecretEdited ? sshSecret : nil)
             if isNew { model.selectedConnectionID = saved.id }
             dismiss()
         } catch {

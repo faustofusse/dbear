@@ -72,6 +72,60 @@ pub struct ConnectionConfig {
     /// Offer every database on the server, not just `database`, to switch between (Postgres, MySQL).
     /// `database` stays the one opened first.
     pub show_all_databases: bool,
+    /// Reach the server through an SSH server (Postgres, MySQL, SQL Server). `host` and `port` are
+    /// then as seen from the SSH server.
+    pub ssh: Option<SshTunnel>,
+}
+
+/// How to sign in to an SSH server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshAuth {
+    #[default]
+    Password,
+    /// A private key file (`SshTunnel::key_path`), with an optional passphrase.
+    PrivateKey,
+    /// The keys of the running SSH agent (`SSH_AUTH_SOCK`; Pageant or OpenSSH's agent on Windows).
+    Agent,
+}
+
+/// An SSH server the database is reached through (port forwarding, like `ssh -L`).
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+pub struct SshTunnel {
+    pub host: String,
+    /// `None`: 22.
+    pub port: Option<u16>,
+    pub user: String,
+    pub auth: SshAuth,
+    /// The private key for [`SshAuth::PrivateKey`] (`~` is expanded).
+    pub key_path: String,
+    /// The SSH password, or the key's passphrase. Supplied by the frontend from the platform
+    /// keychain (see `secrets::ssh_account`); never persisted by the core.
+    pub secret: Option<String>,
+    /// Set by the core while a tunnel is open: the local port it listens on. Leave `None`.
+    pub forwarded_port: Option<u16>,
+}
+
+impl SshTunnel {
+    pub const DEFAULT_PORT: u16 = 22;
+
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or(Self::DEFAULT_PORT)
+    }
+}
+
+impl std::fmt::Debug for SshTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshTunnel")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("auth", &self.auth)
+            .field("key_path", &self.key_path)
+            .field("secret", &self.secret.as_ref().map(|_| "•••"))
+            .field("forwarded_port", &self.forwarded_port)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for ConnectionConfig {
@@ -88,6 +142,7 @@ impl std::fmt::Debug for ConnectionConfig {
             .field("password", &self.password.as_ref().map(|_| "•••"))
             .field("ssl_mode", &self.ssl_mode)
             .field("show_all_databases", &self.show_all_databases)
+            .field("ssh", &self.ssh)
             .finish()
     }
 }
@@ -100,6 +155,18 @@ impl ConnectionConfig {
     }
 
     /// The same connection pointed at another database on the server.
+    /// Whether this kind of database can be reached through an SSH tunnel (TCP servers; not SQLite
+    /// files, nor Turso, which is reached over HTTPS).
+    pub fn supports_ssh(&self) -> bool {
+        matches!(self.kind, DatabaseKind::Postgres | DatabaseKind::Mysql | DatabaseKind::SqlServer)
+    }
+
+    /// The local port of the open SSH tunnel to connect to instead of `host:port` (drivers keep
+    /// `host` for TLS: the certificate is the server's).
+    pub(crate) fn tunneled_port(&self) -> Option<u16> {
+        self.ssh.as_ref().and_then(|s| s.forwarded_port)
+    }
+
     pub fn with_database(&self, database: &str) -> Self {
         Self { database: database.into(), ..self.clone() }
     }
@@ -129,8 +196,17 @@ impl ConnectionConfig {
         }
     }
 
-    /// e.g. "PostgreSQL · localhost:5432/app_dev", or "PostgreSQL · localhost:5432" without a database.
+    /// e.g. "PostgreSQL · localhost:5432/app_dev", or "PostgreSQL · localhost:5432" without a database;
+    /// "… via bastion.example.com" through an SSH server.
     pub fn summary(&self) -> String {
+        let summary = self.address_summary();
+        match self.ssh.as_ref().filter(|_| self.supports_ssh()) {
+            Some(ssh) if !ssh.host.trim().is_empty() => format!("{summary} via {}", ssh.host.trim()),
+            _ => summary,
+        }
+    }
+
+    fn address_summary(&self) -> String {
         let kind = self.kind.display_name();
         if self.kind == DatabaseKind::Sqlite {
             return format!("{kind} · {}", self.database);

@@ -25,10 +25,21 @@ pub trait SecretStore: Send + Sync {
     fn delete_password(&self, id: &str) -> Result<()>;
 }
 
-/// `config` with its saved password filled in, unless it already carries one (typed into a form).
+/// The account of a connection's SSH password or key passphrase (beside its own, under the
+/// connection id). The macOS app uses the same account.
+pub fn ssh_account(id: &str) -> String {
+    format!("{id}:ssh")
+}
+
+/// `config` with its saved password filled in (and its SSH password or passphrase, when it goes
+/// through an SSH server), unless it already carries them (typed into a form).
 pub fn with_password(store: &dyn SecretStore, mut config: ConnectionConfig) -> Result<ConnectionConfig> {
     if config.password.is_none() {
         config.password = store.password(&config.id)?;
+    }
+    let id = config.id.clone();
+    if let Some(ssh) = config.ssh.as_mut().filter(|s| s.secret.is_none() && s.auth != crate::model::SshAuth::Agent) {
+        ssh.secret = store.password(&ssh_account(&id))?;
     }
     Ok(config)
 }
@@ -200,7 +211,24 @@ mod tests {
             password: password.map(Into::into),
             ssl_mode: SslMode::default(),
             show_all_databases: true,
+            ssh: None,
         }
+    }
+
+    #[test]
+    fn fills_the_ssh_secret_from_its_own_account() {
+        use crate::model::{SshAuth, SshTunnel};
+        let store = MemorySecretStore::new();
+        store.set_password("a", "db-pw").unwrap();
+        store.set_password(&ssh_account("a"), "ssh-pw").unwrap();
+        let tunnel = SshTunnel { host: "bastion".into(), user: "me".into(), ..Default::default() };
+        let filled = with_password(&store, ConnectionConfig { ssh: Some(tunnel.clone()), ..config("a", None) }).unwrap();
+        assert_eq!(filled.password.as_deref(), Some("db-pw"));
+        assert_eq!(filled.ssh.unwrap().secret.as_deref(), Some("ssh-pw"));
+        // The agent needs no secret.
+        let agent = SshTunnel { auth: SshAuth::Agent, ..tunnel };
+        let filled = with_password(&store, ConnectionConfig { ssh: Some(agent), ..config("a", None) }).unwrap();
+        assert_eq!(filled.ssh.unwrap().secret, None);
     }
 
     #[test]

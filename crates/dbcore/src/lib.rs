@@ -27,6 +27,7 @@ pub mod secrets;
 pub mod postgres;
 pub mod sqlite;
 pub mod sqlserver;
+mod ssh;
 pub mod state;
 pub mod store;
 

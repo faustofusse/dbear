@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use dbcore::secrets::{self, KeyringSecretStore};
-use dbcore::{Connection, ConnectionConfig, DatabaseKind, SslMode};
+use dbcore::{Connection, ConnectionConfig, DatabaseKind, SshAuth, SshTunnel, SslMode};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -16,6 +16,24 @@ use gpui_kit::*;
 const KINDS: [DatabaseKind; 5] =
     [DatabaseKind::Postgres, DatabaseKind::Mysql, DatabaseKind::SqlServer, DatabaseKind::Sqlite, DatabaseKind::Libsql];
 const SSL_MODES: [SslMode; 4] = [SslMode::Disable, SslMode::Prefer, SslMode::Require, SslMode::VerifyFull];
+
+const SSH_AUTHS: [SshAuth; 3] = [SshAuth::Password, SshAuth::PrivateKey, SshAuth::Agent];
+
+fn ssh_auth_title(auth: SshAuth) -> &'static str {
+    match auth {
+        SshAuth::Password => "Password",
+        SshAuth::PrivateKey => "Private key",
+        SshAuth::Agent => "SSH agent",
+    }
+}
+
+/// What the form describes: the connection, and the secrets typed into it (`None`: untouched).
+pub struct EditorValues {
+    pub config: ConnectionConfig,
+    pub password: Option<String>,
+    /// The SSH password or key passphrase.
+    pub ssh_secret: Option<String>,
+}
 
 fn ssl_title(mode: SslMode) -> &'static str {
     match mode {
@@ -46,6 +64,15 @@ pub struct ConnectionEditor {
     user: Entity<InputState>,
     password: Entity<InputState>,
     database: Entity<InputState>,
+    /// Reach the server through an SSH server.
+    use_ssh: bool,
+    ssh_auth: SshAuth,
+    ssh_host: Entity<InputState>,
+    ssh_port: Entity<InputState>,
+    ssh_user: Entity<InputState>,
+    ssh_key: Entity<InputState>,
+    /// The SSH password or the key's passphrase.
+    ssh_secret: Entity<InputState>,
     status: Option<Status>,
     secrets: Option<Arc<KeyringSecretStore>>,
     test_task: Option<Task<()>>,
@@ -72,7 +99,15 @@ impl ConnectionEditor {
         let database = input(config.database.clone(), "");
         // Saved passwords are never read back into the form (that could prompt for keychain access).
         let password_placeholder = if original.is_some() { "Unchanged" } else { "" };
+        let ssh = config.ssh.clone().unwrap_or_default();
+        let ssh_host = input(ssh.host.clone(), "bastion.example.com");
+        let ssh_port = input(ssh.port.map(|p| p.to_string()).unwrap_or_default(), "22");
+        let default_user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+        let ssh_user = input(if config.ssh.is_some() { ssh.user.clone() } else { default_user }, "Required");
+        let ssh_key = input(ssh.key_path.clone(), "~/.ssh/id_ed25519");
         let password = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(password_placeholder));
+        let secret_placeholder = if config.ssh.is_some() { "Unchanged" } else { "" };
+        let ssh_secret = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(secret_placeholder));
         let mut editor = Self {
             original,
             kind: config.kind,
@@ -86,6 +121,13 @@ impl ConnectionEditor {
             user,
             password,
             database,
+            use_ssh: config.ssh.is_some(),
+            ssh_auth: ssh.auth,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_key,
+            ssh_secret,
             status: None,
             secrets,
             test_task: None,
@@ -160,6 +202,19 @@ impl ConnectionEditor {
         cx.notify();
     }
 
+    fn choose_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Choose".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            this.update_in(cx, |this, window, cx| {
+                this.ssh_key.update(cx, |s, cx| s.set_value(path.display().to_string(), window, cx));
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn choose_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -178,8 +233,8 @@ impl ConnectionEditor {
         .detach();
     }
 
-    /// What the form describes, validated. The password is only included when typed.
-    pub fn config(&self, cx: &App) -> Result<(ConnectionConfig, Option<String>), String> {
+    /// What the form describes, validated. Passwords are only included when typed.
+    pub fn values(&self, cx: &App) -> Result<EditorValues, String> {
         let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
         let mut config = self.original.clone().unwrap_or_else(|| ConnectionConfig::new_empty(self.kind));
         config.kind = self.kind;
@@ -203,10 +258,27 @@ impl ConnectionEditor {
             config.port = None;
             config.user = None;
         }
+        config.ssh = None;
+        if self.use_ssh && config.supports_ssh() {
+            let port = text(&self.ssh_port);
+            config.ssh = Some(SshTunnel {
+                host: text(&self.ssh_host),
+                port: if port.is_empty() {
+                    None
+                } else {
+                    Some(port.parse::<u16>().map_err(|_| "SSH port must be between 1 and 65535.".to_string())?)
+                },
+                user: text(&self.ssh_user),
+                auth: self.ssh_auth,
+                key_path: if self.ssh_auth == SshAuth::PrivateKey { text(&self.ssh_key) } else { String::new() },
+                ..Default::default()
+            });
+        }
         config.validate().map_err(|e| e.to_string())?;
         // Not trimmed: spaces can be part of a password.
-        let password = self.password.read(cx).value().to_string();
-        Ok((config, (!password.is_empty()).then_some(password)))
+        let typed = |input: &Entity<InputState>| Some(input.read(cx).value().to_string()).filter(|p| !p.is_empty());
+        let ssh_secret = config.ssh.as_ref().filter(|s| s.auth != SshAuth::Agent).and_then(|_| typed(&self.ssh_secret));
+        Ok(EditorValues { config, password: typed(&self.password), ssh_secret })
     }
 
     pub fn show_error(&mut self, message: String, cx: &mut Context<Self>) {
@@ -215,13 +287,16 @@ impl ConnectionEditor {
     }
 
     pub fn test(&mut self, cx: &mut Context<Self>) {
-        let (mut config, password) = match self.config(cx) {
-            Ok(config) => config,
+        let EditorValues { mut config, password, ssh_secret } = match self.values(cx) {
+            Ok(values) => values,
             Err(e) => return self.show_error(e, cx),
         };
-        // Editing without retyping the password: test with the saved one.
-        let saved = if password.is_none() && !self.is_new() { self.secrets.clone() } else { None };
+        // Editing without retyping a password: test with the saved one.
+        let saved = if !self.is_new() { self.secrets.clone() } else { None };
         config.password = password;
+        if let Some(ssh) = config.ssh.as_mut() {
+            ssh.secret = ssh_secret;
+        }
         self.status = Some(Status::Testing);
         self.test_task = Some(cx.spawn(async move |this, cx| {
             let config = cx
@@ -334,6 +409,66 @@ impl Render for ConnectionEditor {
                     .child(Self::field(if libsql { "Auth token" } else { "Password" }, Input::new(&self.password).mask_toggle(), cx))
                     .when(!libsql, |form| form.child(Self::field("Database", Input::new(&self.database), cx)))
                     .child(Self::field("SSL", h_flex().child(ssl_menu), cx))
+            })
+            .when(ConnectionConfig::new_empty(kind).supports_ssh(), |form| {
+                let auth = self.ssh_auth;
+                let auth_menu = Button::new("ssh-auth").outline().label(ssh_auth_title(auth)).dropdown_caret(true).dropdown_menu({
+                    let this = this.clone();
+                    move |mut menu, _, _| {
+                        for a in SSH_AUTHS {
+                            let this = this.clone();
+                            menu = menu.item(PopupMenuItem::new(ssh_auth_title(a)).checked(a == auth).on_click(move |_, _, cx| {
+                                this.update(cx, |e, cx| {
+                                    e.ssh_auth = a;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }));
+                        }
+                        menu
+                    }
+                });
+                form.child(div().h_px().bg(cx.theme().border))
+                    .child(Self::field(
+                        "SSH tunnel",
+                        Switch::new("use-ssh").small().checked(self.use_ssh).label("Connect through an SSH server").on_click(
+                            cx.listener(|this, checked: &bool, _, cx| {
+                                this.use_ssh = *checked;
+                                cx.notify();
+                            }),
+                        ),
+                        cx,
+                    ))
+                    .when(self.use_ssh, |form| {
+                        form.child(Self::field("SSH host", Input::new(&self.ssh_host), cx))
+                            .child(Self::field("SSH port", div().w(px(120.)).child(Input::new(&self.ssh_port)), cx))
+                            .child(Self::field("SSH user", Input::new(&self.ssh_user), cx))
+                            .child(Self::field("Sign in with", h_flex().child(auth_menu), cx))
+                            .when(auth == SshAuth::PrivateKey, |form| {
+                                form.child(Self::field(
+                                    "Key file",
+                                    h_flex().gap_2().child(div().flex_1().child(Input::new(&self.ssh_key))).child(
+                                        Button::new("choose-key")
+                                            .outline()
+                                            .label("Choose…")
+                                            .on_click(cx.listener(|this, _, window, cx| this.choose_key(window, cx))),
+                                    ),
+                                    cx,
+                                ))
+                            })
+                            .when(auth != SshAuth::Agent, |form| {
+                                let label = if auth == SshAuth::PrivateKey { "Passphrase" } else { "SSH password" };
+                                form.child(Self::field(label, Input::new(&self.ssh_secret).mask_toggle(), cx))
+                            })
+                            .child(Self::field(
+                                "",
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Host and port above are as seen from the SSH server."),
+                                cx,
+                            ))
+                    })
             })
             .when(ConnectionConfig::new_empty(kind).supports_multiple_databases(), |form| {
                 form.child(Self::field(

@@ -27,8 +27,14 @@ as SQLite.
 - Pick the database from the title of the tables column. dbear remembers the last database you
   used on each connection. **New Database…** creates one.
 - SQL Server supports SQL logins only. Windows and Azure AD authentication aren't supported yet.
+- **SSH tunnels** (PostgreSQL, MySQL, SQL Server): turn on **Connect through SSH** and sign in to
+  the SSH server with a password, a private key (with its passphrase, if any) or your SSH agent.
+  The database's host and port are then as seen from the SSH server. Host keys are checked against
+  `~/.ssh/known_hosts`. A server that isn't listed there is trusted the first time and remembered,
+  and a different key later is refused. DBeaver connections bring their tunnels along, except jump
+  servers.
 
-Passwords and auth tokens are stored in the macOS Keychain. Everything else is kept in
+Passwords, SSH passwords and passphrases, and auth tokens are stored in the macOS Keychain. Everything else is kept in
 `~/Library/Application Support/dbear/dbear.db`.
 
 ## Features

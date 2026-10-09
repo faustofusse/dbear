@@ -253,6 +253,8 @@ async fn run(
     if crate::mock::is_mock(&config) {
         return Err(Error::Unsupported("sample connections can’t be dumped".into()));
     }
+    // Through an SSH server: one tunnel for the whole dump.
+    let (_tunnel, config) = crate::ssh::route(config).await?;
     let (out, writer) = writer::start(&path, options.compression)?;
     let mut ctx = Ctx::new(out, options, progress);
     ctx.report();

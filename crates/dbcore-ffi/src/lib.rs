@@ -47,6 +47,27 @@ pub struct ConnectionConfig {
     pub password: Option<String>,
     pub ssl_mode: SslMode,
     pub show_all_databases: bool,
+    /// Reach the server through an SSH server (Postgres, MySQL, SQL Server).
+    pub ssh: Option<SshTunnel>,
+}
+
+#[derive(uniffi::Enum, Clone, Copy)]
+pub enum SshAuth {
+    Password,
+    PrivateKey,
+    Agent,
+}
+
+/// An SSH server the database is reached through (see `dbcore::SshTunnel`).
+#[derive(uniffi::Record, Clone)]
+pub struct SshTunnel {
+    pub host: String,
+    pub port: Option<u16>,
+    pub user: String,
+    pub auth: SshAuth,
+    pub key_path: String,
+    /// The SSH password or the key's passphrase, from the Keychain (account: `ssh_secret_account`).
+    pub secret: Option<String>,
 }
 
 #[derive(uniffi::Enum, Clone, Copy)]
@@ -378,6 +399,12 @@ impl ConnectionStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, dbcore::ConnectionStore> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// The Keychain account of a connection's SSH password or key passphrase (shared with the GPUI app).
+#[uniffi::export]
+pub fn ssh_secret_account(connection_id: String) -> String {
+    dbcore::secrets::ssh_account(&connection_id)
 }
 
 /// Blank config for the "Add Connection" form.
@@ -721,6 +748,19 @@ impl From<ConnectionConfig> for dbcore::ConnectionConfig {
             password: c.password,
             ssl_mode: c.ssl_mode.into(),
             show_all_databases: c.show_all_databases,
+            ssh: c.ssh.map(|s| dbcore::SshTunnel {
+                host: s.host,
+                port: s.port,
+                user: s.user,
+                auth: match s.auth {
+                    SshAuth::Password => dbcore::SshAuth::Password,
+                    SshAuth::PrivateKey => dbcore::SshAuth::PrivateKey,
+                    SshAuth::Agent => dbcore::SshAuth::Agent,
+                },
+                key_path: s.key_path,
+                secret: s.secret,
+                forwarded_port: None,
+            }),
         }
     }
 }
@@ -739,6 +779,18 @@ impl From<dbcore::ConnectionConfig> for ConnectionConfig {
             password: c.password,
             ssl_mode: c.ssl_mode.into(),
             show_all_databases: c.show_all_databases,
+            ssh: c.ssh.map(|s| SshTunnel {
+                host: s.host,
+                port: s.port,
+                user: s.user,
+                auth: match s.auth {
+                    dbcore::SshAuth::Password => SshAuth::Password,
+                    dbcore::SshAuth::PrivateKey => SshAuth::PrivateKey,
+                    dbcore::SshAuth::Agent => SshAuth::Agent,
+                },
+                key_path: s.key_path,
+                secret: s.secret,
+            }),
         }
     }
 }

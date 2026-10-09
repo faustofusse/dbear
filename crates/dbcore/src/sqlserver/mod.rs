@@ -298,6 +298,19 @@ async fn open(config: &ConnectionConfig, level: EncryptionLevel) -> std::result:
         // Encrypt without verifying (self-signed certificates are the norm), like libpq's `require`.
         tds.trust_cert();
     }
+    // Through an SSH tunnel: connect to its local end; `host` still names the server for TLS.
+    // (Named instances need a port then: SQL Server Browser is UDP, which the tunnel doesn't carry.)
+    if let Some(port) = config.tunneled_port() {
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+        tcp.set_nodelay(true)?;
+        return match tiberius::Client::connect(tds, tcp.compat_write()).await {
+            Err(TdsError::Routing { host, port }) => Err(TdsError::Io {
+                kind: std::io::ErrorKind::Unsupported,
+                message: format!("the server redirected to {host}:{port}, which the SSH tunnel doesn’t reach"),
+            }),
+            other => other,
+        };
+    }
     // Azure SQL's gateway may redirect to the node that hosts the database.
     let mut redirected = false;
     loop {

@@ -41,13 +41,16 @@ public struct ConnectionConfig: Identifiable, Hashable, Sendable {
     public var sslMode: SslMode
     /// List every database on the server in the sidebar; `database` is the default one.
     public var showAllDatabases: Bool
+    /// Reach the server through an SSH server; `host` and `port` are then as seen from it.
+    public var ssh: SshTunnel?
     /// e.g. "PostgreSQL · localhost:5432/app_dev" (formatted by the Rust core).
     public var summary: String
 
     public init(
         id: String, name: String, group: String, kind: DatabaseKind,
         host: String, port: Int? = nil, database: String, user: String? = nil,
-        password: String? = nil, sslMode: SslMode = .prefer, showAllDatabases: Bool = true, summary: String = ""
+        password: String? = nil, sslMode: SslMode = .prefer, showAllDatabases: Bool = true,
+        ssh: SshTunnel? = nil, summary: String = ""
     ) {
         self.id = id
         self.name = name
@@ -60,12 +63,46 @@ public struct ConnectionConfig: Identifiable, Hashable, Sendable {
         self.password = password
         self.sslMode = sslMode
         self.showAllDatabases = showAllDatabases
+        self.ssh = ssh
         self.summary = summary
     }
+
+    /// Can go through an SSH tunnel (servers reached over TCP; not SQLite files or Turso).
+    public var supportsSSH: Bool { [.postgres, .mysql, .sqlServer].contains(kind) }
 
     /// The server's other databases can be switched to (the tables column's title menu), each with
     /// its own session (Postgres, MySQL, SQL Server). SQLite files have none.
     public var supportsMultipleDatabases: Bool { [.postgres, .mysql, .sqlServer].contains(kind) }
+}
+
+public enum SshAuth: String, Sendable, Hashable, CaseIterable {
+    case password
+    case privateKey
+    /// The keys of the running SSH agent (`SSH_AUTH_SOCK`).
+    case agent
+}
+
+/// An SSH server the database is reached through (port forwarding, like `ssh -L`).
+public struct SshTunnel: Hashable, Sendable {
+    public var host: String
+    /// nil: 22.
+    public var port: Int?
+    public var user: String
+    public var auth: SshAuth
+    /// The private key file, for `.privateKey` (`~` is expanded).
+    public var keyPath: String
+    /// The SSH password or the key's passphrase. From the Keychain; never saved in the store.
+    public var secret: String?
+
+    public init(host: String = "", port: Int? = nil, user: String = "", auth: SshAuth = .password, keyPath: String = "", secret: String? = nil) {
+        self.host = host
+        self.port = port
+        self.user = user
+        self.auth = auth
+        self.keyPath = keyPath
+        self.secret = secret
+    }
+
 }
 
 public enum TableKind: String, Sendable, Hashable {

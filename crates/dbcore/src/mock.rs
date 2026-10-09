@@ -55,6 +55,7 @@ pub fn connections() -> Vec<ConnectionConfig> {
             password: None,
             ssl_mode: SslMode::default(),
             show_all_databases: kind != DatabaseKind::Sqlite,
+            ssh: None,
         }
     }
     use DatabaseKind::*;

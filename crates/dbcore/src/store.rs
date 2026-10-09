@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::driver::{Error, Result};
-use crate::model::{ConnectionConfig, DatabaseKind, SslMode};
+use crate::model::{ConnectionConfig, DatabaseKind, SshAuth, SshTunnel, SslMode};
 
 /// File name inside the app's config folder.
 pub const DATABASE_FILE: &str = "dbear.db";
@@ -43,6 +43,12 @@ const MIGRATIONS: &[&str] = &[
     create index connections_position on connections (position);",
     // 2: the database last browsed on each connection, reopened next time.
     "alter table connections add column last_database text;",
+    // 3: SSH tunnels (`ssh_host` null: none). Passwords and passphrases stay in the keychain.
+    "alter table connections add column ssh_host text;
+    alter table connections add column ssh_port integer;
+    alter table connections add column ssh_user text;
+    alter table connections add column ssh_auth text;
+    alter table connections add column ssh_key_path text;",
 ];
 
 fn storage(path: &Path, e: impl std::fmt::Display) -> Error {
@@ -257,6 +263,15 @@ fn normalized(c: &ConnectionConfig) -> ConnectionConfig {
         password: None,
         ssl_mode: c.ssl_mode,
         show_all_databases: c.show_all_databases,
+        ssh: c.ssh.as_ref().map(|s| SshTunnel {
+            host: s.host.trim().into(),
+            port: s.port,
+            user: s.user.trim().into(),
+            auth: s.auth,
+            key_path: if s.auth == SshAuth::PrivateKey { s.key_path.trim().into() } else { String::new() },
+            secret: None,
+            forwarded_port: None,
+        }),
     }
 }
 
@@ -273,7 +288,8 @@ fn parse_enum<T: DeserializeOwned>(column: usize, text: String) -> rusqlite::Res
 
 fn load(db: &rusqlite::Connection) -> rusqlite::Result<Vec<ConnectionConfig>> {
     let mut stmt = db.prepare_cached(
-        "select id, name, grp, kind, host, port, database, user, ssl_mode, show_all_databases
+        "select id, name, grp, kind, host, port, database, user, ssl_mode, show_all_databases,
+                ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path
          from connections order by position, rowid",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -289,6 +305,21 @@ fn load(db: &rusqlite::Connection) -> rusqlite::Result<Vec<ConnectionConfig>> {
             password: None,
             ssl_mode: parse_enum::<SslMode>(8, r.get(8)?)?,
             show_all_databases: r.get(9)?,
+            ssh: match r.get::<_, Option<String>>(10)? {
+                Some(host) => Some(SshTunnel {
+                    host,
+                    port: r.get(11)?,
+                    user: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    auth: match r.get::<_, Option<String>>(13)? {
+                        Some(auth) => parse_enum::<SshAuth>(13, auth)?,
+                        None => SshAuth::default(),
+                    },
+                    key_path: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                    secret: None,
+                    forwarded_port: None,
+                }),
+                None => None,
+            },
         })
     })?
     .collect();
@@ -298,22 +329,28 @@ fn load(db: &rusqlite::Connection) -> rusqlite::Result<Vec<ConnectionConfig>> {
 /// Updates the row in place (keeping its position) or appends it.
 fn insert_or_update(tx: &Transaction, c: &ConnectionConfig) -> rusqlite::Result<()> {
     let exists = tx.query_row("select 1 from connections where id = ?1", [&c.id], |_| Ok(())).optional()?.is_some();
+    let ssh = c.ssh.as_ref();
     let values = params![
         c.id, c.name, c.group, enum_text(&c.kind), c.host, c.port, c.database, c.user,
         enum_text(&c.ssl_mode), c.show_all_databases,
+        ssh.map(|s| &s.host), ssh.and_then(|s| s.port), ssh.map(|s| &s.user), ssh.map(|s| enum_text(&s.auth)),
+        ssh.map(|s| &s.key_path).filter(|p| !p.is_empty()),
     ];
     if exists {
         tx.execute(
             "update connections set name = ?2, grp = ?3, kind = ?4, host = ?5, port = ?6,
              last_database = case when database = ?7 and host = ?5 and show_all_databases = ?10
                                   then last_database end,
-             database = ?7, user = ?8, ssl_mode = ?9, show_all_databases = ?10 where id = ?1",
+             database = ?7, user = ?8, ssl_mode = ?9, show_all_databases = ?10,
+             ssh_host = ?11, ssh_port = ?12, ssh_user = ?13, ssh_auth = ?14, ssh_key_path = ?15 where id = ?1",
             values,
         )?;
     } else {
         tx.execute(
-            "insert into connections (id, name, grp, kind, host, port, database, user, ssl_mode, show_all_databases, position)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, (select coalesce(max(position), -1) + 1 from connections))",
+            "insert into connections (id, name, grp, kind, host, port, database, user, ssl_mode, show_all_databases,
+                                      ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path, position)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     (select coalesce(max(position), -1) + 1 from connections))",
             values,
         )?;
     }
@@ -378,6 +415,7 @@ fn read_json_store(path: &Path) -> Result<Vec<ConnectionConfig>> {
                 password: None,
                 ssl_mode: s.ssl_mode,
                 show_all_databases: s.show_all_databases,
+                ssh: None,
             })
         })
         .collect())
@@ -601,5 +639,57 @@ mod tests {
         assert_eq!(store.connections().len(), 1);
         store.set_last_database("a", Some("app")).unwrap();
         assert_eq!(store.last_database("a").as_deref(), Some("app"));
+        assert_eq!(store.connections()[0].ssh, None);
+    }
+
+    #[test]
+    fn keeps_ssh_tunnels_without_their_secrets() {
+        use crate::model::{SshAuth, SshTunnel};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbear.db");
+        let mut store = ConnectionStore::open(&path).unwrap();
+        let tunnel = SshTunnel {
+            host: " bastion.example.com ".into(),
+            port: Some(2222),
+            user: "deploy".into(),
+            auth: SshAuth::PrivateKey,
+            key_path: "~/.ssh/id_ed25519".into(),
+            secret: Some("passphrase".into()),
+            forwarded_port: Some(1234),
+        };
+        let saved = store.upsert(ConnectionConfig { ssh: Some(tunnel), ..sample("tunneled") }).unwrap();
+        let expected = SshTunnel {
+            host: "bastion.example.com".into(),
+            port: Some(2222),
+            user: "deploy".into(),
+            auth: SshAuth::PrivateKey,
+            key_path: "~/.ssh/id_ed25519".into(),
+            secret: None,
+            forwarded_port: None,
+        };
+        assert_eq!(saved.ssh.as_ref(), Some(&expected));
+        assert_eq!(ConnectionStore::open(&path).unwrap().connections()[0].ssh.as_ref(), Some(&expected));
+        assert!(!std::fs::read(&path).unwrap().windows(10).any(|w| w == b"passphrase"));
+
+        // Switching to the agent forgets the key path; removing the tunnel clears it all.
+        let agent = SshTunnel { auth: SshAuth::Agent, ..expected };
+        let saved = store.upsert(ConnectionConfig { ssh: Some(agent), ..saved }).unwrap();
+        assert_eq!(saved.ssh.as_ref().map(|s| s.key_path.as_str()), Some(""));
+        let saved = store.upsert(ConnectionConfig { ssh: None, ..saved }).unwrap();
+        assert_eq!(ConnectionStore::open(&path).unwrap().connections()[0].ssh, None);
+        assert_eq!(saved.ssh, None);
+    }
+
+    #[test]
+    fn validates_ssh_tunnels() {
+        use crate::model::{SshAuth, SshTunnel};
+        let with = |ssh: SshTunnel| ConnectionConfig { ssh: Some(ssh), ..sample("x") }.validate().err().map(|e| e.to_string());
+        let ok = SshTunnel { host: "bastion".into(), user: "me".into(), ..Default::default() };
+        assert_eq!(with(ok.clone()), None);
+        assert!(with(SshTunnel { host: " ".into(), ..ok.clone() }).unwrap().contains("SSH host"));
+        assert!(with(SshTunnel { user: String::new(), ..ok.clone() }).unwrap().contains("SSH user"));
+        assert!(with(SshTunnel { auth: SshAuth::PrivateKey, ..ok.clone() }).unwrap().contains("key file"));
+        let sqlite = ConnectionConfig { ssh: Some(ok), database: "/tmp/a.db".into(), ..ConnectionConfig::new_empty(DatabaseKind::Sqlite) };
+        assert!(sqlite.validate().unwrap_err().to_string().contains("SSH"));
     }
 }

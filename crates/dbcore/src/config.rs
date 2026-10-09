@@ -28,6 +28,7 @@ impl ConnectionConfig {
             // Turso is always reached over the internet: verify its certificate by default.
             ssl_mode: if kind == DatabaseKind::Libsql { SslMode::VerifyFull } else { SslMode::default() },
             show_all_databases: !kind.is_sqlite_family(),
+            ssh: None,
         }
     }
 
@@ -35,6 +36,9 @@ impl ConnectionConfig {
     pub fn validate(&self) -> Result<()> {
         // Name and database are optional (see `default_name` / `default_database`).
         let invalid = |msg: &str| Err(Error::InvalidConfig(msg.into()));
+        if self.ssh.is_some() && !self.supports_ssh() {
+            return Err(Error::InvalidConfig(format!("{} connections can’t use an SSH tunnel.", self.kind.display_name())));
+        }
         if self.kind == DatabaseKind::Sqlite {
             if self.database.trim().is_empty() {
                 return invalid("Choose a database file.");
@@ -49,6 +53,20 @@ impl ConnectionConfig {
         }
         if self.port == Some(0) {
             return invalid("Port must be between 1 and 65535.");
+        }
+        if let Some(ssh) = &self.ssh {
+            if ssh.host.trim().is_empty() {
+                return invalid("Enter the SSH host.");
+            }
+            if ssh.user.trim().is_empty() {
+                return invalid("Enter the SSH user.");
+            }
+            if ssh.port == Some(0) {
+                return invalid("SSH port must be between 1 and 65535.");
+            }
+            if ssh.auth == crate::model::SshAuth::PrivateKey && ssh.key_path.trim().is_empty() {
+                return invalid("Choose the SSH private key file.");
+            }
         }
         Ok(())
     }
@@ -204,6 +222,8 @@ mod tests {
         let c = ConnectionConfig::from_url("postgres://u@db.example.com:5432").unwrap();
         assert_eq!((c.name.as_str(), c.database.as_str(), c.default_database()), ("db.example.com", "", "postgres"));
         assert_eq!(c.summary(), "PostgreSQL · db.example.com:5432");
+        let tunneled = ConnectionConfig { ssh: Some(crate::model::SshTunnel { host: "bastion".into(), ..Default::default() }), ..c.clone() };
+        assert_eq!(tunneled.summary(), "PostgreSQL · db.example.com:5432 via bastion");
         let c = ConnectionConfig::from_url("postgres://u@db.example.com/app").unwrap();
         assert_eq!((c.name.as_str(), c.default_database()), ("app", "app"));
         let m = ConnectionConfig::from_url("mysql://root@localhost").unwrap();

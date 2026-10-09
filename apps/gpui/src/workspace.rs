@@ -474,8 +474,8 @@ impl Workspace {
 
     /// Saves the editor's connection (and password). Returns whether it worked; errors show in the form.
     fn save_connection(&mut self, editor: &Entity<ConnectionEditor>, cx: &mut Context<Self>) -> bool {
-        let (config, password) = match editor.read(cx).config(cx) {
-            Ok(config) => config,
+        let crate::connection_editor::EditorValues { config, password, ssh_secret } = match editor.read(cx).values(cx) {
+            Ok(values) => values,
             Err(e) => {
                 editor.update(cx, |e2, cx| e2.show_error(e, cx));
                 return false;
@@ -501,6 +501,19 @@ impl Workspace {
                     }
                 }
                 None => log::warn!("no keyring: the password for {} isn’t saved", saved.name),
+            }
+        }
+        // The SSH password or passphrase: saved when typed, dropped with the tunnel (or for the agent).
+        let ssh_account = secrets::ssh_account(&saved.id);
+        let keeps_ssh_secret = saved.ssh.as_ref().is_some_and(|s| s.auth != dbcore::SshAuth::Agent);
+        if let Some(secrets) = &self.secrets {
+            let result = match (&ssh_secret, keeps_ssh_secret) {
+                (Some(secret), true) => secrets::save_password(secrets.as_ref(), &ssh_account, Some(secret)),
+                (_, false) => secrets::save_password(secrets.as_ref(), &ssh_account, None),
+                (None, true) => Ok(()),
+            };
+            if let Err(e) = result {
+                editor.update(cx, |ed, cx| ed.show_error(format!("Saved, but the SSH password wasn’t: {e}"), cx));
             }
         }
         self.reload_connections();
@@ -567,6 +580,11 @@ impl Workspace {
                         if let Ok(Some(password)) = secrets.password(&from) {
                             if let Err(e) = secrets::save_password(secrets.as_ref(), &to, Some(&password)) {
                                 log::warn!("the copy’s password wasn’t saved: {e}");
+                            }
+                        }
+                        if let Ok(Some(secret)) = secrets.password(&secrets::ssh_account(&from)) {
+                            if let Err(e) = secrets::save_password(secrets.as_ref(), &secrets::ssh_account(&to), Some(&secret)) {
+                                log::warn!("the copy’s SSH password wasn’t saved: {e}");
                             }
                         }
                     })
@@ -907,18 +925,22 @@ impl Workspace {
         for mut config in configs {
             // Imported connections have no id yet, so each one is added (never replaces another).
             let password = config.password.take().filter(|p| !p.is_empty());
+            let ssh_secret = config.ssh.as_mut().and_then(|s| s.secret.take()).filter(|p| !p.is_empty());
             let name = config.name.clone();
             match store.upsert(config) {
                 Ok(saved) => {
                     imported += 1;
-                    let Some(password) = password else { continue };
-                    match &self.secrets {
-                        Some(secrets) => {
-                            if let Err(e) = secrets::save_password(secrets.as_ref(), &saved.id, Some(&password)) {
-                                problems.push(format!("{name}: the password wasn’t saved ({e})"));
+                    let secrets_to_save = [(saved.id.clone(), password, "password"), (secrets::ssh_account(&saved.id), ssh_secret, "SSH password")];
+                    for (account, secret, what) in secrets_to_save {
+                        let Some(secret) = secret else { continue };
+                        match &self.secrets {
+                            Some(secrets) => {
+                                if let Err(e) = secrets::save_password(secrets.as_ref(), &account, Some(&secret)) {
+                                    problems.push(format!("{name}: the {what} wasn’t saved ({e})"));
+                                }
                             }
+                            None => problems.push(format!("{name}: the {what} wasn’t saved (no keyring)")),
                         }
-                        None => problems.push(format!("{name}: the password wasn’t saved (no keyring)")),
                     }
                 }
                 Err(e) => problems.push(format!("{name}: {e}")),
@@ -962,6 +984,7 @@ impl Workspace {
         }
         if let Some(secrets) = &self.secrets {
             let _ = secrets::save_password(secrets.as_ref(), id, None);
+            let _ = secrets::save_password(secrets.as_ref(), &secrets::ssh_account(id), None);
         }
         if let Some(state) = &self.state {
             let _ = state.borrow_mut().clear_history(id);

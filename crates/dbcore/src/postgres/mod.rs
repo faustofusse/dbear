@@ -94,7 +94,8 @@ impl Session {
 pub(crate) async fn connect(config: &ConnectionConfig) -> Result<Client> {
     let mut pg = tokio_postgres::Config::new();
     pg.host(&config.host)
-        .port(config.port.unwrap_or(5432))
+        // Through an SSH tunnel: its local end. `host` still names the server for TLS.
+        .port(config.tunneled_port().or(config.port).unwrap_or(5432))
         .dbname(config.default_database())
         .user(config.user.as_deref().unwrap_or("postgres"))
         .application_name("dbear")
@@ -106,6 +107,9 @@ pub(crate) async fn connect(config: &ConnectionConfig) -> Result<Client> {
         });
     if let Some(password) = &config.password {
         pg.password(password);
+    }
+    if config.tunneled_port().is_some() {
+        pg.hostaddr(std::net::Ipv4Addr::LOCALHOST.into());
     }
 
     let (client, connection) = pg

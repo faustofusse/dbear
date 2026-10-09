@@ -65,6 +65,11 @@ fn make_driver(config: ConnectionConfig) -> Arc<dyn Driver> {
     if mock::is_mock(&config) {
         return Arc::new(MockDriver::new(config));
     }
+    // Through an SSH server: the tunnel opens on first use, then this is called again for the
+    // driver behind it (with `forwarded_port` set).
+    if config.ssh.as_ref().is_some_and(|s| s.forwarded_port.is_none()) && config.supports_ssh() {
+        return Arc::new(crate::ssh::TunneledDriver::new(config, make_driver));
+    }
     match config.kind {
         DatabaseKind::Postgres => Arc::new(PostgresDriver::new(config)),
         DatabaseKind::Mysql => Arc::new(MysqlDriver::new(config)),

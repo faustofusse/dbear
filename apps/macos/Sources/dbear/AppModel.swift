@@ -348,6 +348,7 @@ extension ConnectionConfig {
 
     func connectsDifferently(than other: ConnectionConfig) -> Bool {
         (kind, host, port, database, user, sslMode) != (other.kind, other.host, other.port, other.database, other.user, other.sslMode)
+            || ssh != other.ssh
     }
 }
 
@@ -591,6 +592,9 @@ final class AppModel {
         if let d = drivers[config.driverKey] { return d }
         var current = connections.first { $0.id == config.id }.map { $0.withDatabase(config.database) } ?? config
         if current.password == nil { current.password = secrets.password(for: config.id) }
+        if let ssh = current.ssh, ssh.secret == nil, ssh.auth != .agent {
+            current.ssh?.secret = secrets.password(for: SshTunnel.secretAccount(for: config.id))
+        }
         let d = Drivers.make(for: current)
         drivers[config.driverKey] = d
         return d
@@ -618,17 +622,33 @@ final class AppModel {
         id.isEmpty ? nil : secrets.password(for: id)
     }
 
-    /// Saves a new or edited connection. `password`: nil keeps the saved one, "" removes it.
+    /// A connection's saved SSH password or key passphrase.
+    func hasSavedSSHSecret(_ id: ConnectionConfig.ID) -> Bool {
+        !id.isEmpty && secrets.hasPassword(for: SshTunnel.secretAccount(for: id))
+    }
+
+    func savedSSHSecret(_ id: ConnectionConfig.ID) -> String? {
+        id.isEmpty ? nil : secrets.password(for: SshTunnel.secretAccount(for: id))
+    }
+
+    /// Saves a new or edited connection. `password` / `sshSecret`: nil keeps the saved one, "" removes it.
     /// Changing how to connect drops the live connection and closes its tabs.
     @discardableResult
-    func save(_ config: ConnectionConfig, password: String?) throws -> ConnectionConfig {
+    func save(_ config: ConnectionConfig, password: String?, sshSecret: String? = nil) throws -> ConnectionConfig {
         guard let store else { throw DatabaseError.storage(storeError ?? "no connections file") }
         let previous = connections.first { $0.id == config.id }
         let saved = try store.upsert(config).refreshed
         if let password {
             if password.isEmpty { secrets.deletePassword(for: saved.id) } else { try secrets.setPassword(password, for: saved.id) }
         }
-        if let previous, previous.connectsDifferently(than: saved) || password != nil {
+        // Without a tunnel (or with the agent) there's no SSH secret to keep.
+        let sshAccount = SshTunnel.secretAccount(for: saved.id)
+        if saved.ssh == nil || saved.ssh?.auth == .agent {
+            if previous?.ssh != nil { secrets.deletePassword(for: sshAccount) }
+        } else if let sshSecret {
+            if sshSecret.isEmpty { secrets.deletePassword(for: sshAccount) } else { try secrets.setPassword(sshSecret, for: sshAccount) }
+        }
+        if let previous, previous.connectsDifferently(than: saved) || password != nil || sshSecret != nil {
             resetConnection(saved.id)
         } else if let previous, previous.showAllDatabases != saved.showAllDatabases {
             databaseLists[saved.id] = nil
@@ -646,9 +666,9 @@ final class AppModel {
         let fresh = ConnectionConfig(
             id: "", name: "\(config.name) copy", group: config.group, kind: config.kind, host: config.host,
             port: config.port, database: config.database, user: config.user, sslMode: config.sslMode,
-            showAllDatabases: config.showAllDatabases)
+            showAllDatabases: config.showAllDatabases, ssh: config.ssh)
         do {
-            let saved = try save(fresh, password: savedPassword(config.id))
+            let saved = try save(fresh, password: savedPassword(config.id), sshSecret: savedSSHSecret(config.id))
             selectedConnectionID = saved.id
         } catch {
             storeError = error.localizedDescription
@@ -665,6 +685,7 @@ final class AppModel {
         }
         resetConnection(config.id)
         secrets.deletePassword(for: config.id)
+        secrets.deletePassword(for: SshTunnel.secretAccount(for: config.id))
         clearHistory(of: config.id)
         connections = store.connections()
         failedConnections.remove(config.id)
