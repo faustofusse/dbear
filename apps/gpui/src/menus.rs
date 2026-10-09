@@ -79,6 +79,10 @@ fn menus(state: MenuState) -> Vec<Menu> {
             MenuItem::submenu(Menu::new("Select Tab").items(tabs)),
         ]),
     ]);
+    // Builds that update themselves (Windows): Help ▸ Check for Updates… (see update.rs).
+    if crate::update::enabled() {
+        menus.push(Menu::new("Help").items([MenuItem::action("Check for Updates…", crate::update::CheckForUpdates)]));
+    }
     menus
 }
 

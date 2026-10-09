@@ -7,7 +7,8 @@
 //!
 //! Like the macOS app: it checks at launch and then once a day, downloads in the background and
 //! installs when you quit; **Restart to Update** installs right away. Both can be turned off in the
-//! Updates dialog (the button at the bottom of the connections column); the choice is kept in
+//! Updates dialog (Help ▸ Check for Updates…, or the button at the bottom of the connections
+//! column); the choice is kept in
 //! `state.db` (`gpui.updates`).
 //!
 //! Command line (also used by `scripts/test-update-windows.ps1`):
@@ -287,6 +288,12 @@ pub fn init(cx: &mut App) {
         })
         .detach();
     }
+}
+
+/// Whether this build updates itself (it has a key and an installer for the platform).
+pub fn enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| Config::load().is_some())
 }
 
 fn updater_entity(cx: &App) -> Option<Entity<Updater>> {

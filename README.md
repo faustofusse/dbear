@@ -28,8 +28,9 @@ code-signed yet, so SmartScreen may warn you: click **More info ▸ Run anyway**
 The installed app checks for updates at launch and once a day. It downloads them in the background
 and installs them when you quit. Updates are signed, and dbear won't install one whose signature
 doesn't match. When an update is ready, an **Update** button appears at the bottom of the
-connections list. Click it to restart now. The button next to it (⬆) opens the Updates dialog,
-where you can check now or turn automatic checks and installs off.
+connections list. Click it to restart now. **Help ▸ Check for Updates…** (or the ⬆ button next
+to it) opens the Updates dialog, where you can check now or turn automatic checks and installs
+off.
 
 There's also a portable `dbear-*-windows-x64.zip`. It doesn't update itself, but it tells you
 when a new version is out. On Windows, passwords are stored in the Credential Manager and
