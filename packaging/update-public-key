@@ -1,0 +1,4 @@
+# ed25519 public key(s), base64, that dbear's self-updates must be signed with (one per line; list
+# two while rotating). Compiled into the app by apps/gpui/build.rs. Empty: builds don't update.
+# Generate with `cargo run -p dbear-update -- keygen`; the private half goes into the GitHub secret
+# DBEAR_UPDATE_PRIVATE_KEY (see .github/workflows/release-windows.yml).

@@ -86,6 +86,7 @@
             pkgs.lld # lld-link
             pkgs.llvm # llvm-lib, llvm-rc
             pkgs.nsis # makensis
+            pkgs.zip
             pkgs.resvg # icon.svg → PNGs for the .ico
             pkgs.python3
             pkgs.pkg-config
