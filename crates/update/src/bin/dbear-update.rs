@@ -42,7 +42,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "keygen" => {
             let key = SecretKey::generate().map_err(|e| e.to_string())?;
             println!("private key (secret DBEAR_UPDATE_PRIVATE_KEY): {}", key.to_base64());
-            println!("public key  (packaging/windows/update-public-key): {}", key.public_key());
+            println!("public key  (packaging/update-public-key): {}", key.public_key());
             Ok(())
         }
         "public-key" => {

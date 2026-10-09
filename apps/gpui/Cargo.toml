@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 dbcore = { workspace = true, features = ["os-keyring"] }
+dbear-update = { path = "../../crates/update" }
 # GPUI is pre-1.0: pin exact versions. gpui-kit 0.7.1 pins GPUI itself (gpui-pre 0.3.8).
 gpui-kit = "=0.7.1"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
@@ -20,3 +21,7 @@ log = "0.4"
 lsp-types = { version = "0.97", features = ["proposed"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[build-dependencies]
+# Windows resources (icon, version) for dbear.exe; GPUI already uses it for its manifest.
+embed-resource = "3"

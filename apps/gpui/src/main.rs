@@ -1,6 +1,9 @@
 //! dbear for Linux, written with GPUI. It also runs on macOS and Windows, which is handy for
 //! development; the macOS release is the SwiftUI app in `apps/macos`.
 
+// Release builds on Windows are GUI apps: no console window. Debug builds keep it for logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod assets;
 mod backup;
 mod connection_editor;
@@ -13,6 +16,7 @@ mod highlight;
 mod import_dialog;
 mod sql_complete;
 mod tabs;
+mod update;
 mod users;
 mod workspace;
 
@@ -22,6 +26,10 @@ use gpui_kit::*;
 actions!(dbear, [Quit]);
 
 fn main() {
+    // `--version`, `--update` (see update.rs): no window.
+    if let Some(code) = update::run_cli() {
+        std::process::exit(code);
+    }
     // RUST_LOG=info (or debug) shows what GPUI and the drivers are doing; warnings and errors by default.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
@@ -45,6 +53,7 @@ fn main() {
         workspace::bind_keys(cx);
         tabs::bind_keys(cx);
         inspector::bind_keys(cx);
+        update::init(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

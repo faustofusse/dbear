@@ -1870,6 +1870,8 @@ name = "dbear-gpui"
 version = "0.1.0"
 dependencies = [
  "dbcore",
+ "dbear-update",
+ "embed-resource",
  "env_logger",
  "gpui-kit",
  "log",

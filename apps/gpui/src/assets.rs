@@ -7,7 +7,7 @@ use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::component::Icon;
 use gpui_kit::{AssetSource, Result, SharedString};
 
-icon_assets!(ExtraIcons, [TextWrap, Import, ListFilter, Users, Zap, KeyRound, UserPlus, SquareArrowOutUpRight, RotateCw, Database]);
+icon_assets!(ExtraIcons, [TextWrap, Import, ListFilter, Users, Zap, KeyRound, UserPlus, SquareArrowOutUpRight, RotateCw, Database, CircleArrowUp]);
 
 /// Engine logos (the macOS app's: Simple Icons, CC0), drawn in the text colour like other icons.
 const KIND_ICONS: [(DatabaseKind, &str, &[u8]); 5] = [

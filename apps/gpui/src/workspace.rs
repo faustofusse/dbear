@@ -2062,6 +2062,7 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, window, cx| this.open_editor(None, window, cx))),
             )
             .child(div().flex_1())
+            .child(crate::update::footer_button(cx))
             .child(
                 Button::new("import-connections")
                     .ghost()
