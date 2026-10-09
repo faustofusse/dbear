@@ -5,15 +5,22 @@ import SwiftUI
 struct ConnectionsSidebar: View {
     @Environment(AppModel.self) private var model
     @State private var collapsed: Set<String> = []
+    /// Connections whose databases are shown under them in the sidebar.
+    @State private var expanded: Set<ConnectionConfig.ID> = []
     @FocusState private var focused: Bool
 
     var body: some View {
         List {
             ForEach(model.groupedConnections, id: \.group) { group in
                 Section(isExpanded: expansion(for: group.group)) {
-                    // Databases of a connection are picked from the tables column's title menu.
                     ForEach(group.connections) { connection in
                         connectionRow(connection)
+                        // The connection expands to its databases (chevron on the row's trailing edge).
+                        if showsDatabases(connection), let databases = sidebarDatabases(of: connection) {
+                            ForEach(databases, id: \.self) { database in
+                                databaseRow(database, of: connection)
+                            }
+                        }
                     }
                 } header: {
                     Text(group.group.isEmpty ? "Connections" : group.group)
@@ -21,8 +28,12 @@ struct ConnectionsSidebar: View {
             }
         }
         .listStyle(.sidebar)
-        .arrowKeySelection(ids: visibleConnections, selected: model.selectedConnectionID, focus: $focused) {
-            model.select($0)
+        .arrowKeySelection(ids: visibleRows, selected: selectedRow, focus: $focused) { row in
+            if let database = row.database {
+                model.select(row.connectionID, database: database)
+            } else if model.selectedConnectionID != row.connectionID {
+                model.select(row.connectionID)
+            }
         }
         .onDeleteCommand {
             if let selected = model.selectedConnection { model.pendingDeletion = selected }
@@ -65,14 +76,63 @@ struct ConnectionsSidebar: View {
         ConnectionRow(
             connection: connection,
             isOpen: model.openConnections.contains(connection.id),
-            failed: model.failedConnections.contains(connection.id)
+            failed: model.failedConnections.contains(connection.id),
+            isExpanded: sidebarDatabases(of: connection) == nil ? nil : databasesExpanded(connection)
         )
-        .mailSelection(model.selectedConnectionID == connection.id) {
+        .mailSelection(selectedRow == SidebarRow(connectionID: connection.id)) {
             // Clicking the selected connection again keeps the database picked for it.
             if model.selectedConnectionID != connection.id { model.select(connection.id) }
             focused = true
         }
         .contextMenu { menu(for: connection) }
+    }
+
+    private func databaseRow(_ database: String, of connection: ConnectionConfig) -> some View {
+        Label(database, systemImage: "cylinder")
+            .lineLimit(1)
+            .padding(.leading, 20)
+            .help(database == connection.defaultDatabase ? "\(database) (default)" : database)
+            .mailSelection(selectedRow == SidebarRow(connectionID: connection.id, database: database)) {
+                model.select(connection.id, database: database)
+                focused = true
+            }
+            .contextMenu {
+                Button("New SQL Script") {
+                    model.select(connection.id, database: database)
+                    model.newScript()
+                }
+            }
+    }
+
+    /// The databases listed under a connection: only once listed, and only when there's a choice.
+    private func sidebarDatabases(of connection: ConnectionConfig) -> [String]? {
+        guard let databases = model.databases(of: connection), databases.count > 1 else { return nil }
+        return databases
+    }
+
+    private func showsDatabases(_ connection: ConnectionConfig) -> Bool {
+        expanded.contains(connection.id) && sidebarDatabases(of: connection) != nil
+    }
+
+    private func databasesExpanded(_ connection: ConnectionConfig) -> Binding<Bool> {
+        Binding(
+            get: { expanded.contains(connection.id) },
+            set: { isExpanded in
+                withAnimation(.snappy(duration: 0.2)) {
+                    if isExpanded { expanded.insert(connection.id) } else { expanded.remove(connection.id) }
+                }
+            }
+        )
+    }
+
+    /// The highlighted row: the shown database's row while its connection is expanded, else the connection's.
+    private var selectedRow: SidebarRow? {
+        guard let connection = model.selectedConnection else { return nil }
+        guard showsDatabases(connection), let database = model.selectedTarget?.defaultDatabase,
+              sidebarDatabases(of: connection)?.contains(database) == true else {
+            return SidebarRow(connectionID: connection.id)
+        }
+        return SidebarRow(connectionID: connection.id, database: database)
     }
 
     @ViewBuilder
@@ -117,11 +177,15 @@ struct ConnectionsSidebar: View {
         Button("Delete…", role: .destructive) { model.pendingDeletion = connection }
     }
 
-    private var visibleConnections: [ConnectionConfig.ID] {
+    private var visibleRows: [SidebarRow] {
         model.groupedConnections
             .filter { !collapsed.contains($0.group) }
             .flatMap(\.connections)
-            .map(\.id)
+            .flatMap { connection -> [SidebarRow] in
+                let row = SidebarRow(connectionID: connection.id)
+                guard showsDatabases(connection), let databases = sidebarDatabases(of: connection) else { return [row] }
+                return [row] + databases.map { SidebarRow(connectionID: connection.id, database: $0) }
+            }
     }
 
     private func expansion(for group: String) -> Binding<Bool> {
@@ -132,25 +196,53 @@ struct ConnectionsSidebar: View {
     }
 }
 
+/// A row of the sidebar: a connection, or one of its databases.
+private struct SidebarRow: Equatable {
+    let connectionID: ConnectionConfig.ID
+    var database: String? = nil
+}
+
 private struct ConnectionRow: View {
     let connection: ConnectionConfig
     let isOpen: Bool
     let failed: Bool
+    /// Set when the connection has databases to list under it: drives the trailing chevron.
+    var isExpanded: Binding<Bool>?
 
     var body: some View {
         Label {
-            HStack {
+            HStack(spacing: 6) {
                 Text(connection.name)
                 Spacer()
-                if failed {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(.secondary)
-                        .help("Could not connect")
-                } else if isOpen {
-                    ConnectedIndicator()
-                        .padding(.trailing, 2)
-                        .help("Connected")
-                        .transition(.scale.combined(with: .opacity))
+                Group {
+                    if failed {
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundStyle(.secondary)
+                            .help("Could not connect")
+                    } else if isOpen {
+                        ConnectedIndicator()
+                            .help("Connected")
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .frame(width: 18)
+                if let isExpanded {
+                    Button {
+                        isExpanded.wrappedValue.toggle()
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(isExpanded.wrappedValue ? "Hide databases" : "Show databases")
+                    .accessibilityLabel(isExpanded.wrappedValue ? "Hide databases" : "Show databases")
+                } else {
+                    // Same slot on every row, so status dots and warnings line up in one column.
+                    Color.clear.frame(width: 16, height: 16)
                 }
             }
         } icon: {
