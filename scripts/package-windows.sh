@@ -44,13 +44,14 @@ sha() {
 sign "$STAGE/dbear.exe"
 
 BASE="dbear-$VERSION-windows-$ARCH"
-# Portable zip: just the app. It can't update itself (no uninstall.exe beside it) and says so.
+# Portable zip: just the app. With no uninstall.exe beside it, it updates by replacing itself
+# (plain Deflate: what the updater unpacks).
 ZIP="$OUT/$BASE.zip"
 rm -f "$ZIP"
 if command -v zip >/dev/null; then
     (cd "$STAGE" && zip -q -9 -X "$ZIP" dbear.exe)
 elif command -v 7z >/dev/null; then
-    (cd "$STAGE" && 7z a -tzip -mx=9 "$ZIP" dbear.exe >/dev/null)
+    (cd "$STAGE" && 7z a -tzip -mm=Deflate -mx=9 "$ZIP" dbear.exe >/dev/null)
 else
     powershell -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$STAGE/dbear.exe")' -DestinationPath '$(cygpath -w "$ZIP")'"
 fi

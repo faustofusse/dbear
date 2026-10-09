@@ -32,8 +32,11 @@ connections list. Click it to restart now. **Help ▸ Check for Updates…** (or
 to it) opens the Updates dialog, where you can check now or turn automatic checks and installs
 off.
 
-There's also a portable `dbear-*-windows-x64.zip`. It doesn't update itself, but it tells you
-when a new version is out. On Windows, passwords are stored in the Credential Manager and
+If you'd rather not install anything, download `dbear-*-windows-x64.zip` instead, unzip it
+anywhere you can write to (Documents, Desktop, a USB stick) and run `dbear.exe`. This portable
+copy updates itself the same way, by replacing its own `dbear.exe`, so it doesn't need an
+installer or administrator rights either. In a folder it can't write to, it only tells you when a
+new version is out. On Windows, passwords are stored in the Credential Manager and
 everything else in `%APPDATA%\dbear`. Shortcuts use Ctrl where the macOS app uses ⌘.
 
 ## Connecting

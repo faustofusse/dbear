@@ -3,8 +3,9 @@
 # then updates it with `dbear.exe --update` against a local feed. Runs on Windows (Git Bash) or
 # under Wine (RUN=wine). Expects in $WORK (prepared by test-update-windows.sh):
 #   old-setup.exe                       dbear 8.9.0's installer
-#   www/good/…                          9.0.0's installer and a manifest signed with the test key
-#   www/tampered/…                      the same manifest, with a changed installer
+#   old.exe                             dbear 8.9.0 itself (the portable copy)
+#   www/good/…                          9.0.0's installer and zip, and a manifest signed with the test key
+#   www/tampered/…                      the same manifest, with a changed installer and zip
 #   www/wrongkey/…                      a manifest signed with another key
 # Env: RUN (wine or empty), INSTALL_WIN (install folder, Windows path), PORT.
 # NO_INSTALLER=1 (Wine under Rosetta, which can't run 32-bit code such as NSIS installers): the
@@ -60,12 +61,13 @@ else
 fi
 echo "   ok: $(version) in $INSTALL_WIN"
 
-update() { # <feed dir> → exit code of dbear --update
+# Runs `<exe> --update` against feed <dir>, logging to <log>; returns its exit code.
+update_with() { # <exe> <feed dir> <log>
     local code
-    for _ in 1 2 3; do
+    for _ in 1 2 3 4 5 6 7 8; do
         code=0
-        DBEAR_UPDATE_FEED="$FEED/$1/dbear-update-windows.json" run "$APP" --update >"$WORK/$1.log" 2>&1 || code=$?
-        sed 's/^/   | /' "$WORK/$1.log"
+        DBEAR_UPDATE_FEED="$FEED/$2/dbear-update-windows.json" run "$1" --update >"$3" 2>&1 || code=$?
+        sed 's/^/   | /' "$3"
         # Wine under Rosetta sometimes dies on a signal (exit ≥ 128, "assertion failed … xsave");
         # that's the emulator, not dbear: try again.
         [[ -n "$RUN" && $code -ge 128 ]] || break
@@ -73,6 +75,7 @@ update() { # <feed dir> → exit code of dbear --update
     done
     return "$code"
 }
+update() { update_with "$APP" "$1" "$WORK/$1.log"; }
 
 echo "== signed with another key"
 code=0; update wrongkey || code=$?
@@ -88,17 +91,28 @@ grep -q "doesn’t match the signed update" "$WORK/tampered.log" || fail "tamper
 sleep 3; [[ "$(version)" == "$OLD" ]] || fail "tampered: now $(version)"
 echo "   ok: rejected"
 
-echo "== portable copy"
+echo "== portable copy (replaces its own exe)"
 portable="$WORK/portable"
-mkdir -p "$portable" && cp "$dir/dbear.exe" "$portable/dbear.exe"
-code=0; DBEAR_UPDATE_FEED="$FEED/good/dbear-update-windows.json" run "$portable/dbear.exe" --update >"$WORK/portable.log" 2>&1 || code=$?
-if [[ $code != 1 ]] || ! grep -q portable "$WORK/portable.log"; then fail "portable: exit $code: $(cat "$WORK/portable.log")"; fi
-echo "   ok: doesn't install"
+mkdir -p "$portable" && cp "$WORK/old.exe" "$portable/dbear.exe"
+pversion() { run "$portable/dbear.exe" --version 2>/dev/null | tr -d '\r' | sed -n 's/^dbear //p'; }
+portable_update() { update_with "$portable/dbear.exe" "$1" "$WORK/portable-$1.log"; }
+code=0; portable_update tampered || code=$?
+[[ $code == 1 && "$(pversion)" == "$OLD" ]] || fail "portable, tampered: exit $code, now $(pversion)"
+code=0; portable_update good || code=$?
+[[ $code == 0 ]] || fail "portable: exit $code"
+[[ -f "$portable/dbear.old.exe" ]] || fail "portable: no dbear.old.exe left for the next launch"
+[[ "$(pversion)" == "$NEW" ]] || fail "portable: still $(pversion)"
+# That launch (--version) removed the old exe.
+[[ ! -f "$portable/dbear.old.exe" ]] || fail "portable: dbear.old.exe still there after a launch"
+[[ "$(find "$portable" -type f | wc -l | tr -d ' ')" == 1 ]] || fail "portable: leftovers: $(ls "$portable")"
+code=0; portable_update good || code=$?
+[[ $code == 3 ]] || fail "portable, up to date: exit $code"
+echo "   ok: $OLD → $NEW in place"
 
 echo "== good update"
 code=0; update good || code=$?
 if [[ $NO_INSTALLER == 1 ]]; then
-    grep -q "^verified .*dbear-9.0.0-windows-x64-setup.exe; starting the installer" "$WORK/good.log" || fail "good: not verified"
+    grep -q "^verified .*dbear-9.0.0-windows-x64-setup.exe; installing (nsis)" "$WORK/good.log" || fail "good: not verified"
     echo "   ok: downloaded and verified (the installer can't run here)"
     echo "PASS (without the installer)"
     exit 0

@@ -419,5 +419,7 @@ fn client(timeout: Duration) -> Result<reqwest::blocking::Client> {
     builder.build().map_err(network)
 }
 
+pub mod replace;
+
 #[cfg(test)]
 mod tests;

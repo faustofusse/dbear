@@ -3,8 +3,9 @@
 #
 #   DBEAR_UPDATE_PRIVATE_KEY=… scripts/write-update-manifest.sh <version> <dir> <base url> [notes.md] [notes url]
 #
-# Lists every dbear-<version>-windows-<x64|arm64>-setup.exe in <dir> as an `nsis` artifact
-# downloadable at <base url>/<file name> (for a release: …/releases/download/v<version>).
+# Lists every dbear-<version>-windows-<x64|arm64>-setup.exe in <dir> as an `nsis` artifact and
+# every dbear-<version>-windows-<arch>.zip as a `zip` one (portable copies), downloadable at
+# <base url>/<file name> (for a release: …/releases/download/v<version>).
 # The private key is the base64 ed25519 seed from `dbear-update keygen`; its public half must be
 # the one the installed apps were built with (packaging/update-public-key), and is checked
 # against that file unless DBEAR_UPDATE_PUBLIC_KEY overrides it (tests use throwaway keys).
@@ -39,13 +40,16 @@ args=(sign --version "$VERSION" --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --ou
 [[ -n "$NOTES_URL" ]] && args+=(--notes-url "$NOTES_URL")
 found=0
 for arch in x64 arm64; do
-    file="$DIR/dbear-$VERSION-windows-$arch-setup.exe"
-    [[ -f "$file" ]] || continue
     case "$arch" in x64) target=windows-x86_64 ;; arm64) target=windows-aarch64 ;; esac
-    args+=(--artifact "$target" nsis "$file" "$BASE_URL/$(basename "$file")")
-    found=1
+    # Installed copies take the installer, portable ones the zip.
+    for kind in nsis zip; do
+        case "$kind" in nsis) file="$DIR/dbear-$VERSION-windows-$arch-setup.exe" ;; zip) file="$DIR/dbear-$VERSION-windows-$arch.zip" ;; esac
+        [[ -f "$file" ]] || continue
+        args+=(--artifact "$target" "$kind" "$file" "$BASE_URL/$(basename "$file")")
+        found=1
+    done
 done
-[[ $found == 1 ]] || { echo "no dbear-$VERSION-windows-*-setup.exe in $DIR" >&2; exit 1; }
+[[ $found == 1 ]] || { echo "no dbear-$VERSION-windows-* installers or zips in $DIR" >&2; exit 1; }
 tool "${args[@]}"
 tool verify "$DIR/dbear-update-windows.json" --key "$actual" >/dev/null
 echo "wrote $DIR/dbear-update-windows.json"

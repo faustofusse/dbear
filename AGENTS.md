@@ -97,7 +97,10 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   newer versions are offered. The app reads `releases/latest/download/…` (`DBEAR_UPDATE_FEED` overrides it,
   still verified). Builds without a public key never check. Windows installs run the NSIS installer with
   `/S /UPDATE [/RELAUNCH] /D=<dir>`; it waits for dbear.exe to exit. A copy without `uninstall.exe` beside it
-  (the portable zip) only notifies. Settings live in `state.db` under `gpui.updates`. Platforms plug in an
+  (the portable zip) takes the manifest's `zip` artifact instead and replaces its own exe
+  (`dbear_update::replace`: the running exe is renamed to `dbear.old.exe`, removed at the next launch;
+  a restart passes `--updated` so the new process waits for the old one to quit). In a folder it can't
+  write to, it only notifies. Settings live in `state.db` under `gpui.updates`. Platforms plug in an
   `update::Installer` (Linux: none yet, so it's a no-op there and on macOS). Debug builds:
   `DBEAR_UPDATE_DRY_RUN=1|portable` and `DBEAR_UPDATE_SHOW_DIALOG=1` try the flow on macOS.
 - Connection store: SQLite at `~/Library/Application Support/dbear/dbear.db` (`$XDG_CONFIG_HOME/dbear/`

@@ -23,6 +23,10 @@ thiserror.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 rustls.workspace = true
 webpki-roots.workspace = true
+# Portable copies update by unpacking the release zip. zip's deflate goes through flate2, whose
+# default (pure-Rust) backend this dependency selects.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+flate2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

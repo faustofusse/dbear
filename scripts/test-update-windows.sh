@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # End-to-end test of the Windows self-update: builds dbear 8.9.0 and 9.0.0 with a throwaway update
 # key, packages both, installs 8.9.0 with its installer and updates it with `dbear.exe --update`
-# from a local feed. Also checks that a tampered installer, a manifest signed with another key and
-# a portable copy don't install anything, and that the uninstaller cleans up.
+# from a local feed. Updates a portable copy (no installer: it replaces its own exe) the same way.
+# Also checks that tampered files and a manifest signed with another key aren't installed, and
+# that the uninstaller cleans up.
 #
 #   scripts/test-update-windows.sh           # on Windows (Git Bash; CI: .github/workflows/windows.yml)
 #   scripts/test-update-windows.sh --wine    # on macOS: cross-builds with cargo-xwin, runs under Wine
 #                                            # in an amd64 Arch container (Apple `container`, Rosetta).
-#                                            # Rosetta can't run the 32-bit installer, so this stops
-#                                            # once the update is downloaded and verified.
+#                                            # Rosetta can't run the 32-bit installer, so the
+#                                            # installed copy's update stops once it's verified;
+#                                            # the portable copy's update runs all the way.
 #   … --keep                                 # keep the work folder (build/windows-update-test)
 #   … --prepare-only                         # build and package, don't run (implies --keep)
 #
@@ -76,14 +78,16 @@ echo "== package"
 cp "$WORK/pkg/dbear-8.9.0-windows-x64-setup.exe" "$WORK/old-setup.exe"
 cp "$WORK/pkg/dbear-8.9.0.exe" "$WORK/old.exe"
 manifest() { # <dir> <key file>
-    cp "$WORK/pkg/dbear-9.0.0-windows-x64-setup.exe" "$WORK/www/$1/"
+    cp "$WORK/pkg/dbear-9.0.0-windows-x64-setup.exe" "$WORK/pkg/dbear-9.0.0-windows-x64.zip" "$WORK/www/$1/"
     DBEAR_UPDATE_TOOL="$TOOL" DBEAR_UPDATE_PRIVATE_KEY="$(key_of private "$2")" DBEAR_UPDATE_PUBLIC_KEY="$(key_of public "$2")" \
         ./scripts/write-update-manifest.sh 9.0.0 "$WORK/www/$1" "http://127.0.0.1:18732/$1" >/dev/null
 }
 manifest good "$WORK/test.key"
 manifest tampered "$WORK/test.key"
 # Same size, one byte changed: only the hash (and signature) can tell.
-printf 'x' | dd of="$WORK/www/tampered/dbear-9.0.0-windows-x64-setup.exe" bs=1 seek=4096 conv=notrunc 2>/dev/null
+for f in dbear-9.0.0-windows-x64-setup.exe dbear-9.0.0-windows-x64.zip; do
+    printf 'x' | dd of="$WORK/www/tampered/$f" bs=1 seek=4096 conv=notrunc 2>/dev/null
+done
 manifest wrongkey "$WORK/other.key"
 rm -rf "$WORK/pkg"
 cp scripts/windows/update-e2e.sh "$WORK/"
@@ -114,5 +118,9 @@ EOF
 chmod +x "$WORK/run.sh"
 NAME=dbear-wine-update-test
 container rm -f "$NAME" >/dev/null 2>&1 || true
-container run --rm --name "$NAME" --arch amd64 --rosetta -c 4 -m 4G \
-    -v "$WORK:/work" docker.io/library/archlinux:latest /work/run.sh
+# Started idle and the test run with `exec`: with the test as the container's first process, Wine
+# under Rosetta crashes far more often (an xsave assertion in Rosetta's signal handling).
+container run -d --rm --name "$NAME" --arch amd64 --rosetta -c 4 -m 4G \
+    -v "$WORK:/work" docker.io/library/archlinux:latest sleep infinity >/dev/null
+trap 'container rm -f "$NAME" >/dev/null 2>&1 || true; cleanup' EXIT
+container exec "$NAME" /work/run.sh

@@ -8,13 +8,17 @@
 //! Like the macOS app: it checks at launch and then once a day, downloads in the background and
 //! installs when you quit; **Restart to Update** installs right away. Both can be turned off in the
 //! Updates dialog (Help ▸ Check for Updates…, or the button at the bottom of the connections
-//! column); the choice is kept in
-//! `state.db` (`gpui.updates`).
+//! column); the choice is kept in `state.db` (`gpui.updates`).
 //!
-//! Command line (also used by `scripts/test-update-windows.ps1`):
+//! Installed copies update by running the new installer. Portable copies (the zip) replace their
+//! own `dbear.exe` in place when their folder is writable (`dbear_update::replace`), so they need
+//! no installer or administrator rights either; in a folder they can't write to they only notify.
+//!
+//! Command line (also used by `scripts/test-update-windows.sh`):
 //! - `dbear --version`
-//! - `dbear --update`: check, download, verify and start the installer, without a window. Exit
-//!   code 0 when the installer started, 3 when already up to date, 1 on errors.
+//! - `dbear --update`: check, download, verify and install (start the installer, or replace a
+//!   portable copy's exe), without a window. Exit code 0 when done or started, 3 when already up
+//!   to date, 1 on errors.
 //!
 //! `DBEAR_UPDATE_FEED` points at another manifest (an `http(s)://` or `file://` URL), e.g. a
 //! local test feed; it must still be signed with the compiled-in key.
@@ -95,7 +99,7 @@ fn platform_mode() -> Option<Mode> {
     }
 }
 
-const PORTABLE: &str = "This is a portable copy of dbear, so it can’t update itself. Download the new version, or install dbear with its installer to get updates automatically.";
+const PORTABLE: &str = "dbear can’t update itself here because it can’t write to its folder. Download the new version, or move dbear.exe to a folder of yours (e.g. in Documents) to get updates automatically.";
 
 struct DryRun;
 
@@ -126,11 +130,42 @@ mod windows {
     pub(super) fn mode() -> Option<Mode> {
         let exe = std::env::current_exe().ok()?;
         let dir = exe.parent()?.to_path_buf();
-        // The installer puts its uninstaller beside the app; the portable zip has none.
+        // The installer puts its uninstaller beside the app; the portable zip has none. A portable
+        // copy replaces its own exe, which only needs its folder to be writable.
         if dir.join("uninstall.exe").is_file() {
             Some(Mode::Install(Box::new(Nsis { dir })))
+        } else if dbear_update::replace::can_replace(&exe) {
+            Some(Mode::Install(Box::new(Portable { exe })))
         } else {
             Some(Mode::NotifyOnly(super::PORTABLE))
+        }
+    }
+
+    /// The portable zip: swaps the running exe for the zip's (see `dbear_update::replace`). The
+    /// old one is removed at the next launch (`super::remove_previous`).
+    struct Portable {
+        exe: PathBuf,
+    }
+
+    impl Installer for Portable {
+        fn kind(&self) -> &'static str {
+            "zip"
+        }
+
+        fn install(&self, file: &Path, relaunch: bool) -> std::io::Result<()> {
+            dbear_update::replace::replace_from_zip(file, "dbear.exe", &self.exe)?;
+            if relaunch {
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                // `--updated`: the new process waits for this one to exit before it starts.
+                Command::new(&self.exe)
+                    .arg(super::UPDATED_ARG)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(DETACHED_PROCESS)
+                    .spawn()?;
+            }
+            Ok(())
         }
     }
 
@@ -679,6 +714,7 @@ fn ago(ms: i64) -> String {
 
 /// Handles `--version` and `--update`; `Some(exit code)` when it did (no window is opened).
 pub fn run_cli() -> Option<i32> {
+    remove_previous();
     let arg = std::env::args().nth(1)?;
     match arg.as_str() {
         "--version" | "-V" => {
@@ -686,7 +722,23 @@ pub fn run_cli() -> Option<i32> {
             Some(0)
         }
         "--update" => Some(update_now()),
+        // Anything else, `--updated` included, is a normal launch.
         _ => None,
+    }
+}
+
+/// Passed to a portable copy started right after it updated itself.
+const UPDATED_ARG: &str = "--updated";
+
+/// Removes what a portable copy's last update left beside it (`dbear.old.exe`). After a restart to
+/// update, the previous process may still be quitting (saving the open tabs): wait for it, so this
+/// one starts with its tabs.
+fn remove_previous() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let restarted = std::env::args().nth(1).as_deref() == Some(UPDATED_ARG);
+    let wait = if restarted { Duration::from_secs(30) } else { Duration::ZERO };
+    if !dbear_update::replace::remove_old(&exe, wait) {
+        log::warn!("couldn’t remove {}", dbear_update::replace::old_path(&exe).display());
     }
 }
 
@@ -696,7 +748,7 @@ fn update_now() -> i32 {
         return 1;
     };
     let Mode::Install(installer) = &config.mode else {
-        eprintln!("this copy of dbear can’t update itself (portable)");
+        eprintln!("this copy of dbear can’t update itself (portable, in a folder it can’t write to)");
         return 1;
     };
     println!("dbear {VERSION}: checking {}", config.feed);
@@ -719,7 +771,7 @@ fn update_now() -> i32 {
             return 1;
         }
     };
-    println!("verified {}; starting the installer", file.display());
+    println!("verified {}; installing ({})", file.display(), installer.kind());
     match installer.install(&file, false) {
         Ok(()) => 0,
         Err(e) => {
