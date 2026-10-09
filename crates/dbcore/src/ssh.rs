@@ -153,7 +153,13 @@ pub(crate) async fn route(config: ConnectionConfig) -> Result<(Option<Tunnel>, C
 fn describe(e: &russh::Error) -> String {
     match e {
         russh::Error::IO(io) => io.to_string(),
-        russh::Error::ChannelOpenFailure(reason) => format!("{reason:?}").to_lowercase().replace('_', " "),
+        russh::Error::ChannelOpenFailure(reason) => match reason {
+            russh::ChannelOpenFailure::ConnectFailed => "nothing answered there".into(),
+            russh::ChannelOpenFailure::AdministrativelyProhibited => "the SSH server doesn’t allow port forwarding".into(),
+            russh::ChannelOpenFailure::UnknownChannelType => "the SSH server doesn’t support port forwarding".into(),
+            russh::ChannelOpenFailure::ResourceShortage => "the SSH server is out of resources".into(),
+            russh::ChannelOpenFailure::Other { reason, .. } => reason.clone(),
+        },
         other => other.to_string(),
     }
 }
@@ -164,19 +170,36 @@ async fn authenticate(session: &mut Handle<Client>, ssh: &SshTunnel) -> Result<(
     if user.is_empty() {
         return Err(Error::InvalidConfig("Enter the SSH user.".into()));
     }
-    let sign_in_error = |e: russh::Error| failed(format!("SSH: signing in to {host} failed: {}", describe(&e)));
+    // A server that hangs up instead of answering (Tailscale SSH, for a user it doesn't know)
+    // turns the next request into a send error: report it as the refusal it is.
+    let refused = || failed(format!("SSH: {host} refused user “{user}”."));
+    let sign_in_error = |e: russh::Error, closed: bool| {
+        if closed { refused() } else { failed(format!("SSH: signing in to {host} failed: {}", describe(&e))) }
+    };
+    // Like OpenSSH, ask first whether no credentials are needed: servers that authenticate by other
+    // means (Tailscale SSH: the tailnet identity) accept that, whatever the connection is set to.
+    match session.authenticate_none(user).await {
+        Ok(result) if result.success() => return Ok(()),
+        Ok(_) => {}
+        Err(e) => return Err(sign_in_error(e, session.is_closed())),
+    }
+    if session.is_closed() {
+        return Err(refused());
+    }
     let accepted = match ssh.auth {
         SshAuth::Password => {
             let password = ssh.secret.clone().unwrap_or_default();
-            session.authenticate_password(user, password).await.map_err(sign_in_error)?.success()
+            let result = session.authenticate_password(user, password).await;
+            result.map_err(|e| sign_in_error(e, session.is_closed()))?.success()
         }
         SshAuth::PrivateKey => {
             let path = crate::paths::expand_home(ssh.key_path.trim());
             let passphrase = ssh.secret.as_deref().filter(|p| !p.is_empty());
             let key = keys::load_secret_key(&path, passphrase).map_err(|e| key_error(&path, passphrase.is_some(), &e))?;
-            let hash = session.best_supported_rsa_hash().await.map_err(sign_in_error)?.flatten();
+            let hash = session.best_supported_rsa_hash().await.map_err(|e| sign_in_error(e, session.is_closed()))?.flatten();
             let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-            session.authenticate_publickey(user, key).await.map_err(sign_in_error)?.success()
+            let result = session.authenticate_publickey(user, key).await;
+            result.map_err(|e| sign_in_error(e, session.is_closed()))?.success()
         }
         SshAuth::Agent => authenticate_with_agent(session, user).await?,
     };
