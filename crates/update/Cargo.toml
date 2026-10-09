@@ -1,0 +1,28 @@
+[package]
+name = "dbear-update"
+description = "dbear's self-updater core: signed release manifests (ed25519), version checks and verified downloads. UI-free."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+# Release tooling: key generation, manifest signing and verification (scripts/sign-update.sh, CI).
+name = "dbear-update"
+path = "src/bin/dbear-update.rs"
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+sha2 = "0.10"
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver = "1"
+getrandom.workspace = true
+thiserror.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+rustls.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

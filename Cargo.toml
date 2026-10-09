@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dbcore", "crates/dbcore-ffi", "tools/uniffi-bindgen", "apps/gpui"]
+members = ["crates/dbcore", "crates/dbcore-ffi", "crates/update", "tools/uniffi-bindgen", "apps/gpui"]
 # Third-party crates patched for dbear (see vendor/README.md): dependencies, not members.
 exclude = ["vendor/tiberius"]
 
