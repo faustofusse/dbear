@@ -133,6 +133,13 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   structures into links and editability by column index. Both apps use it for script grids, and
   for a table tab's links (`ResultSources::for_table`). A table is editable when its whole primary
   key is in the result exactly once. Saving doesn't re-run the script.
+- Command palette (⌘K / Ctrl+K, everywhere in the window): `dbcore::palette` matches and ranks
+  (fuzzy, word starts first; `>` commands, `#` tables, `@` connections; an empty query lists all but
+  tables). It lists commands, open tabs, connections and their databases, and the tables of every
+  target listed so far. macOS: `AppCommand` is both the menus and the palette's commands,
+  `CommandPalette.swift` the overlay, `DBKit.PaletteSearch` the core. GPUI: `palette.rs` on
+  gpui-kit's `Command` in a dialog; `menus::palette_commands` lists the commands, and commands are
+  sent to what had focus before (left out when nothing there handles them).
 - Copy/inspect: `dbcore::export::format_rows`; `export::pretty_json` keeps key order and digits.
 - Users & roles: `dbcore::access` generates the SQL, run in one transaction where the database allows
   (Postgres). Postgres privileges are listed for the connection's current database. Access levels

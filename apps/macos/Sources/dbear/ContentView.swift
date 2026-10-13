@@ -27,6 +27,18 @@ struct ContentView: View {
         .sheet(item: $model.newDatabaseRequest) { NewDatabaseSheet(connection: $0.connection) }
         .usersSheets(model)
         .overlay(alignment: .bottomTrailing) { BackupJobsPanel() }
+        .overlay(alignment: .top) {
+            if model.showingPalette {
+                ZStack(alignment: .top) {
+                    // A click outside closes it.
+                    Color.black.opacity(0.08)
+                        .ignoresSafeArea()
+                        .onTapGesture { model.showingPalette = false }
+                    CommandPalette()
+                        .padding(.top, 70)
+                }
+            }
+        }
         .confirmationDialog(
             "Delete “\(model.pendingDeletion?.name ?? "")”?",
             isPresented: Binding(get: { model.pendingDeletion != nil }, set: { if !$0 { model.pendingDeletion = nil } }),

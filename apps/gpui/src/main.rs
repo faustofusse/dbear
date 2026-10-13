@@ -12,6 +12,7 @@ mod inspector;
 mod keys;
 mod menus;
 mod new_database;
+mod palette;
 mod highlight;
 mod import_dialog;
 mod sql_complete;
@@ -51,6 +52,7 @@ fn main() {
         cx.on_action(|_: &tabs::ToggleInspector, cx| inspector::toggle(cx));
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         workspace::bind_keys(cx);
+        palette::bind_keys(cx);
         tabs::bind_keys(cx);
         inspector::bind_keys(cx);
         update::init(cx);

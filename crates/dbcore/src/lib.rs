@@ -20,6 +20,7 @@ pub mod libsql;
 pub mod mock;
 pub mod model;
 pub mod mysql;
+pub mod palette;
 pub mod paths;
 pub mod restore;
 pub mod results;

@@ -368,6 +368,8 @@ final class AppModel {
     var editor: ConnectionEditorRequest?
     /// The "Import from DBeaver" sheet is open.
     var showingImport = false
+    /// The command palette (⌘K) is open.
+    var showingPalette = false
     /// Connection waiting for delete confirmation.
     var pendingDeletion: ConnectionConfig?
     /// Dumps and restores (see `AppModel+Backup.swift`).
@@ -447,7 +449,7 @@ final class AppModel {
     @ObservationIgnored private var lastDatabase: [ConnectionConfig.ID: String?] = [:]
     /// Schemas already listed per database, so switching back and forth doesn't reload them.
     /// Dropped by Refresh, (re)connecting, disconnecting, and scripts that change the schema.
-    private var schemaCache: [DriverKey: [Schema]] = [:]
+    private(set) var schemaCache: [DriverKey: [Schema]] = [:]
     /// Databases on each connection's server, once listed (only for "show all databases" connections).
     var databaseLists: [ConnectionConfig.ID: [String]] = [:]
 

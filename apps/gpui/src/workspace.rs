@@ -31,6 +31,8 @@ use crate::new_database::{CreateRequested, NewDatabaseDialog};
 use crate::grid::{RelatedRows, copy};
 use crate::users::{self, RoleCreated, UsersState, UsersTab};
 use crate::menus::MenuState;
+use crate::palette::{self, OpenPalette, Palette, Target};
+use dbcore::palette::{Candidate, Kind};
 use crate::tabs::{AddRow, EditorFontSize, History, OpenResults, ResultTab, ScriptTab, ShowData, ShowStructure, TabEvent, TableTab, count, plural};
 
 enum Load<T> {
@@ -184,6 +186,15 @@ enum TabView {
 }
 
 impl TabView {
+    fn entity_id(&self) -> EntityId {
+        match self {
+            TabView::Table(tab) => tab.entity_id(),
+            TabView::Script(tab) => tab.entity_id(),
+            TabView::Users(tab) => tab.entity_id(),
+            TabView::Result(tab) => tab.entity_id(),
+        }
+    }
+
     fn has_unsaved_edits(&self, cx: &App) -> bool {
         match self {
             TabView::Table(tab) => tab.read(cx).has_unsaved_edits(cx),
@@ -1639,6 +1650,158 @@ impl Workspace {
         }
     }
 
+    // MARK: command palette
+
+    fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.palette_entries(window, cx);
+        let workspace = cx.entity().downgrade();
+        Palette::open(
+            entries,
+            move |target, window, cx| {
+                workspace.update(cx, |w, cx| w.palette_chose(target, window, cx)).ok();
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Everything the palette lists, in the order an empty query shows it: commands, open tabs,
+    /// connections (and their databases), then the tables of every connection listed so far,
+    /// the shown one's first.
+    fn palette_entries(&self, window: &Window, cx: &App) -> Vec<palette::Entry> {
+        let menu_state = MenuState { sidebar: self.sidebar_visible, inspector: crate::inspector::is_shown(cx) };
+        let mut entries = Vec::new();
+        let focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        // Commands that nothing where focus is handles are left out, as the menus disable them, and
+        // so are the window's that wouldn't do anything now.
+        for command in crate::menus::palette_commands(menu_state) {
+            let action = command.action.as_ref();
+            if !command.global && !window.is_action_available_in(action, &focus) || !self.command_applies(action, cx) {
+                continue;
+            }
+            let shortcut = window
+                .highest_precedence_binding_for_action_in(action, &focus)
+                .or_else(|| window.highest_precedence_binding_for_action_in_context(action, KeyContext::default()))
+                .and_then(|b| b.keystrokes().first().map(|k| k.as_keystroke().clone()));
+            entries.push(palette::Entry {
+                candidate: Candidate::new(Kind::Command, command.label).keywords(command.keywords.iter().copied()),
+                detail: None,
+                icon: Icon::new(AssetIcon::Command),
+                shortcut,
+                target: Target::Action(command.action),
+            });
+        }
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            let target = self.target_label(&tab.key);
+            let icon = match &tab.view {
+                TabView::Table(t) if t.read(cx).table.kind == TableKind::View => Icon::new(IconName::Eye),
+                TabView::Table(_) => Icon::new(IconName::FileText),
+                TabView::Script(_) | TabView::Result(_) => Icon::new(IconName::SquareTerminal),
+                TabView::Users(_) => Icon::new(AssetIcon::Users),
+            };
+            let detail = if ix == self.active { format!("{target} \u{b7} current tab") } else { format!("{target} \u{b7} tab") };
+            entries.push(palette::Entry {
+                candidate: Candidate::new(Kind::Tab, tab.title(cx)).keywords([target, "tab".into()]),
+                detail: Some(detail.into()),
+                icon,
+                shortcut: None,
+                target: Target::Tab(tab.view.entity_id()),
+            });
+        }
+        for c in &self.connections {
+            let mut keywords = vec![c.group.clone(), c.host.clone(), c.database.clone(), c.kind.display_name().to_string()];
+            // Not a file's path (SQLite): its folders would match almost anything.
+            keywords.retain(|k| !k.is_empty() && !k.contains(['/', '\\']));
+            let detail = if c.group.is_empty() { c.kind.display_name().to_string() } else { format!("{} \u{b7} {}", c.group, c.kind.display_name()) };
+            entries.push(palette::Entry {
+                candidate: Candidate::new(Kind::Connection, c.name.clone()).keywords(keywords),
+                detail: Some(detail.into()),
+                icon: crate::assets::kind_icon(c.kind),
+                shortcut: None,
+                target: Target::Connection { id: c.id.clone(), database: None },
+            });
+            for database in self.sidebar_databases(c).into_iter().flatten() {
+                entries.push(palette::Entry {
+                    candidate: Candidate::new(Kind::Connection, database.clone()).keywords([c.name.clone(), "database".into()]),
+                    detail: Some(format!("database on {}", c.name).into()),
+                    icon: Icon::new(AssetIcon::Database),
+                    shortcut: None,
+                    target: Target::Connection { id: c.id.clone(), database: Some(database.clone()) },
+                });
+            }
+        }
+        let current = self.target().map(|(_, key)| key);
+        let mut listed: Vec<&TargetKey> = self.schema_cache.keys().collect();
+        listed.sort_by_key(|key| (Some(*key) != current.as_ref(), self.target_label(key)));
+        for key in listed {
+            let target = self.target_label(key);
+            for schema in &self.schema_cache[key] {
+                for table in &schema.tables {
+                    let qualified = if schema.name.is_empty() { table.name.clone() } else { format!("{}.{}", schema.name, table.name) };
+                    let detail = if schema.name.is_empty() { target.clone() } else { format!("{} \u{b7} {target}", schema.name) };
+                    let view = table.kind == TableKind::View;
+                    entries.push(palette::Entry {
+                        candidate: Candidate::new(Kind::Table, table.name.clone()).keywords([qualified, target.clone()]),
+                        detail: Some(detail.into()),
+                        icon: Icon::new(if view { IconName::Eye } else { IconName::FileText }),
+                        shortcut: None,
+                        target: Target::Table { connection: key.0.clone(), database: key.1.clone(), table: table.clone() },
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    /// Whether one of the window's commands would do something now.
+    fn command_applies(&self, action: &dyn Action, cx: &App) -> bool {
+        let any = action.as_any();
+        let table_tab = matches!(self.tabs.get(self.active).map(|t| &t.view), Some(TabView::Table(_)));
+        if any.is::<NewScript>() {
+            self.open_connection().is_some()
+        } else if any.is::<EditConnection>() {
+            self.selected_connection().is_some()
+        } else if any.is::<ShowUsers>() {
+            self.selected_connection().is_some_and(|c| dbcore::access::features(c.kind).is_some())
+        } else if any.is::<ShowData>() || any.is::<ShowStructure>() || any.is::<AddRow>() {
+            table_tab && self.active_table(cx).is_some()
+        } else if any.is::<CloseTab>() {
+            !self.tabs.is_empty()
+        } else if any.is::<PreviousTab>() || any.is::<NextTab>() {
+            self.tabs.len() > 1
+        } else {
+            true
+        }
+    }
+
+    fn palette_chose(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            Target::Tab(id) => {
+                if let Some(ix) = self.tabs.iter().position(|tab| tab.view.entity_id() == id) {
+                    self.activate(ix, window, cx);
+                }
+            }
+            Target::Connection { id, database } => {
+                self.users_mode = false;
+                if database.is_some() {
+                    self.expanded.insert(id.clone());
+                }
+                self.select_row((id, database), cx);
+            }
+            Target::Table { connection, database, table } => {
+                self.users_mode = false;
+                self.select_connection(connection, cx);
+                if self.database != database {
+                    self.select_database(database, cx);
+                }
+                self.open_table(table, true, window, cx);
+            }
+            // Sent by the palette itself.
+            Target::Action(_) => {}
+        }
+        cx.notify();
+    }
+
     /// Opens a script on a connection (and database), connecting first when needed.
     fn new_script_on(&mut self, id: String, database: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.select_connection(id, cx);
@@ -2601,6 +2764,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ImportConnections, window, cx| this.open_import(window, cx)))
             .on_action(cx.listener(Self::show_users))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(|this, _: &ShowData, window, cx| this.with_active_table(window, cx, |t, w, cx| t.show_structure(false, w, cx))))
             .on_action(cx.listener(|this, _: &ShowStructure, window, cx| this.with_active_table(window, cx, |t, w, cx| t.show_structure(true, w, cx))))
             .on_action(cx.listener(|this, _: &AddRow, window, cx| this.with_active_table(window, cx, |t, w, cx| t.add_row_from_menu(w, cx))))

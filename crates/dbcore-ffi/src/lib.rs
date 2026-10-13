@@ -11,6 +11,7 @@ uniffi::setup_scaffolding!();
 mod access;
 mod dump;
 mod import;
+mod palette;
 mod results;
 mod state;
 

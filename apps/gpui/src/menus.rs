@@ -62,6 +62,8 @@ fn menus(state: MenuState) -> Vec<Menu> {
             MenuItem::action("Copy Value", CopyValue),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Command Palette…", crate::palette::OpenPalette),
+            MenuItem::separator(),
             MenuItem::action("Connections", ToggleSidebar).checked(state.sidebar),
             MenuItem::action("Inspector", ToggleInspector).checked(state.inspector),
             MenuItem::separator(),
@@ -84,6 +86,64 @@ fn menus(state: MenuState) -> Vec<Menu> {
         menus.push(Menu::new("Help").items([MenuItem::action("Check for Updates…", crate::update::CheckForUpdates)]));
     }
     menus
+}
+
+/// A command the palette lists (⌘K): the menus' items, worded to read on their own.
+pub struct PaletteCommand {
+    pub label: &'static str,
+    pub action: Box<dyn Action>,
+    /// Other words that find it.
+    pub keywords: &'static [&'static str],
+    /// Handled by the app rather than the window: always available.
+    pub global: bool,
+}
+
+/// The palette's commands. Keep them in step with [`menus`].
+pub fn palette_commands(state: MenuState) -> Vec<PaletteCommand> {
+    fn command(label: &'static str, action: impl Action, keywords: &'static [&'static str]) -> PaletteCommand {
+        PaletteCommand { label, action: Box::new(action), keywords, global: false }
+    }
+    let mut commands = vec![
+        command("New SQL Script", NewScript, &["query", "editor", "console"]),
+        command("New Connection…", NewConnection, &["add", "create", "server"]),
+        command("Edit Connection…", EditConnection, &["settings", "password", "host"]),
+        command("Import Connections from DBeaver…", ImportConnections, &[]),
+        command("Users & Roles", ShowUsers, &["permissions", "privileges", "grants", "access"]),
+        command("Save Changes…", SaveEdits, &["commit", "apply", "edits"]),
+        command("Add Row", AddRow, &["insert", "new"]),
+        command("Copy", CopySelection, &[]),
+        command("Copy with Headers", CopySelectionWithHeaders, &["columns"]),
+        command("Copy Value", CopyValue, &["cell"]),
+        command("Show Data", ShowData, &["rows", "view"]),
+        command("Show Structure", ShowStructure, &["columns", "indexes", "ddl", "schema", "view"]),
+        command(
+            if state.sidebar { "Hide Connections" } else { "Show Connections" },
+            ToggleSidebar,
+            &["sidebar", "toggle", "view"],
+        ),
+        PaletteCommand {
+            label: if state.inspector { "Hide Inspector" } else { "Show Inspector" },
+            action: Box::new(ToggleInspector),
+            keywords: &["value", "toggle", "view"],
+            global: true,
+        },
+        command("Zoom In", ZoomIn, &["font", "bigger", "text size"]),
+        command("Zoom Out", ZoomOut, &["font", "smaller", "text size"]),
+        command("Actual Size", ResetZoom, &["zoom", "font", "reset", "text size"]),
+        command("Show Previous Tab", PreviousTab, &["switch"]),
+        command("Show Next Tab", NextTab, &["switch"]),
+        command("Close Tab", CloseTab, &[]),
+    ];
+    if crate::update::enabled() {
+        commands.push(PaletteCommand {
+            label: "Check for Updates…",
+            action: Box::new(crate::update::CheckForUpdates),
+            keywords: &["upgrade", "version"],
+            global: true,
+        });
+    }
+    commands.push(PaletteCommand { label: "Quit dbear", action: Box::new(crate::Quit), keywords: &["exit"], global: true });
+    commands
 }
 
 /// Sets the menus (again, when what they show checked changed).
