@@ -146,7 +146,7 @@ private struct InspectorContent: View {
     }
 
     private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
+        HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(cell.column.name)
                     .font(.headline)
