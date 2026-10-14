@@ -1,6 +1,7 @@
 import AppKit
 import DBKit
 import SwiftUI
+import VimKit
 
 /// Plain-text SQL editor (NSTextView) with tree-sitter highlighting from the Rust core.
 struct SQLEditor: NSViewRepresentable {
@@ -17,6 +18,8 @@ struct SQLEditor: NSViewRepresentable {
     /// Schema catalog for completion; `nil` while it's loading (⌃Space and autocomplete do nothing).
     var completionCatalog: CompletionCatalog?
     var databaseKind: DatabaseKind = .postgres
+    /// Vim keys (Settings ▸ Editor).
+    var vimMode = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, theme: SQLTheme(fontSize: fontSize), onSelectionChange: onSelectionChange)
@@ -54,6 +57,10 @@ struct SQLEditor: NSViewRepresentable {
         textView.typingAttributes = theme.baseAttributes
 
         textView.string = text
+        let vimLabel = VimModeLabel()
+        scrollView.addSubview(vimLabel)
+        textView.onVimChange = { [weak textView, weak vimLabel] in vimLabel?.show(textView?.vim) }
+        textView.setVimMode(vimMode)
         context.coordinator.textView = textView
         context.coordinator.completion.textView = textView
         context.coordinator.catalog = completionCatalog
@@ -84,6 +91,7 @@ struct SQLEditor: NSViewRepresentable {
         coordinator.databaseKind = databaseKind
         guard let textView = coordinator.textView as? SQLTextView else { return }
         textView.onZoomIn = onZoomIn
+        textView.setVimMode(vimMode)
         if coordinator.theme.fontSize != fontSize {
             coordinator.theme = SQLTheme(fontSize: fontSize)
             textView.font = coordinator.theme.font
@@ -140,7 +148,11 @@ struct SQLEditor: NSViewRepresentable {
             guard let textView else { return }
             text.wrappedValue = textView.string
             highlight()
-            completion.textDidChange(inserted: lastInsertedText)
+            if (textView as? SQLTextView)?.isApplyingVimEdit == true {
+                completion.dismiss()  // a Vim command, not typing
+            } else {
+                completion.textDidChange(inserted: lastInsertedText)
+            }
         }
 
         /// Small scripts are highlighted synchronously (no flash of unstyled text);
@@ -199,6 +211,124 @@ final class SQLTextView: NSTextView {
     var onZoomIn: () -> Void = {}
     weak var completionHandler: CompletionKeyHandling?
 
+    // MARK: Vim
+
+    /// Set while Vim mode is on.
+    private(set) var vim: VimEngine?
+    /// The Vim mode or pending keys changed (or Vim mode was turned on or off).
+    var onVimChange: () -> Void = {}
+    /// A Vim command is editing the text (so it doesn't open completion).
+    var isApplyingVimEdit = false
+    private let blockCursor = VimBlockCursor()
+    private var normalCaretColor: NSColor?
+
+    func setVimMode(_ on: Bool) {
+        guard on != (vim != nil) else { return }
+        if on {
+            let engine = VimEngine(buffer: self, registers: .app)
+            engine.onChange = { [weak self] in self?.vimStateChanged() }
+            vim = engine
+            if blockCursor.superview == nil { addSubview(blockCursor) }
+            engine.reset()
+        } else {
+            vim = nil
+        }
+        vimStateChanged()
+    }
+
+    private var showsBlockCursor: Bool {
+        guard let vim, vim.mode == .normal, selectedRange().length == 0 else { return false }
+        return window?.firstResponder === self && window?.isKeyWindow == true
+    }
+
+    private func vimStateChanged() {
+        breakUndoCoalescing()
+        // Normal mode hides the bar caret behind the block.
+        let hideCaret = vim.map { $0.mode != .insert } ?? false
+        if hideCaret, normalCaretColor == nil {
+            normalCaretColor = insertionPointColor
+            insertionPointColor = .clear
+        } else if !hideCaret, let color = normalCaretColor {
+            insertionPointColor = color
+            normalCaretColor = nil
+        }
+        // Leaving insert mode (⌃C, visual commands…) never leaves the popup behind.
+        if hideCaret, completionHandler?.isCompletionVisible == true { completionHandler?.dismissCompletion() }
+        updateBlockCursor()
+        onVimChange()
+    }
+
+    private func updateBlockCursor() {
+        guard showsBlockCursor, let window else {
+            blockCursor.isHidden = true
+            return
+        }
+        let ns = string as NSString
+        let caret = selectedRange().location
+        var range = NSRange(location: caret, length: 0)
+        if caret < ns.length, !"\n\r".contains(Character(UnicodeScalar(ns.character(at: caret)) ?? " ")) {
+            range = ns.rangeOfComposedCharacterSequence(at: caret)
+        }
+        var actual = NSRange()
+        let screen = firstRect(forCharacterRange: range, actualRange: &actual)
+        guard screen.height > 0 else {
+            blockCursor.isHidden = true
+            return
+        }
+        var rect = convert(window.convertFromScreen(screen), from: nil)
+        let width = font.map { ("M" as NSString).size(withAttributes: [.font: $0]).width } ?? 8
+        if rect.width < 1 { rect.size.width = width }
+        blockCursor.frame = rect.integral
+        blockCursor.isHidden = false
+    }
+
+    override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
+        var ranges = ranges
+        if let vim, vim.mode == .normal, !stillSelecting, ranges.count == 1, ranges[0].rangeValue.length == 0 {
+            // A click past the end of a line: normal mode's caret sits on a character.
+            let caret = VimEngine.normalCaret(ranges[0].rangeValue.location, in: string as NSString)
+            ranges = [NSValue(range: NSRange(location: caret, length: 0))]
+        }
+        super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        guard vim != nil else { return }
+        // After layout catches up with the change.
+        DispatchQueue.main.async { [weak self] in self?.updateBlockCursor() }
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        if vim != nil { DispatchQueue.main.async { [weak self] in self?.updateBlockCursor() } }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        defer { if vim != nil { DispatchQueue.main.async { [weak self] in self?.updateBlockCursor() } } }
+        return super.becomeFirstResponder()
+    }
+
+    override func resignFirstResponder() -> Bool {
+        defer { if vim != nil { blockCursor.isHidden = true } }
+        return super.resignFirstResponder()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
+        guard let window else { return }
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(windowKeyChanged), name: name, object: window)
+        }
+    }
+
+    @objc private func windowKeyChanged() {
+        if vim != nil { updateBlockCursor() }
+    }
+
+    override func layout() {
+        super.layout()
+        if vim != nil { updateBlockCursor() }
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags == .command, event.charactersIgnoringModifiers == "=" {
@@ -215,12 +345,18 @@ final class SQLTextView: NSTextView {
             case 126: handler.moveCompletionSelection(by: -1); return // Up arrow
             case 36, 76, 48: handler.acceptCompletion(); return // Return, Enter, Tab
             case 53: handler.dismissCompletion(); return // Escape
-            default: break
+            default:
+                // ⌃[ is Esc in Vim mode: it closes the popup first too.
+                if vim != nil, VimKey(event) == .escape { handler.dismissCompletion(); return }
             }
         }
         // \u2303Space: works whether or not the popup is already open.
         if event.keyCode == 49, event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .control {
             completionHandler?.requestManualCompletion()
+            return
+        }
+        // Vim: insert mode only takes Esc; while composing (input methods) every key is the text view's.
+        if let vim, !hasMarkedText(), let key = VimKey(event), vim.handle(key) {
             return
         }
         super.keyDown(with: event)

@@ -203,6 +203,7 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
         table.doubleAction = #selector(doubleClicked)
         table.onHover = { [weak self] point in self?.hover(at: point) }
         table.onArrow = { [weak self] step in self?.moveFocus(by: step) }
+        table.onColumnEdge = { [weak self] last in self?.moveFocus(toLast: last) }
         table.onCopy = { [weak self] headers in self?.copySelection(headers: headers) }
         table.onCopyValue = { [weak self] in self?.copyFocusedValue() }
         table.canCopy = { [weak self] in !(self?.table?.selectedRowIndexes.isEmpty ?? true) }
@@ -611,11 +612,22 @@ final class GridData: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTe
 
     /// ←/→: the previous or next column in on-screen order.
     private func moveFocus(by step: Int) {
-        guard let table, let current = focusedCell else { return }
+        guard let current = focusedCell else { return }
         let order = displayOrder()
         guard let position = order.firstIndex(of: current.column), order.indices.contains(position + step) else { return }
-        focusedColumn = order[position + step]
-        let tableColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier(String(order[position + step])))
+        focus(column: order[position + step])
+    }
+
+    /// Vim's `0` and `$`: the first or last column on screen.
+    private func moveFocus(toLast last: Bool) {
+        guard focusedCell != nil, let column = last ? displayOrder().last : displayOrder().first else { return }
+        focus(column: column)
+    }
+
+    private func focus(column: Int) {
+        guard let table else { return }
+        focusedColumn = column
+        let tableColumn = table.column(withIdentifier: NSUserInterfaceItemIdentifier(String(column)))
         if tableColumn >= 0 { table.scrollColumnToVisible(tableColumn) }
         focusChanged()
     }
@@ -896,7 +908,8 @@ private final class GridRowView: NSTableRowView {
     }
 }
 
-/// The grid's table: Return edits the selected row, ⌫ deletes it.
+/// The grid's table: Return edits the selected row, ⌫ deletes it. With Vim mode on, also
+/// h/j/k/l, w/b, 0/$, gg/G, ⌃D/⌃U/⌃F/⌃B (counts work), i/a/c edit, dd deletes and yy copies.
 final class GridTableView: NSTableView {
     var onReturn: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -904,6 +917,8 @@ final class GridTableView: NSTableView {
     var onHover: ((NSPoint?) -> Void)?
     /// ← (-1) / → (+1): move the focused cell.
     var onArrow: ((Int) -> Void)?
+    /// Vim's `0` (false) and `$` (true): the first or last column.
+    var onColumnEdge: ((Bool) -> Void)?
     /// ⌘C (Edit ▸ Copy) copies rows; ⇧⌘C with headers.
     var onCopy: ((_ headers: Bool) -> Void)?
     /// ⌥⌘C copies the focused cell's value.
@@ -956,7 +971,77 @@ final class GridTableView: NSTableView {
         onHover?(nil)
     }
 
+    // MARK: Vim
+
+    /// `g`, `d` or `y` waiting for its second key.
+    private var vimPending: Character?
+    private var vimCount: Int?
+
+    /// Returns whether a Vim key was used.
+    private func handleVim(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection([.command, .option, .control])
+        if flags == .control, let c = event.charactersIgnoringModifiers?.lowercased().first {
+            let page = max(Int(visibleRect.height / max(rowHeight, 1)), 1)
+            let steps: [Character: Int] = ["d": page / 2, "u": -page / 2, "f": page, "b": -page, "e": 1, "y": -1]
+            guard let step = steps[c] else { return false }
+            moveRow(by: step * (vimCount ?? 1))
+            resetVim()
+            return true
+        }
+        guard flags.isEmpty else { return false }
+        if event.keyCode == 53 {  // Esc
+            defer { resetVim() }
+            return vimPending != nil || vimCount != nil
+        }
+        guard let c = event.characters?.first, event.characters?.count == 1, c.isASCII, !c.isNewline,
+              c.isLetter || c.isNumber || c.isPunctuation || c.isSymbol else { return false }
+        if vimPending == nil, let digit = c.wholeNumberValue, digit > 0 || vimCount != nil {
+            vimCount = min((vimCount ?? 0) * 10 + digit, 99_999)
+            return true
+        }
+        let count = vimCount
+        let command = vimPending.map { String($0) + String(c) } ?? String(c)
+        resetVim()
+        let n = count ?? 1
+        switch command {
+        case "j": moveRow(by: n)
+        case "k": moveRow(by: -n)
+        case "h", "b": for _ in 0..<n { onArrow?(-1) }
+        case "l", "w": for _ in 0..<n { onArrow?(1) }
+        case "0", "^": onColumnEdge?(false)
+        case "$": onColumnEdge?(true)
+        case "gg": selectRow(count.map { $0 - 1 } ?? 0)
+        case "G": selectRow(count.map { $0 - 1 } ?? numberOfRows - 1)
+        case "g", "d", "y":
+            vimPending = c
+            vimCount = count
+        case "i", "a", "c": onReturn?()
+        case "dd": onDelete?()
+        case "yy", "Y": if canCopy?() ?? false { onCopy?(false) }
+        default: break  // other letters don't type-select rows
+        }
+        return true
+    }
+
+    private func resetVim() {
+        vimPending = nil
+        vimCount = nil
+    }
+
+    private func moveRow(by step: Int) {
+        let current = selectedRow >= 0 ? selectedRow : (step > 0 ? -1 : numberOfRows)
+        selectRow(current + step)
+    }
+
+    private func selectRow(_ row: Int) {
+        guard numberOfRows > 0 else { return }
+        let row = min(max(row, 0), numberOfRows - 1)
+        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        scrollRowToVisible(row)
+    }
+
     override func keyDown(with event: NSEvent) {
+        if VimPreference.isOn, handleVim(event) { return }
         let plain = event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
         let isReturn = event.keyCode == 36 || event.keyCode == 76  // Return, Enter
         let isDelete = event.keyCode == 51 || event.keyCode == 117  // ⌫, ⌦

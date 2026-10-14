@@ -5,6 +5,7 @@ import SwiftUI
 struct ScriptTabView: View {
     @Environment(AppModel.self) private var model
     @Bindable var tab: ScriptTab
+    @AppStorage(VimPreference.key) private var vimMode = false
 
     var body: some View {
         Group {
@@ -36,7 +37,8 @@ struct ScriptTabView: View {
                     initialSelection: tab.selectedRanges,
                     onSelectionChange: { [tab] in tab.updateSelection($0) },
                     completionCatalog: model.completionCatalog(for: tab.connection),
-                    databaseKind: tab.connection.kind
+                    databaseKind: tab.connection.kind,
+                    vimMode: vimMode
                 )
             }
         } bottom: {

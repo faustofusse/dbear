@@ -1,11 +1,18 @@
 import SwiftUI
 
-/// dbear ▸ Settings… (⌘,). Only updates for now.
+/// dbear ▸ Settings… (⌘,).
 struct SettingsView: View {
     @Bindable var updater: Updater
+    @AppStorage(VimPreference.key) private var vimMode = false
 
     var body: some View {
         Form {
+            Section("Editor") {
+                Toggle(isOn: $vimMode) {
+                    Text("Vim mode")
+                    Text("Normal, insert and visual modes in the SQL editor; h, j, k, l and more in result grids.")
+                }
+            }
             Section("Updates") {
                 Toggle("Automatically check for updates", isOn: $updater.automaticallyChecks)
                 Toggle("Automatically download and install updates", isOn: $updater.automaticallyInstalls)

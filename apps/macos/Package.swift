@@ -26,10 +26,13 @@ let package = Package(
         ),
         // Swift-facing models + DatabaseDriver protocol; adapts the generated API.
         .target(name: "DBKit", dependencies: ["DBCoreFFI"]),
+        // Vim mode for the editor and grid: plain Swift over a text buffer protocol, no AppKit.
+        .target(name: "VimKit"),
         .executableTarget(
             name: "dbear",
-            dependencies: ["DBKit", .product(name: "Sparkle", package: "Sparkle")]
+            dependencies: ["DBKit", "VimKit", .product(name: "Sparkle", package: "Sparkle")]
         ),
         .testTarget(name: "DBKitTests", dependencies: ["DBKit"]),
+        .testTarget(name: "VimKitTests", dependencies: ["VimKit"]),
     ]
 )
