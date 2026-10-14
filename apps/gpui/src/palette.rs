@@ -21,6 +21,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use gpui_kit::assets::IconName as AssetIcon;
 
 actions!(dbear, [OpenPalette, EnterConnection, Back, Dismiss, StayInField]);
 
@@ -111,7 +112,6 @@ impl List {
 struct Scope {
     key: (String, String),
     name: SharedString,
-    icon: Icon,
     tables: PaletteTables,
     list: List,
 }
@@ -210,8 +210,8 @@ impl Palette {
         let Some(row) = self.state.read(cx).selected_index().map(|ix| ix.row) else { return };
         let Some(Target::Connection { id, database }) = self.target(row) else { return };
         let Some(workspace) = self.workspace.upgrade() else { return };
-        let Some((key, name, icon)) = workspace.update(cx, |w, cx| w.palette_enter(id, database, cx)) else { return };
-        self.scope = Some(Scope { key, name: name.into(), icon, tables: PaletteTables::Loading, list: List::default() });
+        let Some((key, name)) = workspace.update(cx, |w, cx| w.palette_enter(id, database, cx)) else { return };
+        self.scope = Some(Scope { key, name: name.into(), tables: PaletteTables::Loading, list: List::default() });
         self.input.update(cx, |input, cx| input.set_placeholder("Search its tables", window, cx));
         self.refresh_scope(cx);
         self.set_query("", window, cx);
@@ -292,7 +292,7 @@ impl Palette {
     /// What the field and the empty list show about the entered connection.
     fn scope_view(&self) -> Option<ScopeView> {
         let scope = self.scope.as_ref()?;
-        Some(ScopeView { name: scope.name.clone(), icon: scope.icon.clone(), tables: scope.tables.clone() })
+        Some(ScopeView { name: scope.name.clone(), tables: scope.tables.clone() })
     }
 
     fn item(&self, m: &search::Match) -> CommandItem {
@@ -329,7 +329,6 @@ impl Palette {
 #[derive(Clone)]
 struct ScopeView {
     name: SharedString,
-    icon: Icon,
     tables: PaletteTables,
 }
 
@@ -345,20 +344,21 @@ fn field(input: &Entity<InputState>, scope: Option<&ScopeView>, cx: &App) -> Any
         .gap_2()
         .border_b_1()
         .border_color(theme.border)
-        .child(Icon::new(IconName::Search).text_color(theme.muted_foreground))
+        // A database once one's entered (its tables are searched), else a magnifying glass.
+        .child(
+            match scope {
+                Some(_) => Icon::new(AssetIcon::Database),
+                None => Icon::new(IconName::Search),
+            }
+            .text_color(theme.muted_foreground),
+        )
         .children(scope.map(|scope| {
+            // Part of the field, like a path: the database, then what's typed.
             h_flex()
                 .flex_shrink_0()
-                .gap_1()
-                .px_1p5()
-                .py_0p5()
-                .rounded_md()
-                .bg(theme.secondary)
-                .text_sm()
-                .text_color(theme.secondary_foreground)
-                .child(scope.icon.clone().xsmall())
+                .gap_1p5()
                 .child(scope.name.clone())
-                .child(Icon::new(IconName::ChevronRight).xsmall().text_color(theme.muted_foreground))
+                .child(div().text_color(theme.muted_foreground).child("/"))
         }))
         .child(div().flex_1().child(Input::new(input).appearance(false).p_0()))
         .when(loading, |row| row.child(Spinner::new().small().color(theme.muted_foreground)))

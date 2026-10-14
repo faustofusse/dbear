@@ -1761,14 +1761,14 @@ impl Workspace {
         entries
     }
 
-    /// Tab on a connection in the palette: selects (connects to) it; returns what it shows, its name and icon.
-    pub(crate) fn palette_enter(&mut self, id: String, database: Option<String>, cx: &mut Context<Self>) -> Option<(TargetKey, String, Icon)> {
+    /// Tab on a connection in the palette: selects (connects to) it; returns what it shows and its name.
+    pub(crate) fn palette_enter(&mut self, id: String, database: Option<String>, cx: &mut Context<Self>) -> Option<(TargetKey, String)> {
         self.palette_chose_connection(id, database, cx);
         let (config, key) = self.target()?;
         // The database, as in "app_dev > orders"; a file's path (SQLite) reads better as the connection.
         let database = config.default_database();
         let name = if database.is_empty() || database.contains(['/', '\\']) { config.name.clone() } else { database.to_string() };
-        Some((key, name, crate::assets::kind_icon(config.kind)))
+        Some((key, name))
     }
 
     /// The tables of `key` for the palette, once listed.

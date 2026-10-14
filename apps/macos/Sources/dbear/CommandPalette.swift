@@ -16,24 +16,24 @@ struct CommandPalette: View {
     @State private var hits: [PaletteHit] = []
     @State private var selection = 0
     /// The connection entered with Tab: only its tables are searched.
-    @State private var scope: (key: DriverKey, name: String, kind: DatabaseKind?)?
+    @State private var scope: (key: DriverKey, name: String)?
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
+                // A database once one's entered (its tables are searched), else a magnifying glass.
+                Image(systemName: scope == nil ? "magnifyingglass" : "cylinder")
                     .foregroundStyle(.secondary)
+                    .frame(width: 18)
                 if let scope {
-                    HStack(spacing: 4) {
-                        if let kind = scope.kind { DatabaseKindIcon(kind: kind, size: 12) }
+                    // Part of the field, like a path: the database, then what's typed.
+                    HStack(spacing: 5) {
                         Text(scope.name)
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                            .font(.title3)
+                        Text("/")
+                            .font(.title3)
+                            .foregroundStyle(.tertiary)
                     }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
                     .fixedSize()
                 }
                 PaletteField(
@@ -162,7 +162,7 @@ struct CommandPalette: View {
         guard hits.indices.contains(selection),
               case .connection(let id, let database) = entries[hits[selection].index].target,
               let (key, name) = model.paletteEnter(id, database: database) else { return false }
-        scope = (key, name, model.connections.first { $0.id == id }?.kind)
+        scope = (key, name)
         query = ""
         load(model.paletteTableEntries(key))
         return true
