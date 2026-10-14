@@ -4,6 +4,10 @@ import SwiftUI
 /// The command palette (⌘K): the menus' commands, the open tabs, the connections and the tables of
 /// every connection listed so far, in one search. Matching and ranking are the core's
 /// (`dbcore::palette`), shared with the GPUI app.
+///
+/// Tab on a connection (or one of its databases) connects to it and keeps the palette open on its
+/// tables, shown as `[app_dev ›] search…` in the field. Backspace in the empty field, or Escape once
+/// it's empty, goes back to everything.
 struct CommandPalette: View {
     @Environment(AppModel.self) private var model
     @State private var query = ""
@@ -11,46 +15,87 @@ struct CommandPalette: View {
     @State private var search: PaletteSearch?
     @State private var hits: [PaletteHit] = []
     @State private var selection = 0
-    @FocusState private var focused: Bool
+    /// The connection entered with Tab: only its tables are searched.
+    @State private var scope: (key: DriverKey, name: String, kind: DatabaseKind?)?
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("Search commands, tabs, connections and tables", text: $query)
-                    .textFieldStyle(.plain)
-                    .font(.title3)
-                    .focused($focused)
-                    .onSubmit { confirm(selection) }
-                    .onKeyPress(.upArrow) { move(-1); return .handled }
-                    .onKeyPress(.downArrow) { move(1); return .handled }
-                    // ⌃N / ⌃P too, like the text system's own (and most palettes).
-                    .onKeyPress(keys: ["n", "p"]) { press in
-                        guard press.modifiers == .control else { return .ignored }
-                        move(press.key == "n" ? 1 : -1)
-                        return .handled
+                if let scope {
+                    HStack(spacing: 4) {
+                        if let kind = scope.kind { DatabaseKindIcon(kind: kind, size: 12) }
+                        Text(scope.name)
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
-                    .onExitCommand { close() }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+                    .fixedSize()
+                }
+                PaletteField(
+                    text: $query,
+                    placeholder: scope == nil ? "Search commands, tabs, connections and tables" : "Search its tables"
+                ) { key in
+                    switch key {
+                    case .up: move(-1)
+                    case .down: move(1)
+                    case .submit: confirm(selection)
+                    // Never moves focus out of the field.
+                    case .tab: _ = enterConnection()
+                    // In the empty field: leaves the entered connection (otherwise it deletes).
+                    case .deleteInEmptyField:
+                        guard scope != nil else { return false }
+                        leaveScope()
+                    // Clears the field, then leaves the entered connection, then closes.
+                    case .cancel:
+                        if !query.isEmpty { query = "" } else if scope != nil { leaveScope() } else { close() }
+                    }
+                    return true
+                }
+                if tablesState == .loading {
+                    ProgressView().controlSize(.small)
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 11)
             Divider()
             if hits.isEmpty {
-                Text("No matches")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 22)
+                Group {
+                    switch tablesState {
+                    case .loading:
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading tables…")
+                        }
+                    case .failed(let error): Text(error).foregroundStyle(.red)
+                    case .ready where query.isEmpty: Text("No tables")
+                    default: Text("No matches")
+                    }
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 22)
+                .padding(.horizontal, 14)
             } else {
                 list
             }
             Divider()
             HStack(spacing: 12) {
-                Text("> commands")
-                Text("# tables")
-                Text("@ connections")
-                Spacer()
-                Text("↑↓ move  ↩ open  ⎋ close")
+                if scope != nil {
+                    if tablesState == .ready { Text("\(entries.count) tables") }
+                    Spacer()
+                    Text("↩ open  ⌫ everything")
+                } else {
+                    Text("> commands")
+                    Text("# tables")
+                    Text("@ connections")
+                    Spacer()
+                    Text("⇥ a connection’s tables  ↩ open")
+                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -62,12 +107,13 @@ struct CommandPalette: View {
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator))
         .shadow(color: .black.opacity(0.25), radius: 24, y: 10)
         .onAppear {
-            entries = model.paletteEntries()
-            search = PaletteSearch(entries.map(\.item))
-            rank()
-            focused = true
+            load(model.paletteEntries())
         }
         .onChange(of: query) { rank() }
+        // An entered connection's tables, once they're listed.
+        .onChange(of: tablesState) {
+            if let scope { load(model.paletteTableEntries(scope.key)) }
+        }
     }
 
     private var list: some View {
@@ -90,9 +136,43 @@ struct CommandPalette: View {
         }
     }
 
+    private func load(_ newEntries: [PaletteEntry]) {
+        entries = newEntries
+        search = PaletteSearch(entries.map(\.item))
+        rank()
+    }
+
+    /// The entered connection's tables: loading, listed, or why not (`nil`: none entered).
+    private var tablesState: PaletteTablesState? {
+        scope.map { model.paletteTablesState($0.key) }
+    }
+
     private func rank() {
-        hits = search?.rank(query) ?? []
+        if scope != nil {
+            // Its tables only, all of them before anything's typed.
+            hits = search?.rank("#" + query.drop { "#>@".contains($0) }) ?? []
+        } else {
+            hits = search?.rank(query) ?? []
+        }
         selection = 0
+    }
+
+    /// Tab: connects to the selected connection or database and lists its tables.
+    private func enterConnection() -> Bool {
+        guard hits.indices.contains(selection),
+              case .connection(let id, let database) = entries[hits[selection].index].target,
+              let (key, name) = model.paletteEnter(id, database: database) else { return false }
+        scope = (key, name, model.connections.first { $0.id == id }?.kind)
+        query = ""
+        load(model.paletteTableEntries(key))
+        return true
+    }
+
+    private func leaveScope() {
+        scope = nil
+        query = ""
+        // Connecting may have made more commands and tables available.
+        load(model.paletteEntries())
     }
 
     private func move(_ offset: Int) {
@@ -159,5 +239,63 @@ private struct PaletteRow: View {
             text[lower..<upper].inlinePresentationIntent = .stronglyEmphasized
         }
         return text
+    }
+}
+
+/// The palette's search field. An AppKit field, so its keys (↑ ↓, ⌃N ⌃P, Tab, Return, Escape,
+/// Backspace in the empty field) reach the palette before the text system acts on them (Tab would
+/// move focus out of a SwiftUI `TextField`).
+private struct PaletteField: NSViewRepresentable {
+    enum Key { case up, down, tab, submit, cancel, deleteInEmptyField }
+
+    @Binding var text: String
+    let placeholder: String
+    /// Returns whether it handled the key.
+    let onKey: (Key) -> Bool
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField()
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = .preferredFont(forTextStyle: .title3)
+        field.cell?.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.delegate = context.coordinator
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        DispatchQueue.main.async { field.window?.makeFirstResponder(field) }
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text { field.stringValue = text }
+        field.placeholderString = placeholder
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: PaletteField
+
+        init(_ parent: PaletteField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            // ⌃P / ⌃N are bound to these by the text system too.
+            case #selector(NSResponder.moveUp(_:)): parent.onKey(.up)
+            case #selector(NSResponder.moveDown(_:)): parent.onKey(.down)
+            case #selector(NSResponder.insertTab(_:)): parent.onKey(.tab)
+            case #selector(NSResponder.insertNewline(_:)): parent.onKey(.submit)
+            case #selector(NSResponder.cancelOperation(_:)): parent.onKey(.cancel)
+            case #selector(NSResponder.deleteBackward(_:)) where textView.string.isEmpty: parent.onKey(.deleteInEmptyField)
+            default: false
+            }
+        }
     }
 }

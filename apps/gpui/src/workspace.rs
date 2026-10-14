@@ -42,6 +42,14 @@ enum Load<T> {
     Failed(String),
 }
 
+/// How the tables of a connection entered in the palette (Tab) are coming along.
+#[derive(Clone)]
+pub enum PaletteTables {
+    Loading,
+    Failed(String),
+    Ready,
+}
+
 /// One connection per (connection id, database): Postgres can't switch databases on a session.
 type TargetKey = (String, String);
 
@@ -1653,34 +1661,27 @@ impl Workspace {
     // MARK: command palette
 
     fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
-        let entries = self.palette_entries(window, cx);
-        let workspace = cx.entity().downgrade();
-        Palette::open(
-            entries,
-            move |target, window, cx| {
-                workspace.update(cx, |w, cx| w.palette_chose(target, window, cx)).ok();
-            },
-            window,
-            cx,
-        );
+        let focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
+        let entries = self.palette_entries(&focus, window, cx);
+        Palette::open(entries, cx.entity(), window, cx);
     }
 
     /// Everything the palette lists, in the order an empty query shows it: commands, open tabs,
     /// connections (and their databases), then the tables of every connection listed so far,
     /// the shown one's first.
-    fn palette_entries(&self, window: &Window, cx: &App) -> Vec<palette::Entry> {
+    /// `focus`: what had focus before the palette, which its commands go to.
+    pub(crate) fn palette_entries(&self, focus: &FocusHandle, window: &Window, cx: &App) -> Vec<palette::Entry> {
         let menu_state = MenuState { sidebar: self.sidebar_visible, inspector: crate::inspector::is_shown(cx) };
         let mut entries = Vec::new();
-        let focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
         // Commands that nothing where focus is handles are left out, as the menus disable them, and
         // so are the window's that wouldn't do anything now.
         for command in crate::menus::palette_commands(menu_state) {
             let action = command.action.as_ref();
-            if !command.global && !window.is_action_available_in(action, &focus) || !self.command_applies(action, cx) {
+            if !command.global && !window.is_action_available_in(action, focus) || !self.command_applies(action, cx) {
                 continue;
             }
             let shortcut = window
-                .highest_precedence_binding_for_action_in(action, &focus)
+                .highest_precedence_binding_for_action_in(action, focus)
                 .or_else(|| window.highest_precedence_binding_for_action_in_context(action, KeyContext::default()))
                 .and_then(|b| b.keystrokes().first().map(|k| k.as_keystroke().clone()));
             entries.push(palette::Entry {
@@ -1734,23 +1735,62 @@ impl Workspace {
         let mut listed: Vec<&TargetKey> = self.schema_cache.keys().collect();
         listed.sort_by_key(|key| (Some(*key) != current.as_ref(), self.target_label(key)));
         for key in listed {
-            let target = self.target_label(key);
-            for schema in &self.schema_cache[key] {
-                for table in &schema.tables {
-                    let qualified = if schema.name.is_empty() { table.name.clone() } else { format!("{}.{}", schema.name, table.name) };
-                    let detail = if schema.name.is_empty() { target.clone() } else { format!("{} \u{b7} {target}", schema.name) };
-                    let view = table.kind == TableKind::View;
-                    entries.push(palette::Entry {
-                        candidate: Candidate::new(Kind::Table, table.name.clone()).keywords([qualified, target.clone()]),
-                        detail: Some(detail.into()),
-                        icon: Icon::new(if view { IconName::Eye } else { IconName::FileText }),
-                        shortcut: None,
-                        target: Target::Table { connection: key.0.clone(), database: key.1.clone(), table: table.clone() },
-                    });
-                }
+            entries.extend(self.table_entries(key));
+        }
+        entries
+    }
+
+    /// The palette's entries for a target's tables (none until they're listed).
+    fn table_entries(&self, key: &TargetKey) -> Vec<palette::Entry> {
+        let target = self.target_label(key);
+        let mut entries = Vec::new();
+        for schema in self.schema_cache.get(key).into_iter().flatten() {
+            for table in &schema.tables {
+                let qualified = if schema.name.is_empty() { table.name.clone() } else { format!("{}.{}", schema.name, table.name) };
+                let detail = if schema.name.is_empty() { target.clone() } else { format!("{} \u{b7} {target}", schema.name) };
+                let view = table.kind == TableKind::View;
+                entries.push(palette::Entry {
+                    candidate: Candidate::new(Kind::Table, table.name.clone()).keywords([qualified, target.clone()]),
+                    detail: Some(detail.into()),
+                    icon: Icon::new(if view { IconName::Eye } else { IconName::FileText }),
+                    shortcut: None,
+                    target: Target::Table { connection: key.0.clone(), database: key.1.clone(), table: table.clone() },
+                });
             }
         }
         entries
+    }
+
+    /// Tab on a connection in the palette: selects (connects to) it; returns what it shows, its name and icon.
+    pub(crate) fn palette_enter(&mut self, id: String, database: Option<String>, cx: &mut Context<Self>) -> Option<(TargetKey, String, Icon)> {
+        self.palette_chose_connection(id, database, cx);
+        let (config, key) = self.target()?;
+        // The database, as in "app_dev > orders"; a file's path (SQLite) reads better as the connection.
+        let database = config.default_database();
+        let name = if database.is_empty() || database.contains(['/', '\\']) { config.name.clone() } else { database.to_string() };
+        Some((key, name, crate::assets::kind_icon(config.kind)))
+    }
+
+    /// The tables of `key` for the palette, once listed.
+    pub(crate) fn palette_tables(&self, key: &TargetKey, _: &App) -> (PaletteTables, Vec<palette::Entry>) {
+        if self.schema_cache.contains_key(key) {
+            return (PaletteTables::Ready, self.table_entries(key));
+        }
+        let shown = self.target().is_some_and(|(_, k)| &k == key);
+        match &self.schemas {
+            Load::Failed(e) if shown => (PaletteTables::Failed(e.clone()), Vec::new()),
+            // Moved on to another connection meanwhile: its tables won't come.
+            _ if !shown => (PaletteTables::Failed("No longer selected".into()), Vec::new()),
+            _ => (PaletteTables::Loading, Vec::new()),
+        }
+    }
+
+    fn palette_chose_connection(&mut self, id: String, database: Option<String>, cx: &mut Context<Self>) {
+        self.users_mode = false;
+        if database.is_some() {
+            self.expanded.insert(id.clone());
+        }
+        self.select_row((id, database), cx);
     }
 
     /// Whether one of the window's commands would do something now.
@@ -1774,20 +1814,14 @@ impl Workspace {
         }
     }
 
-    fn palette_chose(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn palette_chose(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             Target::Tab(id) => {
                 if let Some(ix) = self.tabs.iter().position(|tab| tab.view.entity_id() == id) {
                     self.activate(ix, window, cx);
                 }
             }
-            Target::Connection { id, database } => {
-                self.users_mode = false;
-                if database.is_some() {
-                    self.expanded.insert(id.clone());
-                }
-                self.select_row((id, database), cx);
-            }
+            Target::Connection { id, database } => self.palette_chose_connection(id, database, cx),
             Target::Table { connection, database, table } => {
                 self.users_mode = false;
                 self.select_connection(connection, cx);

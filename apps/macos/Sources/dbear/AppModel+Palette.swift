@@ -17,6 +17,11 @@ enum PaletteIcon {
     case kind(DatabaseKind)
 }
 
+enum PaletteTablesState: Equatable {
+    case loading, ready
+    case failed(String)
+}
+
 struct PaletteEntry {
     let item: PaletteItem
     /// Muted, after the label: a table's schema and connection, a tab's connection…
@@ -84,22 +89,50 @@ extension AppModel {
             let (aFirst, bFirst) = (a.key == current, b.key == current)
             return aFirst != bFirst ? aFirst : a.name < b.name
         }
-        for (key, target) in listed {
-            for schema in schemaCache[key] ?? [] {
-                for table in schema.tables {
-                    let qualified = schema.name.isEmpty ? table.name : "\(schema.name).\(table.name)"
-                    let icon = table.kind == TableKind.view ? "eye" : "tablecells"
-                    entries.append(PaletteEntry(
-                        item: PaletteItem(kind: .table, label: table.name, keywords: [qualified, target]),
-                        detail: schema.name.isEmpty ? target : "\(schema.name) · \(target)",
-                        icon: .symbol(icon),
-                        shortcut: nil,
-                        target: .table(key.connectionID, database: key.database, table)
-                    ))
-                }
+        for (key, _) in listed {
+            entries += paletteTableEntries(key)
+        }
+        return entries
+    }
+
+    /// The palette's entries for a target's tables (none until they're listed).
+    func paletteTableEntries(_ key: DriverKey) -> [PaletteEntry] {
+        guard let connection = connections.first(where: { $0.id == key.connectionID }) else { return [] }
+        let target = displayName(of: connection.withDatabase(key.database))
+        var entries: [PaletteEntry] = []
+        for schema in schemaCache[key] ?? [] {
+            for table in schema.tables {
+                let qualified = schema.name.isEmpty ? table.name : "\(schema.name).\(table.name)"
+                let icon = table.kind == TableKind.view ? "eye" : "tablecells"
+                entries.append(PaletteEntry(
+                    item: PaletteItem(kind: .table, label: table.name, keywords: [qualified, target]),
+                    detail: schema.name.isEmpty ? target : "\(schema.name) · \(target)",
+                    icon: .symbol(icon),
+                    shortcut: nil,
+                    target: .table(key.connectionID, database: key.database, table)
+                ))
             }
         }
         return entries
+    }
+
+    /// Tab on a connection in the palette: selects (connects to) it; returns what it shows and its name.
+    func paletteEnter(_ id: ConnectionConfig.ID, database: String?) -> (key: DriverKey, name: String)? {
+        browseMode = .tables
+        select(id, database: database)
+        guard let target = selectedTarget else { return nil }
+        // The database, as in "app_dev > orders"; a file's path (SQLite) reads better as the connection.
+        let database = target.defaultDatabase
+        let name = database.isEmpty || database.contains("/") || database.contains("\\") ? target.name : database
+        return (target.driverKey, name)
+    }
+
+    /// How the tables of a connection entered in the palette are coming along.
+    func paletteTablesState(_ key: DriverKey) -> PaletteTablesState {
+        if schemaCache[key] != nil { return .ready }
+        guard selectedTarget?.driverKey == key else { return .failed("No longer selected") }
+        if case .failed(let error) = schemas { return .failed(error) }
+        return .loading
     }
 
     func perform(_ target: PaletteTarget) {

@@ -136,7 +136,9 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
 - Command palette (⌘K / Ctrl+K, everywhere in the window): `dbcore::palette` matches and ranks
   (fuzzy, word starts first; `>` commands, `#` tables, `@` connections; an empty query lists all but
   tables). It lists commands, open tabs, connections and their databases, and the tables of every
-  target listed so far. macOS: `AppCommand` is both the menus and the palette's commands,
+  target listed so far. Tab on a connection connects to it and narrows the palette to its tables
+  (a chip in the field, a spinner while they load); Backspace in the empty field goes back. GPUI's
+  palette uses its own search field in the `Command`'s header so the chip can sit in it. macOS: `AppCommand` is both the menus and the palette's commands,
   `CommandPalette.swift` the overlay, `DBKit.PaletteSearch` the core. GPUI: `palette.rs` on
   gpui-kit's `Command` in a dialog; `menus::palette_commands` lists the commands, and commands are
   sent to what had focus before (left out when nothing there handles them).
