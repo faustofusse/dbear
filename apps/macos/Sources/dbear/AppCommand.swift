@@ -4,7 +4,7 @@ import SwiftUI
 /// The window's commands. The menus (`AppCommands`) and the command palette (⌘K) both list these,
 /// so they share titles, shortcuts and when they're available.
 enum AppCommand: CaseIterable {
-    case newScript, newConnection, importConnections, editConnection, usersAndRoles
+    case newScript, newConnection, importConnections, editConnection, disconnect, disconnectAll, usersAndRoles
     case saveChanges, reviewChanges, addRow
     case closeTab, closeWindow
     case toggleSidebar, showData, showStructure, toggleInspector
@@ -18,6 +18,8 @@ enum AppCommand: CaseIterable {
         case .newConnection: "New Connection…"
         case .importConnections: "Import from DBeaver…"
         case .editConnection: "Edit Connection…"
+        case .disconnect: "Disconnect"
+        case .disconnectAll: "Disconnect All"
         case .usersAndRoles: "Users & Roles"
         case .saveChanges: "Save Changes"
         case .reviewChanges: "Review Changes…"
@@ -40,6 +42,7 @@ enum AppCommand: CaseIterable {
     @MainActor func paletteTitle(_ model: AppModel) -> String {
         switch self {
         case .importConnections: "Import Connections from DBeaver…"
+        case .disconnect: model.selectedConnection.map { "Disconnect from \($0.name)" } ?? "Disconnect"
         case .showData: "Show Data"
         case .showStructure: "Show Structure"
         default: title(model)
@@ -53,6 +56,8 @@ enum AppCommand: CaseIterable {
         case .newConnection: ["add", "create", "server"]
         case .importConnections: ["import"]
         case .editConnection: ["settings", "password", "host"]
+        case .disconnect: ["close", "connection", "database"]
+        case .disconnectAll: ["close", "connections", "databases"]
         case .usersAndRoles: ["permissions", "privileges", "grants", "access"]
         case .saveChanges: ["commit", "apply", "edits"]
         case .reviewChanges: ["preview", "sql", "edits"]
@@ -73,7 +78,7 @@ enum AppCommand: CaseIterable {
         switch self {
         case .newScript: KeyboardShortcut("t", modifiers: .command)
         case .newConnection: KeyboardShortcut("n", modifiers: [.command, .shift])
-        case .importConnections: nil
+        case .importConnections, .disconnect, .disconnectAll: nil
         case .editConnection: KeyboardShortcut("e", modifiers: [.command, .shift])
         case .usersAndRoles: KeyboardShortcut("u", modifiers: [.command, .shift])
         case .saveChanges: KeyboardShortcut("s", modifiers: .command)
@@ -98,6 +103,8 @@ enum AppCommand: CaseIterable {
         case .newScript: model.selectedTarget != nil
         case .newConnection, .importConnections, .closeTab, .closeWindow, .toggleSidebar, .toggleInspector: true
         case .editConnection: model.selectedConnection != nil
+        case .disconnect: model.selectedConnectionID.map(model.openConnections.contains) ?? false
+        case .disconnectAll: !model.openConnections.isEmpty
         case .usersAndRoles: model.selectedConnection.map(model.canManageUsers) ?? false
         // Enabled for any table tab: a cell being typed into isn't a pending edit until it's committed.
         case .saveChanges, .reviewChanges: model.activeEditableRows.map { $0.readOnlyReason == nil } ?? false
@@ -116,6 +123,8 @@ enum AppCommand: CaseIterable {
         case .newConnection: model.newConnection()
         case .importConnections: model.showingImport = true
         case .editConnection: if let c = model.selectedConnection { model.edit(c) }
+        case .disconnect: if let c = model.selectedConnection { Task { await model.disconnect(c) } }
+        case .disconnectAll: Task { await model.disconnectAll() }
         case .usersAndRoles: model.openUsers()
         case .saveChanges: if let tab = model.activeEditableRows { model.saveEditsNow(tab) }
         case .reviewChanges: if let tab = model.activeEditableRows { model.reviewEdits(tab) }

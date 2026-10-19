@@ -58,7 +58,7 @@ actions!(
     [
         NewScript, CloseTab, PreviousTab, NextTab, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
         SelectTab7, SelectTab8, LastTab, NewConnection, EditConnection, ImportConnections, ShowUsers, ToggleSidebar,
-        SelectPrevious, SelectNext, DeleteSelected
+        SelectPrevious, SelectNext, DeleteSelected, Disconnect, DisconnectAll
     ]
 );
 
@@ -575,6 +575,16 @@ impl Workspace {
         }
         self.save_session(cx);
         cx.notify();
+    }
+
+    /// Closes every open connection (see [`Self::disconnect`]).
+    fn disconnect_all(&mut self, cx: &mut Context<Self>) {
+        let mut ids: Vec<String> = self.open.keys().map(|(c, _)| c.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            self.disconnect(&id, cx);
+        }
     }
 
     /// Adds a copy named "… copy", with the same password, and selects it.
@@ -1801,6 +1811,10 @@ impl Workspace {
             self.open_connection().is_some()
         } else if any.is::<EditConnection>() {
             self.selected_connection().is_some()
+        } else if any.is::<Disconnect>() {
+            self.selected.as_deref().is_some_and(|id| self.open.keys().any(|(c, _)| c == id))
+        } else if any.is::<DisconnectAll>() {
+            !self.open.is_empty()
         } else if any.is::<ShowUsers>() {
             self.selected_connection().is_some_and(|c| dbcore::access::features(c.kind).is_some())
         } else if any.is::<ShowData>() || any.is::<ShowStructure>() || any.is::<AddRow>() {
@@ -2795,6 +2809,12 @@ impl Render for Workspace {
                     this.open_editor(Some(config), window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &Disconnect, _, cx| {
+                if let Some(id) = this.selected.clone() {
+                    this.disconnect(&id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DisconnectAll, _, cx| this.disconnect_all(cx)))
             .on_action(cx.listener(|this, _: &ImportConnections, window, cx| this.open_import(window, cx)))
             .on_action(cx.listener(Self::show_users))
             .on_action(cx.listener(Self::toggle_sidebar))

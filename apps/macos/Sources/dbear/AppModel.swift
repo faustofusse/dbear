@@ -764,6 +764,12 @@ final class AppModel {
         await updateConnectionState(config.id)
     }
 
+    /// Disconnects every connection that has a driver open.
+    func disconnectAll() async {
+        let ids = Set(drivers.keys.map(\.connectionID))
+        for config in connections where ids.contains(config.id) { await disconnect(config) }
+    }
+
     func updateConnectionState(_ id: ConnectionConfig.ID) async {
         var open = false
         for driver in drivers(of: id) where await driver.isConnected() {

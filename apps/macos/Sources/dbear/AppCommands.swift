@@ -21,6 +21,8 @@ struct AppCommands: Commands {
             item(.newConnection)
             item(.importConnections)
             item(.editConnection)
+            item(.disconnect)
+            item(.disconnectAll)
             item(.usersAndRoles)
             #if DEBUG
             Button("Add Sample Connections") { model.addSampleConnections() }

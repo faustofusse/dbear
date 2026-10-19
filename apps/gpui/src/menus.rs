@@ -9,7 +9,7 @@ use crate::tabs::{
     ToggleInspector, ZoomIn, ZoomOut,
 };
 use crate::workspace::{
-    CloseTab, EditConnection, ImportConnections, LastTab, NewConnection, NewScript, NextTab, PreviousTab, SelectTab1,
+    CloseTab, Disconnect, DisconnectAll, EditConnection, ImportConnections, LastTab, NewConnection, NewScript, NextTab, PreviousTab, SelectTab1,
     SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, ShowUsers, ToggleSidebar,
 };
 
@@ -25,6 +25,8 @@ fn menus(state: MenuState) -> Vec<Menu> {
         MenuItem::action("New Connection…", NewConnection),
         MenuItem::action("Import from DBeaver…", ImportConnections),
         MenuItem::action("Edit Connection…", EditConnection),
+        MenuItem::action("Disconnect", Disconnect),
+        MenuItem::action("Disconnect All", DisconnectAll),
         MenuItem::separator(),
         MenuItem::action("Users & Roles", ShowUsers),
         MenuItem::separator(),
@@ -107,6 +109,8 @@ pub fn palette_commands(state: MenuState) -> Vec<PaletteCommand> {
         command("New SQL Script", NewScript, &["query", "editor", "console"]),
         command("New Connection…", NewConnection, &["add", "create", "server"]),
         command("Edit Connection…", EditConnection, &["settings", "password", "host"]),
+        command("Disconnect", Disconnect, &["close", "connection", "database"]),
+        command("Disconnect All", DisconnectAll, &["close", "connections", "databases"]),
         command("Import Connections from DBeaver…", ImportConnections, &[]),
         command("Users & Roles", ShowUsers, &["permissions", "privileges", "grants", "access"]),
         command("Save Changes…", SaveEdits, &["commit", "apply", "edits"]),
