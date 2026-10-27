@@ -206,6 +206,7 @@ extension DatabaseKind {
         case .sqlite: self = .sqlite
         case .libsql: self = .libsql
         case .sqlServer: self = .sqlServer
+        case .d1: self = .d1
         }
     }
 }
@@ -218,6 +219,7 @@ extension DBCoreFFI.DatabaseKind {
         case .sqlite: self = .sqlite
         case .libsql: self = .libsql
         case .sqlServer: self = .sqlServer
+        case .d1: self = .d1
         }
     }
 }

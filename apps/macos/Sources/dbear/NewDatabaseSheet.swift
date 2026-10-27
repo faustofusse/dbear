@@ -8,9 +8,10 @@ struct NewDatabaseRequest: Identifiable {
 }
 
 extension AppModel {
-    /// Servers you can create databases on: the ones whose other databases dbear can browse.
+    /// Servers you can create databases on: the ones whose other databases dbear can browse, except
+    /// D1 (its databases are created through Cloudflare's API or wrangler, not SQL).
     func canCreateDatabases(on connection: ConnectionConfig) -> Bool {
-        connection.supportsMultipleDatabases
+        connection.supportsMultipleDatabases && connection.kind != .d1
     }
 
     func requestNewDatabase(on connection: ConnectionConfig) {

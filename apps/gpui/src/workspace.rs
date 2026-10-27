@@ -2373,7 +2373,7 @@ impl Workspace {
                     let new_database = this.clone();
                     let new_database_config = config.clone();
                     let (dump_this, dump_config) = (this.clone(), config.clone());
-                    let menu = menu.when(config.supports_multiple_databases(), |menu| {
+                    let menu = menu.when(can_create_databases(&config), |menu| {
                         menu.item(PopupMenuItem::new("New Database…").on_click(move |_, window, cx| {
                             let config = new_database_config.clone();
                             new_database.update(cx, |w, cx| w.open_new_database(config, window, cx)).ok();
@@ -2498,10 +2498,12 @@ impl Workspace {
                             ));
                         }
                         let (this, config) = (this.clone(), config.clone());
-                        menu.separator().item(PopupMenuItem::new("New Database…").on_click(move |_, window, cx| {
-                            let config = config.clone();
-                            this.update(cx, |w, cx| w.open_new_database(config, window, cx)).ok();
-                        }))
+                        menu.when(can_create_databases(&config), |menu| {
+                            menu.separator().item(PopupMenuItem::new("New Database…").on_click(move |_, window, cx| {
+                                let config = config.clone();
+                                this.update(cx, |w, cx| w.open_new_database(config, window, cx)).ok();
+                            }))
+                        })
                     })
                     .into_any_element()
             }
@@ -2842,6 +2844,12 @@ impl Render for Workspace {
             // Running and finished dumps/restores, over the bottom-right corner.
             .child(div().absolute().bottom_4().right_4().child(self.backups.clone()))
     }
+}
+
+/// Whether "New Database…" applies: the connection browses its server's databases and the core can
+/// write a `create database` for it (not D1's, which are made through Cloudflare's API or wrangler).
+fn can_create_databases(config: &ConnectionConfig) -> bool {
+    config.supports_multiple_databases() && Dialect(config.kind).create_database("db").is_ok()
 }
 
 fn open_store() -> dbcore::Result<ConnectionStore> {

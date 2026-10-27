@@ -49,6 +49,11 @@ struct ConnectionEditor: View {
                         draft: $draft, token: $password, tokenPrompt: passwordPrompt,
                         tokenEdited: { passwordEdited = true }
                     ) { kindPicker }
+                } else if draft.kind == .d1 {
+                    D1ConnectionSection(
+                        draft: $draft, token: $password, tokenPrompt: passwordPrompt,
+                        tokenEdited: { passwordEdited = true }
+                    ) { kindPicker }
                 } else {
                     serverSection
                     authSection
@@ -386,14 +391,26 @@ struct ConnectionEditor: View {
         if new != .sqlite, draft.host.trimmingCharacters(in: .whitespaces).isEmpty { draft.host = "localhost" }
         if draft.port == old.defaultPort { draft.port = nil }
         if !draft.supportsSSH { draft.ssh = nil }
+        switch new {
         // Turso: a remote host (not localhost), no user or database, certificate verified.
-        if new == .libsql {
-            if draft.host == "localhost" { draft.host = "" }
+        case .libsql:
+            if draft.host == "localhost" || old == .d1 { draft.host = "" }
             draft.database = ""
             draft.user = nil
             draft.sslMode = .verifyFull
-        } else if old == .libsql {
-            draft.sslMode = .prefer
+        // D1: an account ID instead of a host (optional), a database name, no user or port.
+        case .d1:
+            draft.host = ""
+            draft.port = nil
+            draft.database = ""
+            draft.user = nil
+            draft.sslMode = .verifyFull
+        default:
+            if old == .libsql || old == .d1 { draft.sslMode = .prefer }
+            if old == .d1 {
+                draft.host = new == .sqlite ? "" : "localhost"
+                draft.database = ""
+            }
         }
     }
 

@@ -146,7 +146,9 @@ struct TablesList: View {
             .pickerStyle(.inline)
             .labelsHidden()
             Divider()
-            Button("New Database…") { model.requestNewDatabase(on: connection) }
+            if model.canCreateDatabases(on: connection) {
+                Button("New Database…") { model.requestNewDatabase(on: connection) }
+            }
             Button("Refresh Databases") { Task { await model.loadDatabases(connection) } }
         }
     }

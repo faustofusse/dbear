@@ -13,8 +13,8 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-const KINDS: [DatabaseKind; 5] =
-    [DatabaseKind::Postgres, DatabaseKind::Mysql, DatabaseKind::SqlServer, DatabaseKind::Sqlite, DatabaseKind::Libsql];
+const KINDS: [DatabaseKind; 6] =
+    [DatabaseKind::Postgres, DatabaseKind::Mysql, DatabaseKind::SqlServer, DatabaseKind::Sqlite, DatabaseKind::Libsql, DatabaseKind::D1];
 const SSL_MODES: [SslMode; 4] = [SslMode::Disable, SslMode::Prefer, SslMode::Require, SslMode::VerifyFull];
 
 const SSH_AUTHS: [SshAuth; 3] = [SshAuth::Password, SshAuth::PrivateKey, SshAuth::Agent];
@@ -147,10 +147,15 @@ impl ConnectionEditor {
         let database = match kind {
             DatabaseKind::Postgres => "Optional (postgres)",
             DatabaseKind::Sqlite => "/path/to/file.db",
+            DatabaseKind::D1 => "Name or ID",
             _ => "Optional",
         };
         self.database.update(cx, |s, cx| s.set_placeholder(database, window, cx));
-        let host = if kind == DatabaseKind::Libsql { "mydb-org.turso.io" } else { "localhost" };
+        let host = match kind {
+            DatabaseKind::Libsql => "mydb-org.turso.io",
+            DatabaseKind::D1 => "Optional",
+            _ => "localhost",
+        };
         self.host.update(cx, |s, cx| s.set_placeholder(host, window, cx));
     }
 
@@ -159,6 +164,11 @@ impl ConnectionEditor {
             return;
         }
         let defaults = ConnectionConfig::new_empty(kind);
+        // D1's host is an account ID and its database a D1 name: neither carries over.
+        if kind == DatabaseKind::D1 || self.kind == DatabaseKind::D1 {
+            self.host.update(cx, |s, cx| s.set_value("", window, cx));
+            self.database.update(cx, |s, cx| s.set_value("", window, cx));
+        }
         self.kind = kind;
         self.ssl_mode = defaults.ssl_mode;
         self.show_all_databases = defaults.show_all_databases;
@@ -255,6 +265,8 @@ impl ConnectionEditor {
         config.password = None;
         if self.kind == DatabaseKind::Sqlite {
             config.host.clear();
+        }
+        if matches!(self.kind, DatabaseKind::Sqlite | DatabaseKind::D1) {
             config.port = None;
             config.user = None;
         }
@@ -393,6 +405,7 @@ impl Render for ConnectionEditor {
 
         let sqlite = kind == DatabaseKind::Sqlite;
         let libsql = kind == DatabaseKind::Libsql;
+        let d1 = kind == DatabaseKind::D1;
 
         v_flex()
             .gap_3()
@@ -416,7 +429,20 @@ impl Render for ConnectionEditor {
                     cx,
                 ))
             })
-            .when(!sqlite, |form| {
+            .when(d1, |form| {
+                form.child(Self::field("Account ID", Input::new(&self.host), cx))
+                    .child(Self::field("Database", Input::new(&self.database), cx))
+                    .child(Self::field("API token", Input::new(&self.password).mask_toggle(), cx))
+                    .child(Self::field(
+                        "",
+                        div().text_xs().text_color(cx.theme().muted_foreground).child(
+                            "The account ID can be left empty when the token sees only one account. The database is its \
+                             name (wrangler's database_name) or ID. The token needs D1 Read to browse, D1 Edit to change data.",
+                        ),
+                        cx,
+                    ))
+            })
+            .when(!sqlite && !d1, |form| {
                 form.child(Self::field("Host", Input::new(&self.host), cx))
                     .child(Self::field("Port", div().w(px(120.)).child(Input::new(&self.port)), cx))
                     .when(!libsql, |form| form.child(Self::field("User", Input::new(&self.user), cx)))

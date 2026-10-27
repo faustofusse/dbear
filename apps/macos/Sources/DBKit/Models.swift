@@ -7,6 +7,9 @@ public enum DatabaseKind: String, Sendable, Hashable, CaseIterable {
     /// Turso / libSQL server (remote, auth token instead of user and password).
     case libsql
     case sqlServer
+    /// Cloudflare D1, over Cloudflare's REST API: `host` is the account ID, `database` the
+    /// database's name or ID and `password` the API token.
+    case d1
 
     public var displayName: String {
         switch self {
@@ -15,6 +18,7 @@ public enum DatabaseKind: String, Sendable, Hashable, CaseIterable {
         case .sqlite: "SQLite"
         case .libsql: "Turso"
         case .sqlServer: "SQL Server"
+        case .d1: "Cloudflare D1"
         }
     }
 }
@@ -71,8 +75,9 @@ public struct ConnectionConfig: Identifiable, Hashable, Sendable {
     public var supportsSSH: Bool { [.postgres, .mysql, .sqlServer].contains(kind) }
 
     /// The server's other databases can be switched to (the tables column's title menu), each with
-    /// its own session (Postgres, MySQL, SQL Server). SQLite files have none.
-    public var supportsMultipleDatabases: Bool { [.postgres, .mysql, .sqlServer].contains(kind) }
+    /// its own session (Postgres, MySQL, SQL Server; for D1, the account's other databases).
+    /// SQLite files have none.
+    public var supportsMultipleDatabases: Bool { [.postgres, .mysql, .sqlServer, .d1].contains(kind) }
 }
 
 public enum SshAuth: String, Sendable, Hashable, CaseIterable {

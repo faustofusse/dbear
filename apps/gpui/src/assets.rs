@@ -10,12 +10,13 @@ use gpui_kit::{AssetSource, Result, SharedString};
 icon_assets!(ExtraIcons, [TextWrap, Import, ListFilter, Users, Zap, KeyRound, UserPlus, SquareArrowOutUpRight, RotateCw, Database, CircleArrowUp, Command]);
 
 /// Engine logos (the macOS app's: Simple Icons, CC0), drawn in the text colour like other icons.
-const KIND_ICONS: [(DatabaseKind, &str, &[u8]); 5] = [
+const KIND_ICONS: [(DatabaseKind, &str, &[u8]); 6] = [
     (DatabaseKind::Postgres, "icons/db/postgres.svg", include_bytes!("../assets/db/postgres.svg")),
     (DatabaseKind::Mysql, "icons/db/mysql.svg", include_bytes!("../assets/db/mysql.svg")),
     (DatabaseKind::SqlServer, "icons/db/sqlserver.svg", include_bytes!("../assets/db/sqlserver.svg")),
     (DatabaseKind::Sqlite, "icons/db/sqlite.svg", include_bytes!("../assets/db/sqlite.svg")),
     (DatabaseKind::Libsql, "icons/db/libsql.svg", include_bytes!("../assets/db/libsql.svg")),
+    (DatabaseKind::D1, "icons/db/d1.svg", include_bytes!("../assets/db/d1.svg")),
 ];
 
 /// The logo of a connection's engine.

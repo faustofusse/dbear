@@ -3,7 +3,7 @@
 <img src="assets/logo.svg" width="96" alt="dbear">
 
 A fast, native database client for macOS and Windows. It works with **PostgreSQL**, **MySQL**, **SQLite**,
-**SQL Server** and **Turso / libSQL**. A Linux version is planned.
+**SQL Server**, **Turso / libSQL** and **Cloudflare D1**. A Linux version is planned.
 
 ## Install
 
@@ -46,6 +46,19 @@ everything else in `%APPDATA%\dbear`. Shortcuts use Ctrl where the macOS app use
 Turso, paste the `libsql://…?authToken=…` URL. Local libSQL files are SQLite files, so open them
 as SQLite.
 
+**Cloudflare D1** connects over Cloudflare's API, so it needs no wrangler or Node. Pick
+**Cloudflare D1** as the type and enter:
+
+- **Account ID**: in the Cloudflare dashboard under Workers & Pages ▸ Account details. You can
+  leave it empty when the token can see only one account.
+- **Database**: its name (`database_name` in `wrangler.toml`) or its ID.
+- **API token**: create one under My Profile ▸ API Tokens with the **D1 Read** permission to
+  browse, or **D1 Edit** to change data.
+
+The URL form is `d1://<account id>/<database>?token=…`. The account's other D1 databases are in
+the tables column's title menu. Local databases from `wrangler dev` are SQLite files under
+`.wrangler/state/v3/d1/miniflare-D1DatabaseObject/` in the project, so open them as SQLite.
+
 - **Import from DBeaver…** brings in your existing DBeaver connections.
 - **Copy URL** in a connection's context menu copies its URL, including the saved password.
 - Pick the database from the title of the tables column. dbear remembers the last database you
@@ -58,7 +71,7 @@ as SQLite.
   and a different key later is refused. DBeaver connections bring their tunnels along, except jump
   servers.
 
-Passwords, SSH passwords and passphrases, and auth tokens are stored in the macOS Keychain. Everything else is kept in
+Passwords, SSH passwords and passphrases, auth tokens and API tokens are stored in the macOS Keychain. Everything else is kept in
 `~/Library/Application Support/dbear/dbear.db`.
 
 ## Features
@@ -110,7 +123,8 @@ on databases, schemas and tables. You can also set an access level for each data
 only, read only, read and write, or schema changes. dbear shows the SQL before it runs, with
 passwords masked. Only privileges granted directly to a role are listed; inherited ones aren't.
 
-**Turso.** dbear never shows row counts for Turso databases, because Turso bills by rows read.
+**Turso and D1.** dbear never shows row counts for Turso or D1 databases, because both bill by
+rows read. D1 runs each script as one batch, all or nothing, and has no `BEGIN`/`COMMIT`.
 
 ## Keyboard shortcuts
 

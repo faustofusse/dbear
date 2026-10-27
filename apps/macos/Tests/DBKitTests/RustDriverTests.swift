@@ -77,6 +77,23 @@ private var devLibSQL: ConnectionConfig { connections.first { $0.id == "local-li
     #expect(ConnectionConfig.blank(.libsql).validationError != nil)
 }
 
+@Test func d1URLsRoundTripThroughTheCore() throws {
+    let account = "f12da7851e4dd1d107a80417a1d4cbbd"
+    let parsed = try ConnectionConfig.parse(url: "d1://\(account)/my-app-db?token=tok%2Ben")
+    #expect(parsed.kind == .d1 && parsed.host == account && parsed.database == "my-app-db" && parsed.password == "tok+en")
+    #expect(parsed.name == "my-app-db" && parsed.user == nil && parsed.port == nil)
+    #expect(parsed.summary == "Cloudflare D1 · my-app-db")
+    #expect(parsed.supportsMultipleDatabases && !parsed.supportsSSH && parsed.validationError == nil)
+    #expect(parsed.url() == "d1://\(account)/my-app-db")
+    #expect(parsed.url(includingPassword: true) == "d1://\(account)/my-app-db?token=tok%2Ben")
+    let noAccount = try ConnectionConfig.parse(url: "d1:///fda15bbf-40c6-4d92-9766-5921e932fdd6")
+    #expect(noAccount.host.isEmpty && noAccount.name == "D1 fda15bbf" && noAccount.validationError == nil)
+    #expect(ConnectionConfig.blank(.d1).validationError != nil)
+    var badAccount = parsed
+    badAccount.host = "not-an-account"
+    #expect(badAccount.validationError != nil)
+}
+
 @Test(.enabled(if: libsqlEnabled)) func realLibSQLRoundTrip() async throws {
     let driver = Drivers.make(for: devLibSQL)
     try await driver.connect()

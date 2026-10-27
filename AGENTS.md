@@ -40,7 +40,7 @@ Without Nix (it only pins the toolchain):
 ## Layout
 
 ```
-crates/dbcore/      Rust core: models, drivers (Postgres, MySQL, SQLite, SQL Server, libSQL, mock), connection store, SQL highlighting
+crates/dbcore/      Rust core: models, drivers (Postgres, MySQL, SQLite, SQL Server, libSQL, D1, mock), connection store, SQL highlighting
 crates/dbcore-ffi/  UniFFI bindings for Swift
 crates/update/      self-update core (signed manifests, verified downloads) + `dbear-update` signing tool
 apps/macos/         SwiftUI app
@@ -151,6 +151,17 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
 - Turso / libSQL: Hrana 3 over HTTP (`dbcore::libsql`, reqwest + rustls/ring, no libSQL C library).
   Each call runs on its own short-lived stream, so a transaction a script leaves open is rolled back
   when it ends. Cancel stops the request, but a running statement may still finish on the server.
+- Cloudflare D1: REST API (`dbcore::d1`, `POST /accounts/{account}/d1/database/{id}/raw`; `DBEAR_D1_API`
+  overrides the base URL for tests). No new config fields: `host` is the account ID (empty: the one
+  account the token sees), `database` the name or UUID, `password` the API token (D1 Read / D1 Edit);
+  URL `d1://<account>/<database>?token=…`. SQL and catalog are the libSQL driver's. Each request is one
+  transaction and `BEGIN`/`COMMIT` are refused, so a script runs as one batch (all or nothing) and edits
+  run as one batch with a one-row check after each statement. Table pages select `quote(col)` and parse
+  the literals back (the API's JSON rounds big integers and turns blobs into arrays); script results
+  stay JSON. Results arrive whole, no row counts, `_cf_*` tables hidden. `list_databases` is the
+  account's D1 databases; there's no SSH and no New Database. `d1::discover::find(dir)` reads a Workers
+  project's wrangler.json/jsonc/toml `d1_databases` and finds the local `wrangler dev` copies (SQLite
+  files under `.wrangler/state/v3/d1/miniflare-D1DatabaseObject/`); neither app has an import UI for it yet.
 - Dump / restore: `dbcore::dump` writes from one consistent snapshot, streaming to `<file>.partial`
   until done. Turso dumps use the SQLite format; SQL Server dumps are T-SQL with `GO` batches,
   skipping what the file header lists. `dbcore::restore` also handles `COPY … FROM stdin` blocks.

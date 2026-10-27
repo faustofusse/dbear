@@ -25,6 +25,9 @@ pub enum DatabaseKind {
     /// Turso / libSQL (shown as "Turso").
     Libsql,
     SqlServer,
+    /// Cloudflare D1 (REST API): `host` is the account ID, `database` the database's name or ID,
+    /// `password` the API token.
+    D1,
 }
 
 #[derive(uniffi::Enum, Clone, Copy)]
@@ -719,6 +722,7 @@ impl From<DatabaseKind> for dbcore::DatabaseKind {
             DatabaseKind::Sqlite => Self::Sqlite,
             DatabaseKind::Libsql => Self::Libsql,
             DatabaseKind::SqlServer => Self::SqlServer,
+            DatabaseKind::D1 => Self::D1,
         }
     }
 }
@@ -731,6 +735,7 @@ impl From<dbcore::DatabaseKind> for DatabaseKind {
             dbcore::DatabaseKind::Sqlite => Self::Sqlite,
             dbcore::DatabaseKind::Libsql => Self::Libsql,
             dbcore::DatabaseKind::SqlServer => Self::SqlServer,
+            dbcore::DatabaseKind::D1 => Self::D1,
         }
     }
 }
