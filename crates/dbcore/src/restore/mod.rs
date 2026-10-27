@@ -5,6 +5,7 @@
 //! runner, which executes them on a dedicated connection: `COPY … FROM stdin` blocks go through
 //! Postgres' COPY protocol. Nothing is loaded whole, so big dumps restore in constant memory.
 
+mod d1;
 mod libsql;
 mod mysql;
 mod postgres;
@@ -121,6 +122,7 @@ async fn runner(config: ConnectionConfig, rx: mpsc::Receiver<Result<Item>>, tall
         DatabaseKind::Sqlite => sqlite::run(&config, rx, tally).await,
         DatabaseKind::Libsql => libsql::run(&config, rx, tally).await,
         DatabaseKind::SqlServer => sqlserver::run(&config, rx, tally).await,
+        DatabaseKind::D1 => d1::run(&config, rx, tally).await,
         _ => Err(Error::Unsupported(format!("restoring into {} databases", config.kind.display_name()))),
     }
 }

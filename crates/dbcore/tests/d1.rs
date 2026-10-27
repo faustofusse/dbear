@@ -252,3 +252,79 @@ fn saves_row_edits_in_one_batch() {
 
     block_on(conn.execute(format!("drop table {t}"))).unwrap();
 }
+
+// MARK: Dump and restore
+
+use std::sync::Arc;
+
+use dbcore::dump::{self, CancelToken, DumpOptions, DumpProgress, DumpScope};
+use dbcore::restore::{self, RestoreOptions, RestoreProgress};
+
+/// Rows of `table`, in order, as debug strings (exact values through the table pager).
+fn snapshot(config: &ConnectionConfig, table: &str) -> Vec<String> {
+    let conn = Connection::new(config.clone());
+    let mut rows = Vec::new();
+    let mut after: Option<PageCursor> = None;
+    loop {
+        let page = block_on(conn.fetch_page(TableInfo::new("main", table), RowQuery::default(), 1000, after.clone())).unwrap();
+        rows.extend(page.result.rows.iter().map(|r| format!("{r:?}")));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return rows,
+        }
+    }
+}
+
+#[test]
+fn dumps_and_restores_through_sqlite() {
+    let Some(config) = config() else { return };
+    let conn = Connection::new(config.clone());
+    let (p, c) = (scratch("dump_parent"), scratch("dump_child"));
+    block_on(conn.execute(format!(
+        "drop table if exists {c}; drop table if exists {p};
+         create table {p} (id integer primary key autoincrement, name text, big integer, r real, b blob);
+         create table {c} (a integer, b integer references {p}(id), note text, primary key (a, b)) without rowid;
+         create index {p}_name on {p}(name);
+         insert into {p} (name, big, r, b) select 'n' || value, 9007199254740993 + value, value / 3.0, randomblob(4)
+           from json_each('[' || (select group_concat(n) from (with recursive s(n) as (select 1 union all select n + 1 from s where n < 1203) select n from s)) || ']');
+         insert into {p} (name) values ('it''s
+two lines'), (null);
+         insert into {c} select id % 7, id, 'x' from {p} where id <= 1100;"
+    )))
+    .unwrap();
+    let before = (snapshot(&config, &p), snapshot(&config, &c));
+    assert_eq!((before.0.len(), before.1.len()), (1205, 1100));
+
+    // D1 → a file → a local SQLite database: the same rows.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("d1.sql");
+    let scope = DumpScope::Tables(vec![TableInfo::new("main", &p), TableInfo::new("main", &c)]);
+    let options = DumpOptions { scope, ..Default::default() };
+    let summary =
+        block_on(dump::dump(config.clone(), script.clone(), options, Arc::new(|_: &DumpProgress| {}), CancelToken::new())).unwrap();
+    assert_eq!((summary.tables, summary.rows), (2, 2305));
+    let mut local = ConnectionConfig::new_empty(DatabaseKind::Sqlite);
+    local.id = "d1-dump-test".into();
+    local.database = dir.path().join("local.db").display().to_string();
+    std::fs::File::create(&local.database).unwrap();
+    let ran = block_on(restore::restore(local.clone(), script.clone(), RestoreOptions::default(), Arc::new(|_: &RestoreProgress| {}), CancelToken::new()))
+        .unwrap();
+    assert!(ran.errors.is_empty(), "{:?}", ran.errors);
+    assert_eq!((snapshot(&local, &p), snapshot(&local, &c)), before);
+
+    // The file back into D1 (after dropping the tables): the same rows again.
+    block_on(conn.execute(format!("drop table {c}; drop table {p}"))).unwrap();
+    let ran = block_on(restore::restore(config.clone(), script, RestoreOptions::default(), Arc::new(|_: &RestoreProgress| {}), CancelToken::new()))
+        .unwrap();
+    assert!(ran.errors.is_empty() && ran.warnings.iter().any(|w| w.contains("one transaction")), "{ran:?}");
+    assert_eq!((snapshot(&config, &p), snapshot(&config, &c)), before);
+
+    // A failing statement is found and reported by line; the ones before it ran.
+    let bad = dir.path().join("bad.sql");
+    std::fs::write(&bad, format!("insert into {p} (name) values ('ok');\ninsert into nope values (1);\n")).unwrap();
+    let err = block_on(restore::restore(config.clone(), bad, RestoreOptions::default(), Arc::new(|_: &RestoreProgress| {}), CancelToken::new()))
+        .unwrap_err();
+    assert!(matches!(&err, Error::Query(m) if m.starts_with("Line 2:") && m.contains("no such table")), "{err:?}");
+    assert_eq!(snapshot(&config, &p).len(), 1206);
+    block_on(conn.execute(format!("drop table {c}; drop table {p}"))).unwrap();
+}

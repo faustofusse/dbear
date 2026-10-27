@@ -95,10 +95,8 @@ impl D1Driver {
         catalog::table_meta(table, master, info)
     }
 
-    /// One page of `table`'s rows, every column (and `extra` key) selected through `quote()`.
-    async fn page(&self, meta: &catalog::TableMeta, relation: &str, extra: &[String], query: &RowQuery, seek: Option<&str>, order_by: &[String], limit: u64, offset: u64) -> Result<StmtResult> {
-        let select = quoted_columns(&meta.columns, extra);
-        let sql = page_sql_with(&select, relation, query.filter.as_deref(), seek, order_by, limit, offset);
+    /// Runs a page query made with [`quoted_columns`] and parses the literals back.
+    async fn page(&self, sql: String) -> Result<StmtResult> {
         let mut result = self.run_one(D1Stmt::new(sql)).await?;
         client::unquote_rows(&mut result);
         Ok(result)
@@ -232,7 +230,8 @@ impl Driver for D1Driver {
         let relation = SQLITE.quote_relation(&table.schema, &table.name);
         // Same order as `fetch_page`, so OFFSET and keyset pages agree.
         let keyset = catalog::keyset_for(&meta, table, query)?;
-        let page = self.page(&meta, &relation, &[], query, None, &keyset.order_by(), u64::from(limit), offset).await?;
+        let sql = page_sql_with(&quoted_columns(&meta.columns, &[]), &relation, query.filter.as_deref(), None, &keyset.order_by(), u64::from(limit), offset);
+        let page = self.page(sql).await?;
         // No `total_count`: D1 bills every row read, and `count(*)` reads the whole table.
         Ok(QueryResult { rows: catalog::decode_rows(&page, &meta.columns), columns: meta.columns, ..Default::default() })
     }
@@ -257,12 +256,14 @@ impl Driver for D1Driver {
         let want = limit as usize + 1;
         let key_indexes = keyset.key_indexes();
         let order_by = keyset.order_by();
+        let select = quoted_columns(&meta.columns, &extra);
         for seek in segments {
             let need = want.saturating_sub(rows.len()) as u64;
             if need == 0 {
                 break;
             }
-            let part = self.page(&meta, &relation, &extra, query, seek.as_deref(), &order_by, need, offset).await?;
+            let sql = page_sql_with(&select, &relation, query.filter.as_deref(), seek.as_deref(), &order_by, need, offset);
+            let part = self.page(sql).await?;
             keys.extend(part.rows.iter().map(|row| key_indexes.iter().map(|&i| row.get(i).map_or(CursorValue::Null, HValue::to_cursor)).collect()));
             rows.extend(catalog::decode_rows(&part, &meta.columns));
         }

@@ -154,7 +154,7 @@ async fn dump_rows(stream: &mut Stream, ctx: &mut Ctx, table: &str) -> Result<()
 }
 
 /// A Hrana value as a SQLite literal (same spelling as the SQLite dumper).
-fn write_value(out: &mut String, value: &HValue) {
+pub(super) fn write_value(out: &mut String, value: &HValue) {
     match value {
         HValue::Null => out.push_str("NULL"),
         HValue::Integer { value } => match value.parse::<i64>() {
