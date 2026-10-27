@@ -42,7 +42,8 @@ impl WranglerDatabase {
     pub fn remote_config(&self, account_id: Option<&str>, token: Option<String>) -> ConnectionConfig {
         let mut config = ConnectionConfig::new_empty(DatabaseKind::D1);
         config.host = account_id.or(self.account_id.as_deref()).unwrap_or_default().trim().to_string();
-        config.database = self.database_id.clone().filter(|id| !id.is_empty()).unwrap_or_else(|| self.database_name.clone());
+        // Placeholder IDs (`"database_id": "local"`) aren't IDs: go by name then.
+        config.database = self.database_id.clone().filter(|id| super::url::is_uuid(id)).unwrap_or_else(|| self.database_name.clone());
         config.password = token;
         config.name = self.database_name.clone();
         config
@@ -261,6 +262,8 @@ mod tests {
         let remote = dbs[0].remote_config(None, Some("tok".into()));
         assert_eq!((remote.kind, remote.database.as_str(), remote.name.as_str()), (DatabaseKind::D1, "b6532fe4-d2a1-42b2-b783-00d97405614b", "auth"));
         assert_eq!(dbs[1].remote_config(None, None).database, "auth-staging");
+        let placeholder = parse(r#"{"d1_databases": [{"binding": "DB", "database_name": "juani", "database_id": "local"}]}"#, false).unwrap();
+        assert_eq!(placeholder[0].remote_config(None, None).database, "juani");
     }
 
     #[test]
