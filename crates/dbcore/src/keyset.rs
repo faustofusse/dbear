@@ -426,11 +426,25 @@ pub fn page_sql(
     limit: u64,
     offset: u64,
 ) -> String {
-    let mut sql = String::from("select *");
+    let mut select = String::from("*");
     for e in extra {
-        sql.push_str(", ");
-        sql.push_str(e);
+        select.push_str(", ");
+        select.push_str(e);
     }
+    page_sql_with(&select, relation, filter, seek, order_by, limit, offset)
+}
+
+/// [`page_sql`] with its own select list (`select <select> from rel …`).
+pub fn page_sql_with(
+    select: &str,
+    relation: &str,
+    filter: Option<&str>,
+    seek: Option<&str>,
+    order_by: &[String],
+    limit: u64,
+    offset: u64,
+) -> String {
+    let mut sql = format!("select {select}");
     sql.push_str(" from ");
     sql.push_str(relation);
     // The filter goes on its own lines so a trailing `-- comment` can't swallow the closing paren.

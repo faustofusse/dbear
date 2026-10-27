@@ -12,7 +12,7 @@ impl Dialect {
     pub fn quote_ident(self, name: &str) -> String {
         match self.0 {
             DatabaseKind::Mysql => format!("`{}`", name.replace('`', "``")),
-            DatabaseKind::Postgres | DatabaseKind::Sqlite | DatabaseKind::Libsql => format!("\"{}\"", name.replace('"', "\"\"")),
+            DatabaseKind::Postgres | DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => format!("\"{}\"", name.replace('"', "\"\"")),
             DatabaseKind::SqlServer => format!("[{}]", name.replace(']', "]]")),
         }
     }
@@ -35,7 +35,7 @@ impl Dialect {
             DatabaseKind::Postgres | DatabaseKind::Mysql | DatabaseKind::SqlServer => {
                 Ok(format!("create database {}", self.quote_ident(name)))
             }
-            DatabaseKind::Sqlite | DatabaseKind::Libsql => {
+            DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => {
                 Err(Error::Unsupported(format!("{} has no databases to create", self.0.display_name())))
             }
         }
@@ -46,7 +46,7 @@ impl Dialect {
         match self.0 {
             // Backslash is an escape character in MySQL strings (unless NO_BACKSLASH_ESCAPES).
             DatabaseKind::Mysql => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''")),
-            DatabaseKind::Postgres | DatabaseKind::Sqlite | DatabaseKind::Libsql => format!("'{}'", value.replace('\'', "''")),
+            DatabaseKind::Postgres | DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => format!("'{}'", value.replace('\'', "''")),
             // `N'…'`: Unicode, so non-Latin text survives into NVARCHAR columns.
             DatabaseKind::SqlServer => format!("N'{}'", value.replace('\'', "''")),
         }

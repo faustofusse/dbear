@@ -56,8 +56,8 @@ pub struct Splitter {
 
 impl Splitter {
     pub fn new(kind: DatabaseKind) -> Self {
-        // Turso / libSQL speaks SQLite's SQL.
-        let kind = if kind == DatabaseKind::Libsql { DatabaseKind::Sqlite } else { kind };
+        // Turso / libSQL and D1 speak SQLite's SQL.
+        let kind = if matches!(kind, DatabaseKind::Libsql | DatabaseKind::D1) { DatabaseKind::Sqlite } else { kind };
         Self {
             kind,
             // SQL Server batches end at `GO` lines, never at `;`.

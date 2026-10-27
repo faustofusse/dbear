@@ -733,7 +733,7 @@ fn dialect_functions(dialect: Dialect) -> Vec<&'static str> {
             &["date_trunc", "extract", "array_agg", "json_agg", "jsonb_build_object", "to_char", "generate_series"]
         }
         DatabaseKind::Mysql => &["if", "ifnull", "date_format", "group_concat", "json_extract", "curdate"],
-        DatabaseKind::Sqlite | DatabaseKind::Libsql => &["strftime", "ifnull", "json_extract", "group_concat", "printf"],
+        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => &["strftime", "ifnull", "json_extract", "group_concat", "printf"],
         DatabaseKind::SqlServer => &["getdate", "sysdatetime", "isnull", "convert", "try_cast", "dateadd", "datediff",
             "datepart", "format", "len", "charindex", "newid", "iif", "string_agg", "json_value"],
     };

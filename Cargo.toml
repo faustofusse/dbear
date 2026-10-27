@@ -44,6 +44,10 @@ tempfile = "3"
 # `-no-provider` because the driver passes its own ring-based rustls config.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "http2"] }
 base64 = "0.22"
+# Cloudflare D1: wrangler.toml discovery, and Miniflare's HMAC-SHA256 names for local copies (ring is already
+# in the tree through rustls).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+ring = "0.17"
 # Dumps: gzip with the pure-Rust miniz_oxide backend (no zlib/cmake); `Bytes` for Postgres COPY FROM
 flate2 = "1.1"
 bytes = "1"

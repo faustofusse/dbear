@@ -200,7 +200,7 @@ fn convert(id: &str, source: &Json, credentials: Option<&Credentials>, project: 
         DatabaseKind::Postgres => provider_flag("@dbeaver-show-non-default-db@").unwrap_or(false),
         // …and every MySQL database by default.
         DatabaseKind::Mysql => provider_flag("@dbeaver-show-all-dbs@").unwrap_or(true),
-        DatabaseKind::Sqlite | DatabaseKind::Libsql => false,
+        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => false,
         // Every database by default, except for Azure SQL and Babelfish (DBeaver's SQLServerDataSource).
         DatabaseKind::SqlServer => {
             provider_flag("show-all-databases-azure").unwrap_or(!(driver.contains("azure") || driver.contains("babelfish")))
@@ -424,7 +424,7 @@ fn ssl_mode(kind: DatabaseKind, conf: &Json) -> Option<SslMode> {
         DatabaseKind::Mysql => prop("sslMode")
             .and_then(|m| parse(&m))
             .or_else(|| (prop("useSSL").as_deref() == Some("false")).then_some(SslMode::Disable)),
-        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::SqlServer => None,
+        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 | DatabaseKind::SqlServer => None,
     }
 }
 

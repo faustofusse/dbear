@@ -12,6 +12,8 @@ pub enum DatabaseKind {
     Libsql,
     /// Microsoft SQL Server (and Azure SQL), over TDS.
     SqlServer,
+    /// Cloudflare D1 over Cloudflare's REST API; SQLite-compatible SQL.
+    D1,
 }
 
 impl DatabaseKind {
@@ -22,6 +24,7 @@ impl DatabaseKind {
             Self::Sqlite => "SQLite",
             Self::Libsql => "Turso",
             Self::SqlServer => "SQL Server",
+            Self::D1 => "Cloudflare D1",
         }
     }
 
@@ -30,14 +33,14 @@ impl DatabaseKind {
         match self {
             Self::Postgres => Some(5432),
             Self::Mysql => Some(3306),
-            Self::Sqlite | Self::Libsql => None,
+            Self::Sqlite | Self::Libsql | Self::D1 => None,
             Self::SqlServer => Some(1433),
         }
     }
 
-    /// Speaks SQLite's SQL (quoting, catalog, editing rules): SQLite files and Turso / libSQL.
+    /// Speaks SQLite's SQL (quoting, catalog, editing rules): SQLite files, Turso / libSQL and D1.
     pub fn is_sqlite_family(self) -> bool {
-        matches!(self, Self::Sqlite | Self::Libsql)
+        matches!(self, Self::Sqlite | Self::Libsql | Self::D1)
     }
 }
 
@@ -149,9 +152,9 @@ impl std::fmt::Debug for ConnectionConfig {
 
 impl ConnectionConfig {
     /// Whether the server's other databases can be switched to, each opened with its own
-    /// session (Postgres, MySQL, SQL Server). SQLite files have none.
+    /// session (Postgres, MySQL, SQL Server; D1: the account's other databases). SQLite files have none.
     pub fn supports_multiple_databases(&self) -> bool {
-        matches!(self.kind, DatabaseKind::Postgres | DatabaseKind::Mysql | DatabaseKind::SqlServer)
+        matches!(self.kind, DatabaseKind::Postgres | DatabaseKind::Mysql | DatabaseKind::SqlServer | DatabaseKind::D1)
     }
 
     /// The same connection pointed at another database on the server.
@@ -191,6 +194,7 @@ impl ConnectionConfig {
             DatabaseKind::Sqlite => crate::paths::file_name(database).to_string(),
             // `mydb-org.aws-us-east-1.turso.io` → `mydb-org`.
             DatabaseKind::Libsql => host.split('.').next().unwrap_or_default().to_string(),
+            DatabaseKind::D1 => crate::d1::url::default_name(database),
             _ if !database.is_empty() => database.to_string(),
             _ => host.to_string(),
         }
@@ -210,6 +214,9 @@ impl ConnectionConfig {
         let kind = self.kind.display_name();
         if self.kind == DatabaseKind::Sqlite {
             return format!("{kind} · {}", self.database);
+        }
+        if self.kind == DatabaseKind::D1 {
+            return format!("{kind} · {}", crate::d1::url::default_name(&self.database));
         }
         if self.kind == DatabaseKind::Libsql {
             return match self.port {

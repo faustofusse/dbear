@@ -440,7 +440,7 @@ pub fn features(kind: DatabaseKind) -> Option<AccessFeatures> {
             grants_per_database: false,
             object_kinds: vec![Server, Database, Table],
         }),
-        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::SqlServer => None,
+        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 | DatabaseKind::SqlServer => None,
     }
 }
 

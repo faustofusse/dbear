@@ -16,9 +16,9 @@
 //!
 //! Local libSQL files are SQLite files and use the SQLite driver.
 
-mod catalog;
+pub(crate) mod catalog;
 pub(crate) mod hrana;
-mod script;
+pub(crate) mod script;
 pub(crate) mod url;
 
 use std::sync::atomic::{AtomicBool, Ordering};

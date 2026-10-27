@@ -176,7 +176,7 @@ fn specs(kind: DatabaseKind) -> &'static Specs {
     match kind {
         DatabaseKind::Postgres => postgres_specs(),
         DatabaseKind::Mysql => mysql_specs(),
-        DatabaseKind::Sqlite | DatabaseKind::Libsql => sqlite_specs(),
+        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => sqlite_specs(),
         DatabaseKind::SqlServer => postgres_specs(),
     }
 }
@@ -326,7 +326,7 @@ impl Driver for MockDriver {
         let mut names = match self.config.kind {
             DatabaseKind::Postgres => vec![format!("{db}_test"), db, "postgres".into()],
             DatabaseKind::Mysql => vec![db, "shop".into()],
-            DatabaseKind::Sqlite | DatabaseKind::Libsql => vec![db],
+            DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => vec![db],
             DatabaseKind::SqlServer => vec![db, "master".into()],
         };
         names.retain(|n| !n.is_empty());

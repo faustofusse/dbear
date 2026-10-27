@@ -163,7 +163,7 @@ fn is_boolean(kind: DatabaseKind, column: &ColumnInfo) -> bool {
     match kind {
         DatabaseKind::Postgres => false,
         DatabaseKind::Mysql => t == "tinyint(1)" || t == "boolean" || t == "bool",
-        DatabaseKind::Sqlite | DatabaseKind::Libsql => t.contains("bool"),
+        DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => t.contains("bool"),
         DatabaseKind::SqlServer => t == "bit",
     }
 }

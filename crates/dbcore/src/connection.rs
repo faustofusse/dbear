@@ -13,6 +13,7 @@ use crate::edit::{self, EditStatement, RowChange};
 use crate::keyset::{PageCursor, RowPage};
 use crate::results::{self, ResultSources, TableChanges};
 use crate::model::{ColumnInfo, ColumnOrigin, ConnectionConfig, QueryResult, RowQuery, Schema, TableColumns, TableInfo, TableStructure};
+use crate::d1::D1Driver;
 use crate::libsql::LibsqlDriver;
 use crate::mock::{self, MockDriver};
 use crate::model::DatabaseKind;
@@ -76,6 +77,7 @@ fn make_driver(config: ConnectionConfig) -> Arc<dyn Driver> {
         DatabaseKind::Sqlite => Arc::new(SqliteDriver::new(config)),
         DatabaseKind::Libsql => Arc::new(LibsqlDriver::new(config)),
         DatabaseKind::SqlServer => Arc::new(SqlServerDriver::new(config)),
+        DatabaseKind::D1 => Arc::new(D1Driver::new(config)),
     }
 }
 

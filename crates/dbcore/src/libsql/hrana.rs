@@ -333,7 +333,7 @@ impl Client {
     }
 }
 
-fn tls_config(mode: SslMode) -> Result<rustls::ClientConfig> {
+pub(crate) fn tls_config(mode: SslMode) -> Result<rustls::ClientConfig> {
     use crate::postgres::tls::{provider, AcceptAnyCert};
     let builder = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()

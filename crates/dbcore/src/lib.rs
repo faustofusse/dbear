@@ -8,6 +8,7 @@ pub mod access;
 mod config;
 mod connection;
 pub mod complete;
+pub mod d1;
 pub mod dialect;
 pub mod dump;
 pub mod driver;

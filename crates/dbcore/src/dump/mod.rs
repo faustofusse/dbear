@@ -9,7 +9,7 @@
 //! New engines: add a module and an arm in [`run`].
 
 pub(crate) mod libsql;
-mod literal;
+pub(crate) mod literal;
 mod mysql;
 mod order;
 mod postgres;

@@ -25,9 +25,9 @@ impl ConnectionConfig {
             database: String::new(),
             user: None,
             password: None,
-            // Turso is always reached over the internet: verify its certificate by default.
-            ssl_mode: if kind == DatabaseKind::Libsql { SslMode::VerifyFull } else { SslMode::default() },
-            show_all_databases: !kind.is_sqlite_family(),
+            // Turso and D1 are always reached over the internet: verify their certificates by default.
+            ssl_mode: if matches!(kind, DatabaseKind::Libsql | DatabaseKind::D1) { SslMode::VerifyFull } else { SslMode::default() },
+            show_all_databases: !kind.is_sqlite_family() || kind == DatabaseKind::D1,
             ssh: None,
         }
     }
@@ -47,6 +47,9 @@ impl ConnectionConfig {
         }
         if self.kind == DatabaseKind::Libsql {
             return crate::libsql::url::validate(self);
+        }
+        if self.kind == DatabaseKind::D1 {
+            return crate::d1::url::validate(self);
         }
         if self.host.trim().is_empty() {
             return invalid("Enter a host.");
@@ -72,8 +75,9 @@ impl ConnectionConfig {
     }
 
     /// Parses `postgres://user:pass@host:5432/db?sslmode=require`, `mysql://…`, `sqlserver://…` (or `mssql://`),
-    /// `sqlite:///path/file.db` or a Turso / libSQL URL (`libsql://db-org.turso.io?authToken=…`, `https://…`,
-    /// `http://localhost:8080`). SQL Server URLs also take `encrypt` and `trustServerCertificate`.
+    /// `sqlite:///path/file.db`, a Turso / libSQL URL (`libsql://db-org.turso.io?authToken=…`, `https://…`,
+    /// `http://localhost:8080`) or a Cloudflare D1 URL (`d1://<account id>/<database>?token=…`).
+    /// SQL Server URLs also take `encrypt` and `trustServerCertificate`.
     /// The name defaults to [`ConnectionConfig::default_name`]; id and group are left empty.
     pub fn from_url(input: &str) -> Result<Self> {
         let invalid = |msg: String| Error::InvalidConfig(msg);
@@ -83,6 +87,7 @@ impl ConnectionConfig {
             "mysql" | "mariadb" => DatabaseKind::Mysql,
             "sqlite" | "file" => DatabaseKind::Sqlite,
             "libsql" | "http" | "https" | "ws" | "wss" => return crate::libsql::url::from_url(&url),
+            "d1" => return crate::d1::url::from_url(&url),
             "sqlserver" | "mssql" => DatabaseKind::SqlServer,
             other => return Err(invalid(format!("Unsupported URL scheme “{other}”."))),
         };
@@ -133,6 +138,9 @@ impl ConnectionConfig {
         }
         if self.kind == DatabaseKind::Libsql {
             return crate::libsql::url::to_url(self, include_password);
+        }
+        if self.kind == DatabaseKind::D1 {
+            return crate::d1::url::to_url(self, include_password);
         }
         let scheme = match self.kind {
             DatabaseKind::Postgres => "postgres",

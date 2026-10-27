@@ -159,7 +159,7 @@ fn sql_literal(d: Dialect, column: &ColumnInfo, value: &Value) -> String {
             Some(hex) if !hex.ends_with('…') && hex.chars().all(|c| c.is_ascii_hexdigit()) => match d.0 {
                 DatabaseKind::Postgres => format!("'\\x{hex}'"),
                 DatabaseKind::SqlServer => format!("0x{hex}"),
-                DatabaseKind::Mysql | DatabaseKind::Sqlite | DatabaseKind::Libsql => format!("X'{hex}'"),
+                DatabaseKind::Mysql | DatabaseKind::Sqlite | DatabaseKind::Libsql | DatabaseKind::D1 => format!("X'{hex}'"),
             },
             _ => "NULL /* binary value too large to copy */".into(),
         },
