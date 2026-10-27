@@ -8,7 +8,7 @@
 //!   "D1 Read" permission to browse, "D1 Edit" to change anything.
 //! - `port`, `user` and `ssl_mode` are unused: requests go to `api.cloudflare.com` over verified TLS.
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use url::Url;
 
 use crate::driver::{Error, Result};
@@ -38,9 +38,12 @@ pub(crate) fn from_url(url: &Url) -> Result<ConnectionConfig> {
     Ok(config)
 }
 
+/// Everything but URL-safe characters (RFC 3986's unreserved), so `my-app-db` stays readable.
+const COMPONENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+
 /// `d1://<account id>/<database>[?token=…]`. The token is only included when asked for.
 pub(crate) fn to_url(config: &ConnectionConfig, include_token: bool) -> String {
-    let encode = |s: &str| utf8_percent_encode(s.trim(), NON_ALPHANUMERIC).to_string();
+    let encode = |s: &str| utf8_percent_encode(s.trim(), COMPONENT).to_string();
     let mut url = format!("d1://{}/{}", encode(&config.host), encode(&config.database));
     if let (true, Some(token)) = (include_token, config.password.as_deref().map(str::trim).filter(|t| !t.is_empty())) {
         url.push_str(&format!("?token={}", encode(token)));
@@ -119,6 +122,9 @@ mod tests {
         assert_eq!(c.to_url(false), format!("d1://{ACCOUNT}/my%20db"));
         assert_eq!(c.to_url(true), format!("d1://{ACCOUNT}/my%20db?token=a%2Bb"));
         assert_eq!(parse(&c.to_url(true)), c);
+        let id = parse(&format!("d1://{ACCOUNT}/{ID}"));
+        assert_eq!(id.to_url(false), format!("d1://{ACCOUNT}/{ID}"));
+        assert_eq!(parse("d1:///my-app_db.v2").to_url(false), "d1:///my-app_db.v2");
         let no_account = parse("d1:///notes");
         assert_eq!(parse(&no_account.to_url(false)), no_account);
     }
