@@ -323,7 +323,12 @@ impl Workspace {
         let store = open_store().map_err(|e| notices.push(format!("Couldn’t open saved connections: {e}"))).ok();
         let (connections, showing_samples) = Self::listed_connections(store.as_ref());
         let secrets = match KeyringSecretStore::new() {
-            Ok(store) => Some(Arc::new(store)),
+            Ok(store) => {
+                let store = Arc::new(store);
+                // Refreshed "Sign in with Cloudflare" grants go back to the connection's entry.
+                dbcore::d1::oauth::sync_with_store(store.clone());
+                Some(store)
+            }
             Err(e) => {
                 notices.push(format!("Saved passwords are unavailable ({e})."));
                 None

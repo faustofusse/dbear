@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 uniffi::setup_scaffolding!();
 
 mod access;
+mod d1;
 mod dump;
 mod import;
 mod palette;

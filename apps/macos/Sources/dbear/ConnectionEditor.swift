@@ -425,8 +425,10 @@ struct ConnectionEditor: View {
 
     private func save() {
         do {
+            // A sign-in may have been renewed meanwhile (Test): save the newest copy.
+            let typed = draft.kind == .d1 && CloudflareSignIn.isSignIn(password) ? CloudflareSignIn.latest(password) : password
             let saved = try model.save(
-                draft, password: passwordEdited ? password : nil, sshSecret: sshSecretEdited ? sshSecret : nil)
+                draft, password: passwordEdited ? typed : nil, sshSecret: sshSecretEdited ? sshSecret : nil)
             if isNew { model.selectedConnectionID = saved.id }
             dismiss()
         } catch {

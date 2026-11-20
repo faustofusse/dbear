@@ -388,6 +388,8 @@ final class AppModel {
 
     init(store: ConnectionStore? = nil, secrets: any SecretStore = KeychainSecretStore()) {
         self.secrets = secrets
+        // Renewed "Sign in with Cloudflare" grants go back to the connection's Keychain entry.
+        CloudflareSignIn.installSecretSync(secrets)
         do {
             // DBEAR_CONNECTIONS_FILE points at another file (handy for testing).
             let override = ProcessInfo.processInfo.environment["DBEAR_CONNECTIONS_FILE"]

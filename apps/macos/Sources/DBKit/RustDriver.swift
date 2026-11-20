@@ -905,3 +905,82 @@ extension DBCoreFFI.TableStructure {
         )
     }
 }
+
+// MARK: - Sign in with Cloudflare (D1)
+
+/// A Cloudflare account a D1 sign-in or API token reaches.
+public struct CloudflareAccount: Hashable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+}
+
+/// "Sign in with Cloudflare" for D1 connections. The secret `signIn()` returns is the connection's
+/// password (Keychain); the core renews it and saves the renewed one through `installSecretSync`.
+public enum CloudflareSignIn {
+    /// Lets the core save renewed sign-ins (refresh tokens rotate) and read the other app's. Call once at launch.
+    public static func installSecretSync(_ store: any SecretStore) {
+        DBCoreFFI.d1SetSecretSync(sync: SecretSyncBox(store))
+    }
+
+    /// Opens Cloudflare's consent page with `open` and waits for the browser. Cancelling the task
+    /// gives up (throws `CancellationError`) and frees the port.
+    public static func signIn(open: @MainActor (URL) -> Void) async throws -> String {
+        let session: DBCoreFFI.D1SignIn
+        do {
+            session = try DBCoreFFI.D1SignIn.start()
+        } catch let error as DBCoreFFI.DbError {
+            throw DatabaseError(error)
+        }
+        guard let url = URL(string: session.url()) else { throw DatabaseError.internal("Bad sign-in URL") }
+        await open(url)
+        do {
+            return try await withTaskCancellationHandler {
+                try await session.finish()
+            } onCancel: {
+                session.cancel()
+            }
+        } catch DBCoreFFI.DbError.Cancelled {
+            throw CancellationError()
+        } catch let error as DBCoreFFI.DbError {
+            throw DatabaseError(error)
+        }
+    }
+
+    /// True when a D1 password is a sign-in rather than an API token.
+    public static func isSignIn(_ secret: String) -> Bool {
+        DBCoreFFI.d1IsSignIn(secret: secret)
+    }
+
+    /// The newest copy of a sign-in (after renewals in this process): save this one.
+    public static func latest(_ secret: String) -> String {
+        DBCoreFFI.d1LatestSecret(secret: secret)
+    }
+
+    /// Revokes a sign-in (signing out). Best effort.
+    public static func revoke(_ secret: String) async {
+        try? await DBCoreFFI.d1Revoke(secret: secret)
+    }
+
+    public static func accounts(secret: String) async throws -> [CloudflareAccount] {
+        try await bridgedAsync { try await DBCoreFFI.d1Accounts(secret: secret).map { CloudflareAccount(id: $0.id, name: $0.name) } }
+    }
+
+    public static func databases(secret: String, account: String) async throws -> [String] {
+        try await bridgedAsync { try await DBCoreFFI.d1Databases(secret: secret, account: account) }
+    }
+
+    private static func bridgedAsync<T>(_ body: () async throws -> T) async throws -> T {
+        do {
+            return try await body()
+        } catch let error as DBCoreFFI.DbError {
+            throw DatabaseError(error)
+        }
+    }
+}
+
+private final class SecretSyncBox: DBCoreFFI.D1SecretSync, @unchecked Sendable {
+    let store: any SecretStore
+    init(_ store: any SecretStore) { self.store = store }
+    func load(connectionId: String) -> String? { store.password(for: connectionId) }
+    func save(connectionId: String, secret: String) { try? store.setPassword(secret, for: connectionId) }
+}

@@ -136,18 +136,29 @@ struct Account {
 pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
-    token: String,
+    auth: Auth,
     account: String,
     database: String,
     resolved: Mutex<Option<(String, String)>>,
+}
+
+/// How requests authenticate: an API token, or a "Sign in with Cloudflare" grant (refreshed as needed).
+enum Auth {
+    Token(String),
+    OAuth { connection: String, secret: String },
 }
 
 impl Client {
     pub fn new(config: &ConnectionConfig) -> Result<Self> {
         let token = config.password.as_deref().map(str::trim).unwrap_or_default().to_string();
         if token.is_empty() {
-            return Err(Error::ConnectionFailed("Enter a Cloudflare API token with the D1 permission.".into()));
+            return Err(Error::ConnectionFailed("Sign in with Cloudflare, or enter an API token with the D1 permission.".into()));
         }
+        let auth = if super::oauth::is_secret(&token) {
+            Auth::OAuth { connection: config.id.clone(), secret: token }
+        } else {
+            Auth::Token(token)
+        };
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent("dbear")
@@ -157,7 +168,7 @@ impl Client {
         Ok(Self {
             http,
             base: api_base(),
-            token,
+            auth,
             account: config.host.trim().to_string(),
             database: config.database.trim().to_string(),
             resolved: Mutex::new(None),
@@ -241,24 +252,63 @@ impl Client {
         }
     }
 
+    /// The bearer token: the API token, or a current access token for the sign-in.
+    async fn bearer(&self, refresh: bool) -> Answer<String> {
+        match &self.auth {
+            Auth::Token(token) => Ok(token.clone()),
+            Auth::OAuth { connection, secret } => super::oauth::access_token(connection, secret, refresh).await.map_err(SqlFailure::new),
+        }
+    }
+
+    /// Every account the token reaches.
+    pub async fn accounts(&self) -> Answer<Vec<(String, String)>> {
+        let url = format!("{}/accounts?per_page=50", self.base);
+        let (accounts, _): (Vec<Account>, _) = self.send(self.http.get(url)).await?;
+        Ok(accounts.into_iter().map(|a| (a.id, a.name)).collect())
+    }
+
     async fn send<T: for<'de> Deserialize<'de>>(&self, request: reqwest::RequestBuilder) -> Answer<(T, Option<ResultInfo>)> {
         let transport = |e: reqwest::Error| SqlFailure::new(Error::ConnectionFailed(error_chain(&e)));
-        let response = request.bearer_auth(&self.token).send().await.map_err(transport)?;
+        let retry = request.try_clone();
+        let mut response = request.bearer_auth(self.bearer(false).await?).send().await.map_err(transport)?;
+        // A sign-in's access token can stop working before it expires (revoked, rotated by the
+        // other app): get a new one and try once more.
+        if response.status().as_u16() == 401 && matches!(self.auth, Auth::OAuth { .. }) {
+            if let Some(retry) = retry {
+                response = retry.bearer_auth(self.bearer(true).await?).send().await.map_err(transport)?;
+            }
+        }
         let status = response.status().as_u16();
         let body = response.bytes().await.map_err(transport)?;
         match serde_json::from_slice::<Envelope<T>>(&body) {
             Ok(Envelope { success: true, result: Some(result), result_info, .. }) => Ok((result, result_info)),
-            Ok(envelope) => Err(failure(status, &envelope.errors)),
+            Ok(envelope) => Err(self.reword(failure(status, &envelope.errors), status)),
             Err(e) => {
                 // Not the API's JSON (a proxy's page, or a shape this client doesn't expect).
                 let text: String = String::from_utf8_lossy(&body).trim().chars().take(300).collect();
                 let errors: Vec<ApiError> = serde_json::from_slice::<Envelope<Json>>(&body).map(|e| e.errors).unwrap_or_default();
                 if !errors.is_empty() || status >= 400 {
                     let errors = if errors.is_empty() { vec![ApiError { code: 0, message: text }] } else { errors };
-                    return Err(failure(status, &errors));
+                    return Err(self.reword(failure(status, &errors), status));
                 }
                 Err(SqlFailure::new(Error::Internal(format!("Unexpected answer from D1 ({e}): {text}"))))
             }
+        }
+    }
+}
+
+impl Client {
+    /// [`api_error`]'s advice is about API tokens; a sign-in is fixed by signing in again.
+    fn reword(&self, failure: SqlFailure, status: u16) -> SqlFailure {
+        match (&self.auth, &failure.error) {
+            (Auth::OAuth { .. }, Error::ConnectionFailed(message)) if status == 401 || status == 403 => {
+                let detail = message.split_once("): ").map_or(message.as_str(), |(_, rest)| rest);
+                let detail = detail.split(". It needs").next().unwrap_or(detail);
+                SqlFailure::new(Error::ConnectionFailed(format!(
+                    "Cloudflare refused the sign-in (HTTP {status}): {detail}. Sign in with Cloudflare again (Edit Connection)."
+                )))
+            }
+            _ => failure,
         }
     }
 }

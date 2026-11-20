@@ -46,6 +46,35 @@ pub struct D1Driver {
     cancel: Notify,
 }
 
+/// A Cloudflare account a token or sign-in reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub id: String,
+    pub name: String,
+}
+
+/// The accounts an API token or sign-in secret reaches, by name (for the editor's account picker).
+pub async fn accounts(secret: String) -> Result<Vec<Account>> {
+    crate::connection::on_runtime(async move {
+        let config = ConnectionConfig { password: Some(secret), ..ConnectionConfig::new_empty(DatabaseKind::D1) };
+        let mut accounts: Vec<Account> =
+            Client::new(&config)?.accounts().await?.into_iter().map(|(id, name)| Account { id, name }).collect();
+        accounts.sort_by_key(|a| a.name.to_lowercase());
+        Ok(accounts)
+    })
+    .await
+}
+
+/// The D1 databases' names in `account` (empty: the token's only account).
+pub async fn databases(secret: String, account: String) -> Result<Vec<String>> {
+    crate::connection::on_runtime(async move {
+        let config =
+            ConnectionConfig { password: Some(secret), host: account, ..ConnectionConfig::new_empty(DatabaseKind::D1) };
+        Ok(Client::new(&config)?.list_databases().await?.into_iter().map(|d| d.name).collect())
+    })
+    .await
+}
+
 /// Leaves out SQLite's tables and the ones D1 keeps for itself (`_cf_KV`, `_cf_METADATA`), which
 /// can't be read. `name` is the column holding the table's name.
 fn visible(name: &str) -> String {

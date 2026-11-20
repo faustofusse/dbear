@@ -5,8 +5,11 @@
 //!   single account: the driver asks Cloudflare which one.
 //! - `database`: the database's name (as in `wrangler.toml`'s `database_name`) or its ID (a UUID).
 //! - `password`: the API token (kept in the platform keychain like any password). It needs the
-//!   "D1 Read" permission to browse, "D1 Edit" to change anything.
-//! - `port`, `user` and `ssl_mode` are unused: requests go to `api.cloudflare.com` over verified TLS.
+//!   "D1 Read" permission to browse, "D1 Edit" to change anything. Or, after "Sign in with
+//!   Cloudflare", the sign-in's secret ([`super::oauth`]), which is never put in a URL.
+//! - `user`: the account name shown for a connection made with "Sign in with Cloudflare" (display
+//!   only; `None` for API tokens).
+//! - `port` and `ssl_mode` are unused: requests go to `api.cloudflare.com` over verified TLS.
 
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use url::Url;
@@ -45,7 +48,8 @@ const COMPONENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(
 pub(crate) fn to_url(config: &ConnectionConfig, include_token: bool) -> String {
     let encode = |s: &str| utf8_percent_encode(s.trim(), COMPONENT).to_string();
     let mut url = format!("d1://{}/{}", encode(&config.host), encode(&config.database));
-    if let (true, Some(token)) = (include_token, config.password.as_deref().map(str::trim).filter(|t| !t.is_empty())) {
+    let token = config.password.as_deref().map(str::trim).filter(|t| !t.is_empty() && !super::oauth::is_secret(t));
+    if let (true, Some(token)) = (include_token, token) {
         url.push_str(&format!("?token={}", encode(token)));
     }
     url

@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
+use dbcore::d1::oauth::{self, SignIn};
 use dbcore::secrets::{self, KeyringSecretStore};
 use dbcore::{Connection, ConnectionConfig, DatabaseKind, SshAuth, SshTunnel, SslMode};
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
@@ -44,6 +45,30 @@ fn ssl_title(mode: SslMode) -> &'static str {
     }
 }
 
+/// A D1 connection's "Sign in with Cloudflare".
+#[derive(Default)]
+struct D1Auth {
+    /// The saved connection uses a sign-in (its `user` names the account).
+    saved: bool,
+    /// Signed out of the saved sign-in: it's deleted on save.
+    signed_out: bool,
+    /// A sign-in made in this form: its secret, saved as the connection's password.
+    secret: Option<String>,
+    /// The account's name, shown and saved as `user`.
+    label: Option<String>,
+    /// Waiting for the browser.
+    signing_in: Option<(Arc<SignIn>, Task<()>)>,
+    /// What the sign-in reaches, for the account and database menus.
+    accounts: Vec<dbcore::d1::Account>,
+    databases: Vec<String>,
+}
+
+impl D1Auth {
+    fn signed_in(&self) -> bool {
+        self.secret.is_some() || (self.saved && !self.signed_out)
+    }
+}
+
 enum Status {
     Testing,
     Ok(String),
@@ -76,6 +101,7 @@ pub struct ConnectionEditor {
     status: Option<Status>,
     secrets: Option<Arc<KeyringSecretStore>>,
     test_task: Option<Task<()>>,
+    d1: D1Auth,
 }
 
 impl ConnectionEditor {
@@ -131,6 +157,11 @@ impl ConnectionEditor {
             status: None,
             secrets,
             test_task: None,
+            d1: D1Auth {
+                saved: config.kind == DatabaseKind::D1 && config.user.is_some(),
+                label: config.user.clone().filter(|_| config.kind == DatabaseKind::D1),
+                ..Default::default()
+            },
         };
         editor.update_placeholders(window, cx);
         editor
@@ -271,6 +302,10 @@ impl ConnectionEditor {
             config.port = None;
             config.user = None;
         }
+        // D1's `user` is the signed-in account's name (display only).
+        if self.kind == DatabaseKind::D1 && self.d1.signed_in() {
+            config.user = Some(self.d1.label.clone().unwrap_or_else(|| "Cloudflare".into()));
+        }
         config.ssh = None;
         if self.use_ssh && config.supports_ssh() {
             let port = text(&self.ssh_port);
@@ -291,7 +326,111 @@ impl ConnectionEditor {
         // Not trimmed: spaces can be part of a password.
         let typed = |input: &Entity<InputState>| Some(input.read(cx).value().to_string()).filter(|p| !p.is_empty());
         let ssh_secret = config.ssh.as_ref().filter(|s| s.auth != SshAuth::Agent).and_then(|_| typed(&self.ssh_secret));
-        Ok(EditorValues { config, password: typed(&self.password), ssh_secret })
+        let mut password = typed(&self.password);
+        if self.kind == DatabaseKind::D1 {
+            if let Some(secret) = &self.d1.secret {
+                password = Some(oauth::latest_secret(secret));
+            } else if self.d1.signed_out && password.is_none() {
+                password = Some(String::new());
+            }
+        }
+        Ok(EditorValues { config, password, ssh_secret })
+    }
+
+    /// Opens Cloudflare's consent page and waits for the browser to come back.
+    fn sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_sign_in(cx);
+        let sign_in = match SignIn::start() {
+            Ok(sign_in) => Arc::new(sign_in),
+            Err(e) => return self.show_error(e.to_string(), cx),
+        };
+        cx.open_url(sign_in.url());
+        self.status = None;
+        let waiting = sign_in.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let result = waiting.finish().await;
+            this.update_in(cx, |this, window, cx| {
+                this.d1.signing_in = None;
+                match result {
+                    Ok(secret) => {
+                        this.d1.secret = Some(secret.clone());
+                        this.d1.signed_out = false;
+                        this.password.update(cx, |s, cx| s.set_value("", window, cx));
+                        this.load_accounts(secret, window, cx);
+                    }
+                    Err(dbcore::Error::Cancelled) => {}
+                    Err(e) => this.status = Some(Status::Error(e.to_string())),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.d1.signing_in = Some((sign_in, task));
+        cx.notify();
+    }
+
+    fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some((sign_in, _task)) = self.d1.signing_in.take() {
+            sign_in.cancel();
+            cx.notify();
+        }
+    }
+
+    fn sign_out(&mut self, cx: &mut Context<Self>) {
+        if let Some(secret) = self.d1.secret.take() {
+            cx.background_executor().spawn(async move { oauth::revoke(secret).await.ok() }).detach();
+        }
+        self.d1.signed_out = self.d1.saved;
+        self.d1.label = None;
+        self.d1.accounts.clear();
+        self.d1.databases.clear();
+        cx.notify();
+    }
+
+    /// Fills the account menu (and picks the only account).
+    fn load_accounts(&mut self, secret: String, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = dbcore::d1::accounts(secret).await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(accounts) => {
+                        let host = this.host.read(cx).value().trim().to_string();
+                        let chosen = match accounts.as_slice() {
+                            [only] if host.is_empty() => Some(only.clone()),
+                            _ => accounts.iter().find(|a| a.id == host).cloned(),
+                        };
+                        this.d1.accounts = accounts;
+                        if let Some(account) = chosen {
+                            this.choose_account(account, window, cx);
+                        }
+                    }
+                    Err(e) => this.status = Some(Status::Error(e.to_string())),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn choose_account(&mut self, account: dbcore::d1::Account, window: &mut Window, cx: &mut Context<Self>) {
+        self.host.update(cx, |s, cx| s.set_value(account.id.clone(), window, cx));
+        self.d1.label = Some(account.name);
+        self.d1.databases.clear();
+        let Some(secret) = self.d1.secret.clone() else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = dbcore::d1::databases(secret, account.id).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(databases) => this.d1.databases = databases,
+                    Err(e) => this.status = Some(Status::Error(e.to_string())),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     pub fn show_error(&mut self, message: String, cx: &mut Context<Self>) {
@@ -431,17 +570,79 @@ impl Render for ConnectionEditor {
                 ))
             })
             .when(d1, |form| {
-                form.child(Self::field("Account ID", Input::new(&self.host), cx))
-                    .child(Self::field("Database", Input::new(&self.database), cx))
-                    .child(Self::field("API token", Input::new(&self.password).mask_toggle(), cx))
+                let signed_in = self.d1.signed_in();
+                let muted = cx.theme().muted_foreground;
+                let auth = if self.d1.signing_in.is_some() {
+                    h_flex()
+                        .gap_2()
+                        .child(div().text_sm().text_color(muted).child("Waiting for Cloudflare in your browser…"))
+                        .child(Button::new("cancel-sign-in").outline().small().label("Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_sign_in(cx))))
+                } else if signed_in {
+                    let label = match &self.d1.label {
+                        Some(account) => format!("Signed in to {account}"),
+                        None => "Signed in with Cloudflare".into(),
+                    };
+                    h_flex()
+                        .gap_2()
+                        .child(div().text_sm().child(label))
+                        .child(Button::new("sign-out").outline().small().label("Sign Out").on_click(cx.listener(|this, _, _, cx| this.sign_out(cx))))
+                } else {
+                    h_flex().child(
+                        Button::new("sign-in")
+                            .primary()
+                            .label("Sign in with Cloudflare")
+                            .on_click(cx.listener(|this, _, window, cx| this.sign_in(window, cx))),
+                    )
+                };
+                let accounts = self.d1.accounts.clone();
+                let host = self.host.read(cx).value().trim().to_string();
+                let account_menu = (accounts.len() > 1).then(|| {
+                    let this = this.clone();
+                    Button::new("accounts").outline().label("Choose").dropdown_caret(true).dropdown_menu(move |mut menu, _, _| {
+                        for account in &accounts {
+                            let (this, chosen) = (this.clone(), account.clone());
+                            menu = menu.item(PopupMenuItem::new(account.name.clone()).checked(account.id == host).on_click(
+                                move |_, window, cx| {
+                                    this.update(cx, |e, cx| e.choose_account(chosen.clone(), window, cx)).ok();
+                                },
+                            ));
+                        }
+                        menu
+                    })
+                });
+                let databases = self.d1.databases.clone();
+                let database = self.database.read(cx).value().trim().to_string();
+                let database_menu = (!databases.is_empty()).then(|| {
+                    let this = this.clone();
+                    Button::new("databases").outline().label("Choose").dropdown_caret(true).dropdown_menu(move |mut menu, _, _| {
+                        for name in &databases {
+                            let (this, name) = (this.clone(), name.clone());
+                            menu = menu.item(PopupMenuItem::new(name.clone()).checked(name == database).on_click(move |_, window, cx| {
+                                this.update(cx, |e, cx| e.database.update(cx, |s, cx| s.set_value(name.clone(), window, cx))).ok();
+                            }));
+                        }
+                        menu
+                    })
+                });
+                let help = if signed_in {
+                    "dbear keeps the sign-in in your keychain and renews it as needed."
+                } else {
+                    "Sign in to pick the account and database, or use an API token with D1 Read (D1 Edit to change data). \
+                     The account ID can be left empty when the token sees only one account."
+                };
+                form.child(Self::field("Cloudflare", auth, cx))
+                    .when(!signed_in, |form| form.child(Self::field("API token", Input::new(&self.password).mask_toggle(), cx)))
                     .child(Self::field(
-                        "",
-                        div().text_xs().text_color(cx.theme().muted_foreground).child(
-                            "The account ID can be left empty when the token sees only one account. The database is its \
-                             name (wrangler's database_name) or ID. The token needs D1 Read to browse, D1 Edit to change data.",
-                        ),
+                        "Account ID",
+                        h_flex().gap_2().child(div().flex_1().child(Input::new(&self.host))).children(account_menu),
                         cx,
                     ))
+                    .child(Self::field(
+                        "Database",
+                        h_flex().gap_2().child(div().flex_1().child(Input::new(&self.database))).children(database_menu),
+                        cx,
+                    ))
+                    .child(Self::field("", div().text_xs().text_color(muted).child(help), cx))
             })
             .when(!sqlite && !d1, |form| {
                 form.child(Self::field("Host", Input::new(&self.host), cx))

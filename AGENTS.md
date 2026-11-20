@@ -162,11 +162,16 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   account's D1 databases; there's no SSH and no New Database. `d1::discover::find(dir)` reads a Workers
   project's wrangler.json/jsonc/toml `d1_databases` and finds the local `wrangler dev` copies (SQLite
   files under `.wrangler/state/v3/d1/miniflare-D1DatabaseObject/`); neither app has an import UI for it yet.
-  `d1::oauth` (prototype, not wired into the apps yet) is "Sign in with Cloudflare": Authorization Code + PKCE
-  as a public OAuth client (no secret), a one-shot loopback listener for the redirect (default
-  `http://127.0.0.1:38257/oauth/callback`, which the client must register), code exchange, refresh and revoke;
-  the access token works as the D1 API token. `DBEAR_CF_OAUTH` overrides the endpoints. Try it with
-  `cargo run -p dbcore --example d1_oauth -- --client-id <id> --url d1:///<database>`.
+  "Sign in with Cloudflare" (`d1::oauth`, both editors): OAuth Authorization Code + PKCE with dbear's public
+  client (`oauth::CLIENT_ID`, registered in Fausto's account with redirect `http://127.0.0.1:38257/oauth/callback`;
+  still private, so only that account's members can sign in until it's made public). `SignIn` listens on the
+  redirect and returns a secret, `cloudflare-oauth:<json>` (grant id, access and refresh token, expiry), stored
+  as the connection's password; `user` holds the account's name so editors know it's signed in without reading
+  the keychain. The D1 client gets access tokens from `oauth::access_token`: grants are shared in the process by
+  grant id, refreshed 5 minutes before expiry or after a 401, and the rotated secret is saved back through the
+  `SecretSync` each app installs at launch (GPUI: `sync_with_store`; macOS: `CloudflareSignIn.installSecretSync`).
+  `d1::accounts` / `d1::databases` fill the editors' pickers. `DBEAR_CF_OAUTH` / `DBEAR_CF_OAUTH_CLIENT_ID`
+  override the endpoints and client. Try it with `cargo run -p dbcore --example d1_oauth -- --url d1:///<database>`.
 - Dump / restore: `dbcore::dump` writes from one consistent snapshot, streaming to `<file>.partial`
   until done. Turso dumps use the SQLite format; SQL Server dumps are T-SQL with `GO` batches,
   skipping what the file header lists. `dbcore::restore` also handles `COPY … FROM stdin` blocks.
