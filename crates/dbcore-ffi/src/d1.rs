@@ -83,14 +83,15 @@ pub struct D1Account {
     pub name: String,
 }
 
-/// The accounts an API token or sign-in reaches.
+/// The accounts an API token or sign-in reaches. `connection_id`: the saved connection the secret
+/// belongs to (empty for a new one), so a renewed sign-in is saved back to it.
 #[uniffi::export]
-pub async fn d1_accounts(secret: String) -> Result<Vec<D1Account>, DbError> {
-    Ok(dbcore::d1::accounts(secret).await?.into_iter().map(|a| D1Account { id: a.id, name: a.name }).collect())
+pub async fn d1_accounts(connection_id: String, secret: String) -> Result<Vec<D1Account>, DbError> {
+    Ok(dbcore::d1::accounts(connection_id, secret).await?.into_iter().map(|a| D1Account { id: a.id, name: a.name }).collect())
 }
 
 /// The D1 databases of `account` (empty: the token's only account), by name.
 #[uniffi::export]
-pub async fn d1_databases(secret: String, account: String) -> Result<Vec<String>, DbError> {
-    Ok(dbcore::d1::databases(secret, account).await?)
+pub async fn d1_databases(connection_id: String, secret: String, account: String) -> Result<Vec<String>, DbError> {
+    Ok(dbcore::d1::databases(connection_id, secret, account).await?)
 }

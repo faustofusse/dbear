@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use dbcore::d1::oauth::{self, SignIn};
-use dbcore::secrets::{self, KeyringSecretStore};
+use dbcore::secrets::{self, KeyringSecretStore, SecretStore as _};
 use dbcore::{Connection, ConnectionConfig, DatabaseKind, SshAuth, SshTunnel, SslMode};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
@@ -54,6 +54,8 @@ struct D1Auth {
     signed_out: bool,
     /// A sign-in made in this form: its secret, saved as the connection's password.
     secret: Option<String>,
+    /// The saved connection's sign-in, read from the keychain to fill the menus.
+    saved_secret: Option<String>,
     /// The account's name, shown and saved as `user`.
     label: Option<String>,
     /// Waiting for the browser.
@@ -66,6 +68,33 @@ struct D1Auth {
 impl D1Auth {
     fn signed_in(&self) -> bool {
         self.secret.is_some() || (self.saved && !self.signed_out)
+    }
+}
+
+impl ConnectionEditor {
+    /// The sign-in to list accounts and databases with, and the saved connection it belongs to
+    /// (renewals are saved there). A sign-in made in this form isn't saved until the form is.
+    fn listing_secret(&self) -> Option<(String, String)> {
+        if let Some(secret) = &self.d1.secret {
+            return Some((String::new(), secret.clone()));
+        }
+        let id = self.original.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+        self.d1.saved_secret.clone().filter(|_| self.d1.signed_in()).map(|secret| (id, secret))
+    }
+
+    /// Editing a signed-in connection: reads its sign-in in the background and fills the menus.
+    fn load_saved_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(store), Some(id)) = (self.secrets.clone(), self.original.as_ref().map(|c| c.id.clone())) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let secret = cx.background_executor().spawn(async move { store.password(&id).ok().flatten() }).await;
+            let Some(secret) = secret.filter(|s| oauth::is_secret(s)) else { return };
+            this.update_in(cx, |this, window, cx| {
+                this.d1.saved_secret = Some(secret);
+                this.load_accounts(window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -164,6 +193,9 @@ impl ConnectionEditor {
             },
         };
         editor.update_placeholders(window, cx);
+        if editor.d1.saved {
+            editor.load_saved_sign_in(window, cx);
+        }
         editor
     }
 
@@ -356,7 +388,7 @@ impl ConnectionEditor {
                         this.d1.secret = Some(secret.clone());
                         this.d1.signed_out = false;
                         this.password.update(cx, |s, cx| s.set_value("", window, cx));
-                        this.load_accounts(secret, window, cx);
+                        this.load_accounts(window, cx);
                     }
                     Err(dbcore::Error::Cancelled) => {}
                     Err(e) => this.status = Some(Status::Error(e.to_string())),
@@ -381,6 +413,7 @@ impl ConnectionEditor {
             cx.background_executor().spawn(async move { oauth::revoke(secret).await.ok() }).detach();
         }
         self.d1.signed_out = self.d1.saved;
+        self.d1.saved_secret = None;
         self.d1.label = None;
         self.d1.accounts.clear();
         self.d1.databases.clear();
@@ -388,9 +421,10 @@ impl ConnectionEditor {
     }
 
     /// Fills the account menu (and picks the only account).
-    fn load_accounts(&mut self, secret: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn load_accounts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, secret)) = self.listing_secret() else { return };
         cx.spawn_in(window, async move |this, cx| {
-            let result = dbcore::d1::accounts(secret).await;
+            let result = dbcore::d1::accounts(id, secret).await;
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(accounts) => {
@@ -417,9 +451,9 @@ impl ConnectionEditor {
         self.host.update(cx, |s, cx| s.set_value(account.id.clone(), window, cx));
         self.d1.label = Some(account.name);
         self.d1.databases.clear();
-        let Some(secret) = self.d1.secret.clone() else { return };
+        let Some((id, secret)) = self.listing_secret() else { return };
         cx.spawn_in(window, async move |this, cx| {
-            let result = dbcore::d1::databases(secret, account.id).await;
+            let result = dbcore::d1::databases(id, secret, account.id).await;
             this.update(cx, |this, cx| {
                 match result {
                     Ok(databases) => this.d1.databases = databases,

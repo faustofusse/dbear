@@ -12,6 +12,10 @@ struct D1ConnectionSection<KindPicker: View>: View {
     let tokenPrompt: String
     /// Called when the token is typed or pasted, so the editor saves it.
     let tokenEdited: () -> Void
+    /// The saved connection's id ("" for a new one) and its saved password, read when editing a
+    /// signed-in connection to fill the account picker and database menu.
+    let connectionID: String
+    let savedSecret: () -> String?
     @ViewBuilder let kindPicker: KindPicker
 
     @Environment(\.openURL) private var openURL
@@ -21,10 +25,20 @@ struct D1ConnectionSection<KindPicker: View>: View {
     /// What the sign-in reaches: the account picker and database menu.
     @State private var accounts: [CloudflareAccount] = []
     @State private var databases: [String] = []
+    /// The saved sign-in, once read.
+    @State private var savedSignIn: String?
 
     /// A sign-in made in this editor, or the saved connection's (until signed out).
     private var signedIn: Bool {
         CloudflareSignIn.isSignIn(token) || (token.isEmpty && draft.user != nil)
+    }
+
+    /// The sign-in to list with, and the saved connection it belongs to (renewals are saved there).
+    /// A sign-in made in this editor isn't saved until the editor is.
+    private var listing: (connectionID: String, secret: String)? {
+        if CloudflareSignIn.isSignIn(token) { return ("", token) }
+        if signedIn, let savedSignIn { return (connectionID, savedSignIn) }
+        return nil
     }
 
     var body: some View {
@@ -126,6 +140,13 @@ struct D1ConnectionSection<KindPicker: View>: View {
             .font(.caption)
         }
         .onDisappear { cancelSignIn() }
+        .task {
+            // Editing a signed-in connection: fill the menus from its saved sign-in.
+            guard token.isEmpty, draft.user != nil, !connectionID.isEmpty,
+                  let secret = savedSecret(), CloudflareSignIn.isSignIn(secret) else { return }
+            savedSignIn = secret
+            await loadAccounts()
+        }
     }
 
     private var accountBinding: Binding<String> {
@@ -147,7 +168,7 @@ struct D1ConnectionSection<KindPicker: View>: View {
                 token = secret
                 tokenEdited()
                 draft.user = "Cloudflare"
-                await loadAccounts(secret: secret)
+                await loadAccounts()
             } catch is CancellationError {
             } catch {
                 signInError = error.localizedDescription
@@ -168,13 +189,15 @@ struct D1ConnectionSection<KindPicker: View>: View {
         token = ""
         tokenEdited()
         draft.user = nil
+        savedSignIn = nil
         accounts = []
         databases = []
     }
 
-    private func loadAccounts(secret: String) async {
+    private func loadAccounts() async {
+        guard let listing else { return }
         do {
-            accounts = try await CloudflareSignIn.accounts(secret: secret)
+            accounts = try await CloudflareSignIn.accounts(secret: listing.secret, connectionID: listing.connectionID)
             let host = draft.host.trimmingCharacters(in: .whitespaces)
             if host.isEmpty, accounts.count == 1 {
                 choose(accounts[0])
@@ -190,11 +213,11 @@ struct D1ConnectionSection<KindPicker: View>: View {
         draft.host = account.id
         draft.user = account.name
         databases = []
-        guard CloudflareSignIn.isSignIn(token) else { return }
-        let secret = token
+        guard let listing else { return }
         Task { @MainActor in
             do {
-                let names = try await CloudflareSignIn.databases(secret: secret, account: account.id)
+                let names = try await CloudflareSignIn.databases(
+                    secret: listing.secret, account: account.id, connectionID: listing.connectionID)
                 if draft.host == account.id { databases = names }
             } catch {
                 signInError = error.localizedDescription

@@ -54,9 +54,12 @@ pub struct Account {
 }
 
 /// The accounts an API token or sign-in secret reaches, by name (for the editor's account picker).
-pub async fn accounts(secret: String) -> Result<Vec<Account>> {
+/// `connection_id` is the saved connection the secret belongs to (empty for a new one): a sign-in
+/// renewed meanwhile is saved back to it.
+pub async fn accounts(connection_id: String, secret: String) -> Result<Vec<Account>> {
     crate::connection::on_runtime(async move {
-        let config = ConnectionConfig { password: Some(secret), ..ConnectionConfig::new_empty(DatabaseKind::D1) };
+        let config =
+            ConnectionConfig { id: connection_id, password: Some(secret), ..ConnectionConfig::new_empty(DatabaseKind::D1) };
         let mut accounts: Vec<Account> =
             Client::new(&config)?.accounts().await?.into_iter().map(|(id, name)| Account { id, name }).collect();
         accounts.sort_by_key(|a| a.name.to_lowercase());
@@ -66,10 +69,14 @@ pub async fn accounts(secret: String) -> Result<Vec<Account>> {
 }
 
 /// The D1 databases' names in `account` (empty: the token's only account).
-pub async fn databases(secret: String, account: String) -> Result<Vec<String>> {
+pub async fn databases(connection_id: String, secret: String, account: String) -> Result<Vec<String>> {
     crate::connection::on_runtime(async move {
-        let config =
-            ConnectionConfig { password: Some(secret), host: account, ..ConnectionConfig::new_empty(DatabaseKind::D1) };
+        let config = ConnectionConfig {
+            id: connection_id,
+            password: Some(secret),
+            host: account,
+            ..ConnectionConfig::new_empty(DatabaseKind::D1)
+        };
         Ok(Client::new(&config)?.list_databases().await?.into_iter().map(|d| d.name).collect())
     })
     .await

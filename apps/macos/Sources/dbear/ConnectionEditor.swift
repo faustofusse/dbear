@@ -52,7 +52,9 @@ struct ConnectionEditor: View {
                 } else if draft.kind == .d1 {
                     D1ConnectionSection(
                         draft: $draft, token: $password, tokenPrompt: passwordPrompt,
-                        tokenEdited: { passwordEdited = true }
+                        tokenEdited: { passwordEdited = true },
+                        connectionID: original?.id ?? "",
+                        savedSecret: { [model] in original.flatMap { model.savedPassword($0.id) } }
                     ) { kindPicker }
                 } else {
                     serverSection

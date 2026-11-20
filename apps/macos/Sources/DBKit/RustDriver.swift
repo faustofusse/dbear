@@ -961,12 +961,14 @@ public enum CloudflareSignIn {
         try? await DBCoreFFI.d1Revoke(secret: secret)
     }
 
-    public static func accounts(secret: String) async throws -> [CloudflareAccount] {
-        try await bridgedAsync { try await DBCoreFFI.d1Accounts(secret: secret).map { CloudflareAccount(id: $0.id, name: $0.name) } }
+    /// `connectionID`: the saved connection the secret belongs to ("" for a new one), so a sign-in
+    /// renewed meanwhile is saved back to it.
+    public static func accounts(secret: String, connectionID: String = "") async throws -> [CloudflareAccount] {
+        try await bridgedAsync { try await DBCoreFFI.d1Accounts(connectionId: connectionID, secret: secret).map { CloudflareAccount(id: $0.id, name: $0.name) } }
     }
 
-    public static func databases(secret: String, account: String) async throws -> [String] {
-        try await bridgedAsync { try await DBCoreFFI.d1Databases(secret: secret, account: account) }
+    public static func databases(secret: String, account: String, connectionID: String = "") async throws -> [String] {
+        try await bridgedAsync { try await DBCoreFFI.d1Databases(connectionId: connectionID, secret: secret, account: account) }
     }
 
     private static func bridgedAsync<T>(_ body: () async throws -> T) async throws -> T {

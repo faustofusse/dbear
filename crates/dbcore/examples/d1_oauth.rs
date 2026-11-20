@@ -46,8 +46,8 @@ fn main() {
         let secret = sign_in.finish().await?;
         eprintln!("Signed in ({} byte secret).", secret.len());
 
-        for account in dbcore::d1::accounts(secret.clone()).await? {
-            let databases = dbcore::d1::databases(secret.clone(), account.id.clone()).await?;
+        for account in dbcore::d1::accounts(String::new(), secret.clone()).await? {
+            let databases = dbcore::d1::databases(String::new(), secret.clone(), account.id.clone()).await?;
             eprintln!("{} ({}): {}", account.name, account.id, databases.join(", "));
         }
         oauth::access_token("", &secret, true).await?;
