@@ -90,7 +90,7 @@ impl ConnectionEditor {
             let placeholder = placeholder.to_string();
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value))
         };
-        let url = input(String::new(), "postgres://user:password@host:5432/database");
+        let url = input(String::new(), config.kind.url_example());
         let name = input(config.name.clone(), "Optional");
         let group = input(config.group.clone(), "Optional, e.g. Production");
         let host = input(config.host.clone(), "localhost");
@@ -157,6 +157,7 @@ impl ConnectionEditor {
             _ => "localhost",
         };
         self.host.update(cx, |s, cx| s.set_placeholder(host, window, cx));
+        self.url.update(cx, |s, cx| s.set_placeholder(kind.url_example(), window, cx));
     }
 
     fn set_kind(&mut self, kind: DatabaseKind, window: &mut Window, cx: &mut Context<Self>) {

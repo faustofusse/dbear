@@ -104,7 +104,7 @@ struct ConnectionEditor: View {
 
     private var urlSection: some View {
         Section {
-            TextField("URL", text: $url, prompt: Text(verbatim: "postgres://user:password@host:5432/database"))
+            TextField("URL", text: $url, prompt: Text(verbatim: draft.kind.urlExample))
                 .textContentType(.URL)
                 .onChange(of: url) { apply(url: url) }
         } footer: {

@@ -97,6 +97,11 @@ extension DatabaseKind {
     public var defaultPort: Int? {
         DBCoreFFI.defaultPort(kind: DBCoreFFI.DatabaseKind(self)).map(Int.init)
     }
+
+    /// An example connection URL, e.g. `postgres://user:password@localhost:5432/database`.
+    public var urlExample: String {
+        DBCoreFFI.urlExample(kind: DBCoreFFI.DatabaseKind(self))
+    }
 }
 
 /// Rethrows core errors as `DatabaseError`.

@@ -38,6 +38,18 @@ impl DatabaseKind {
         }
     }
 
+    /// An example connection URL, for the URL field's placeholder.
+    pub fn url_example(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres://user:password@localhost:5432/database",
+            Self::Mysql => "mysql://user:password@localhost:3306/database",
+            Self::Sqlite => "sqlite:///path/to/file.db",
+            Self::Libsql => "libsql://mydb-org.turso.io?authToken=…",
+            Self::SqlServer => "sqlserver://user:password@localhost:1433/database",
+            Self::D1 => "d1://<account id>/<database>?token=…",
+        }
+    }
+
     /// Speaks SQLite's SQL (quoting, catalog, editing rules): SQLite files, Turso / libSQL and D1.
     pub fn is_sqlite_family(self) -> bool {
         matches!(self, Self::Sqlite | Self::Libsql | Self::D1)

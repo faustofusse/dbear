@@ -439,6 +439,12 @@ pub fn default_port(kind: DatabaseKind) -> Option<u16> {
     dbcore::DatabaseKind::from(kind).default_port()
 }
 
+/// An example connection URL for the kind (the URL field's placeholder).
+#[uniffi::export]
+pub fn url_example(kind: DatabaseKind) -> String {
+    dbcore::DatabaseKind::from(kind).url_example().to_string()
+}
+
 /// Sample connections (mock data + the dev database) for development.
 #[uniffi::export]
 pub fn sample_connections() -> Vec<ConnectionConfig> {
