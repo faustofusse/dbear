@@ -16,6 +16,7 @@ struct ContentView: View {
         }
         .separatorColoredSplitDividers()
         .task { await model.monitorConnections() }
+        .onAppear { VimWindowNavigator.shared.install(model: model) }
         .sheet(item: $model.editor) { request in
             ConnectionEditor(original: request.original)
         }

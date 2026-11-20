@@ -10,7 +10,7 @@ struct SettingsView: View {
             Section("Editor") {
                 Toggle(isOn: $vimMode) {
                     Text("Vim mode")
-                    Text("Normal, insert and visual modes in the SQL editor; h, j, k, l and more in result grids.")
+                    Text("Normal, insert and visual modes in the SQL editor; h, j, k, l and more in result grids and lists; ⌃W h, j, k, l moves between panes and gt, gT between tabs.")
                 }
             }
             Section("Updates") {

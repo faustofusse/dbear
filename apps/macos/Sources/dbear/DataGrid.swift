@@ -909,7 +909,8 @@ private final class GridRowView: NSTableRowView {
 }
 
 /// The grid's table: Return edits the selected row, ⌫ deletes it. With Vim mode on, also
-/// h/j/k/l, w/b, 0/$, gg/G, ⌃D/⌃U/⌃F/⌃B (counts work), i/a/c edit, dd deletes and yy copies.
+/// h/j/k/l, w/b, 0/$, gg/G, ⌃D/⌃U/⌃F/⌃B (counts work), i/a/c edit, dd deletes, yy copies and
+/// gt/gT switch tabs. ⌃W commands are `VimWindowNavigator`'s.
 final class GridTableView: NSTableView {
     var onReturn: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -1012,6 +1013,7 @@ final class GridTableView: NSTableView {
         case "$": onColumnEdge?(true)
         case "gg": selectRow(count.map { $0 - 1 } ?? 0)
         case "G": selectRow(count.map { $0 - 1 } ?? numberOfRows - 1)
+        case "gt", "gT": VimWindowNavigator.shared.switchTab(forward: command == "gt", count: count, from: self)
         case "g", "d", "y":
             vimPending = c
             vimCount = count

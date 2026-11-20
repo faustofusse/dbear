@@ -270,7 +270,20 @@ private struct PaletteField: NSViewRepresentable {
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
         if field.stringValue != text { field.stringValue = text }
-        field.placeholderString = placeholder
+        guard field.placeholderAttributedString?.string != placeholder else { return }
+        // Dimmer than AppKit's default placeholder, which reads almost like typed text here.
+        field.placeholderAttributedString = NSAttributedString(string: placeholder, attributes: [
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .font: field.font ?? .preferredFont(forTextStyle: .title3),
+        ])
+        // The field editor keeps the placeholder it started editing with: start again.
+        if field.currentEditor() != nil {
+            field.abortEditing()
+            field.stringValue = text
+            field.window?.makeFirstResponder(field)
+            let end = (text as NSString).length
+            field.currentEditor()?.selectedRange = NSRange(location: end, length: 0)
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }

@@ -78,6 +78,8 @@ struct SQLEditor: NSViewRepresentable {
                 guard let textView, let window = textView.window else { return }
                 window.makeFirstResponder(textView)
                 textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
+                // A script that was just opened starts in insert mode.
+                textView.vim?.beginInsert()
             }
         }
         return scrollView
@@ -227,6 +229,10 @@ final class SQLTextView: NSTextView {
         if on {
             let engine = VimEngine(buffer: self, registers: .app)
             engine.onChange = { [weak self] in self?.vimStateChanged() }
+            engine.onSwitchTab = { [weak self] forward, count in
+                guard let self else { return }
+                VimWindowNavigator.shared.switchTab(forward: forward, count: count, from: self)
+            }
             vim = engine
             if blockCursor.superview == nil { addSubview(blockCursor) }
             engine.reset()

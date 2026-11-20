@@ -317,3 +317,12 @@ struct Vim {
     #expect(vim.engine.pendingKeys == "")
     #expect(vim.state == "|a b c")
 }
+
+@MainActor
+@Test func beginInsert() {
+    let vim = Vim("select 1|")
+    vim.engine.beginInsert()
+    #expect(vim.engine.mode == .insert)
+    #expect(vim.keys(" + 2<Esc>").state == "select 1 + |2")
+    #expect(vim.engine.mode == .normal)
+}

@@ -93,6 +93,8 @@ public final class VimEngine {
     public private(set) var mode: VimMode = .normal
     /// Mode or pending keys changed.
     public var onChange: (() -> Void)?
+    /// `gt` (forward) and `gT`, with their count: `3gt` goes to the third tab, `3gT` three tabs back.
+    public var onSwitchTab: ((_ forward: Bool, _ count: Int?) -> Void)?
 
     private weak var buffer: VimBuffer?
     private let registers: VimRegisters
@@ -155,6 +157,15 @@ public final class VimEngine {
         mode = .normal
         let caret = buffer.selection.location
         buffer.select(NSRange(location: VimText(buffer.text).clampNormal(caret), length: 0))
+        changed()
+    }
+
+    /// Insert mode at the caret, as if `i` was typed (e.g. a new script opens ready for typing).
+    public func beginInsert() {
+        guard let buffer else { return }
+        pending = []
+        recording = nil
+        startInsert(at: buffer.selection.location)
         changed()
     }
 
@@ -224,6 +235,7 @@ public final class VimEngine {
         case undo, redo, repeatChange
         case visual(line: Bool)
         case toggleCase
+        case switchTab(forward: Bool)
     }
 
     private enum Parsed<T> {
@@ -369,6 +381,10 @@ public final class VimEngine {
         case .char("v"): return done(.visual(line: false), count)
         case .char("V"): return done(.visual(line: true), count)
         case .char("~"): return done(.toggleCase, count)
+        case .char("g") where i < keys.count && (keys[i] == .char("t") || keys[i] == .char("T")):
+            let forward = keys[i] == .char("t")
+            i += 1
+            return done(.switchTab(forward: forward), count)
         default:
             i -= 1
             switch parseMotion(keys, &i) {
@@ -418,12 +434,15 @@ public final class VimEngine {
         case .redo:
             undo(count: count ?? 1, redo: true)
             return
+        case .switchTab(let forward):
+            onSwitchTab?(forward, count)
+            return
         default: break
         }
         desiredColumn = nil
         buffer.undoGroup {
             switch command {
-            case .move, .undo, .redo: break
+            case .move, .undo, .redo, .switchTab: break
             case .operate(let op, let target): operate(op, target, count: count)
             case .insert(let kind): insert(kind)
             case .replaceChar(let c): replaceChars(with: c, count: count ?? 1)
