@@ -6,7 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros", "net", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros", "net", "sync", "io-util"] }
 async-trait.workspace = true
 thiserror.workspace = true
 regex.workspace = true

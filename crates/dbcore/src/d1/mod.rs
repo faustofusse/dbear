@@ -18,6 +18,7 @@
 
 pub(crate) mod client;
 pub mod discover;
+pub mod oauth;
 pub(crate) mod url;
 
 use std::sync::atomic::{AtomicBool, Ordering};

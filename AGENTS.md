@@ -162,6 +162,11 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   account's D1 databases; there's no SSH and no New Database. `d1::discover::find(dir)` reads a Workers
   project's wrangler.json/jsonc/toml `d1_databases` and finds the local `wrangler dev` copies (SQLite
   files under `.wrangler/state/v3/d1/miniflare-D1DatabaseObject/`); neither app has an import UI for it yet.
+  `d1::oauth` (prototype, not wired into the apps yet) is "Sign in with Cloudflare": Authorization Code + PKCE
+  as a public OAuth client (no secret), a one-shot loopback listener for the redirect (default
+  `http://127.0.0.1:38257/oauth/callback`, which the client must register), code exchange, refresh and revoke;
+  the access token works as the D1 API token. `DBEAR_CF_OAUTH` overrides the endpoints. Try it with
+  `cargo run -p dbcore --example d1_oauth -- --client-id <id> --url d1:///<database>`.
 - Dump / restore: `dbcore::dump` writes from one consistent snapshot, streaming to `<file>.partial`
   until done. Turso dumps use the SQLite format; SQL Server dumps are T-SQL with `GO` batches,
   skipping what the file header lists. `dbcore::restore` also handles `COPY … FROM stdin` blocks.
