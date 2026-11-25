@@ -1,0 +1,30 @@
+[package]
+name = "dbear-cli"
+description = "dbear on the command line: saved connections, queries, dumps, and `serve`, a JSON-RPC server for editor plugins."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "dbear-cli"
+path = "src/main.rs"
+# The tests spawn the built binary: they live in the single `tests/it` binary.
+test = false
+
+[dependencies]
+dbcore = { workspace = true }
+# Saved connections, keychain, caches, scripts with history, dump/restore: shared with the GPUI app.
+dbservice = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "sync", "signal", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+unicode-width = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+dbcore = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "dbservice"
+description = "The glue every dbear client needs around dbcore: saved connections + keychain → connections, targets, caches, scripts with history, connection CRUD, dump/restore. No UI, no FFI."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# Every test binary links all of dbcore: the tests live in the single `tests/it` binary.
+test = false
+doctest = false
+
+[dependencies]
+dbcore = { workspace = true, features = ["os-keyring"] }
+# Only `sync` (oneshot, OnceCell): works on any executor, no tokio runtime needed by callers.
+tokio = { workspace = true, features = ["sync"] }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

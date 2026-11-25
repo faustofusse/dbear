@@ -1216,6 +1216,7 @@ version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
 dependencies = [
+ "anstream",
  "anstyle",
  "clap_lex",
  "strsim",
@@ -1868,11 +1869,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbear-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dbcore",
+ "dbservice",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
 name = "dbear-gpui"
 version = "0.1.0"
 dependencies = [
  "dbcore",
  "dbear-update",
+ "dbservice",
  "embed-resource",
  "env_logger",
  "gpui-kit",
@@ -1900,6 +1917,17 @@ dependencies = [
  "thiserror 2.0.21",
  "webpki-roots",
  "zip",
+]
+
+[[package]]
+name = "dbservice"
+version = "0.1.0"
+dependencies = [
+ "dbcore",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -8817,6 +8845,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
