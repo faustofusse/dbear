@@ -142,6 +142,28 @@ rows read. D1 runs each script as one batch, all or nothing, and has no `BEGIN`/
 | ⇧⌘[ / ⇧⌘] | Previous / next tab |
 | ⌘+ / ⌘- / ⌘0 | Zoom in / out / actual size |
 
+## Command line and Neovim
+
+`dbear-cli` uses the connections, saved passwords and query history of the apps. It never changes
+your saved connections. Build it from source with `cargo install --path apps/cli`.
+
+```sh
+dbear-cli ls                                    # saved connections
+dbear-cli tables app_dev                        # a name, an id or a URL
+dbear-cli describe app_dev users
+dbear-cli query app_dev "select * from users limit 5"     # --format csv|json|markdown|tsv|table
+dbear-cli query app_dev -f report.sql --history  # add the run to the connection's history
+dbear-cli dump app_dev app.sql.gz && dbear-cli restore other app.sql.gz
+```
+
+Output is a table in a terminal and TSV when piped. Ctrl-C stops a running query. `dbear-cli serve`
+is a JSON-RPC server for editor plugins (see [apps/cli/PROTOCOL.md](apps/cli/PROTOCOL.md)). With
+`serve --socket` running, the other commands go through it and reuse its open connections and SSH
+tunnels.
+
+The [Neovim plugin](plugins/nvim/README.md) runs the buffer or a selection on a saved connection
+(`:Dbear`, `:DbearRun`). It shows the results in a split, and completes table and column names.
+
 ## Building from source
 
 ```sh

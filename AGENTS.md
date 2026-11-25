@@ -1,16 +1,24 @@
 # AGENTS.md
 
 - Database logic (drivers, decoding, SQL, connection storage, URL parsing) belongs in `crates/dbcore`. It has no FFI or UI deps.
+- The glue around it that every Rust client needs (stores + keychain → `Connection`, targets, caches, scripts with
+  history, connection CRUD orderings, dump/restore options) belongs in `crates/dbservice`. GPUI and `dbear-cli` use
+  it; the macOS app and `dbcore-ffi` don't (yet).
+- `dbear-cli` never writes the connection store or the keychain (only OAuth token rotation). Plugins talk to
+  `dbear-cli serve` and nothing else; `apps/cli/PROTOCOL.md` is their contract: keep it in step with `wire.rs`.
 - `crates/dbcore-ffi` is the only FFI surface. Only `apps/macos/Sources/DBKit/RustDriver.swift` imports `DBCoreFFI`.
 - Rows cross the FFI boundary in pages (`QueryResult`), never one cell at a time.
 - Passwords never touch disk. `dbcore::secrets` keeps them in the OS store (feature `os-keyring`: Keychain, Secret Service, Credential Manager), using service `ar.fausto.dbear.connection` and the connection id as the account. The macOS app has its own Swift Keychain code with the same service and account, so the two share entries.
-- `apps/gpui` uses `dbcore` directly (no FFI). It reads the same connection store and keyring entries as the macOS app. It's the Windows release (and the Linux app).
+- `apps/gpui` uses `dbcore` and `dbservice` directly (no FFI). It reads the same connection store and keyring entries as the macOS app. It's the Windows release (and the Linux app).
   - GPUI is pre-1.0. `gpui-kit` is pinned to an exact version and pins GPUI (`gpui-pre`) itself; upgrade both together.
   - On macOS, GPUI stops drawing windows that other windows cover. For screenshots in tests, use a window that floats above the others.
   - `RUST_LOG=info` shows the renderer GPUI picked and what it's doing.
 - Platform folders come from `dbcore::paths`. Don't read `HOME` directly; the core also builds for Windows.
 - After changing `crates/`, run `./scripts/build-core.sh` (`bundle-mac.sh` runs it for you). `Sources/DBCoreFFI` and `Frameworks/` are generated.
-- Check work with `cargo test -p dbcore`, `./scripts/test-postgres.sh` and `(cd apps/macos && swift test)`.
+- Check work with `cargo test -p dbcore`, `./scripts/test-postgres.sh` and `(cd apps/macos && swift test)`; for the
+  service, CLI and plugin also `cargo test -p dbservice -p dbear-cli` and `plugins/nvim/tests/run.sh`.
+- `dbservice` and `dbear-cli` keep their integration tests in one test binary (`tests/it/main.rs` with modules):
+  every test binary links all of dbcore. Do the same in new crates.
 - Dev DB: `./scripts/dev-db.sh up|down|reset|psql`. Seed is in `dev/postgres/init.sql`.
 - Use `nix develop`. Commit messages use `feat:`, `fix:`, `chore:` prefixes.
 
@@ -21,6 +29,7 @@ nix develop                                       # Rust toolchain (Xcode provid
 ./scripts/dev-db.sh up                            # dev Postgres at localhost:54329/app_dev
 ./scripts/bundle-mac.sh && open build/dbear.app   # build and run
 ./scripts/run-gpui.sh [--samples] [--release]      # the GPUI app (Linux; runs on macOS for testing). --help for options
+cargo run -p dbear-cli -- --help                  # the CLI (and `serve`, for editor plugins)
 ```
 
 In debug builds, **File ▸ Add Sample Connections** adds `app_dev` plus some mock connections.
@@ -41,10 +50,13 @@ Without Nix (it only pins the toolchain):
 
 ```
 crates/dbcore/      Rust core: models, drivers (Postgres, MySQL, SQLite, SQL Server, libSQL, D1, mock), connection store, SQL highlighting
+crates/dbservice/   glue shared by the GPUI app and the CLI: stores + keychain → connections, caches, scripts, history, CRUD
 crates/dbcore-ffi/  UniFFI bindings for Swift
 crates/update/      self-update core (signed manifests, verified downloads) + `dbear-update` signing tool
 apps/macos/         SwiftUI app
 apps/gpui/          GPUI app: Windows release and Linux (gpui-kit pinned; also runs on macOS for development)
+apps/cli/           dbear-cli: one-shot commands and `serve` (JSON-RPC over stdio or a socket; PROTOCOL.md)
+plugins/nvim/       Neovim plugin (Lua, no deps) on `dbear-cli serve`
 packaging/          Windows installer (NSIS), icon, and the update public key
 scripts/            build, bundle, dev database, tests, release
 vendor/             third-party crates patched for dbear (tiberius; see vendor/README.md)
@@ -54,6 +66,9 @@ vendor/             third-party crates patched for dbear (tiberius; see vendor/R
 
 ```sh
 cargo test -p dbcore              # core (Postgres tests skip without a database)
+cargo test -p dbservice           # service layer (SQLite files, mock driver, MemorySecretStore)
+cargo test -p dbear-cli           # CLI and serve (stdio and socket) against SQLite files and the mock driver
+plugins/nvim/tests/run.sh         # Neovim plugin, headless, against a real `dbear-cli serve` and a SQLite file
 ./scripts/test-postgres.sh        # core against the dev database
 ./scripts/test-linux.sh [--windows] [--gpui] # core on Linux in an Apple container (running dev DBs forwarded); --windows cross-checks x86_64-pc-windows-gnu, --gpui builds apps/gpui
 ./scripts/test-libsql.sh          # core against the dev libSQL server (container dbear-libsql)
@@ -170,7 +185,11 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   the keychain. The D1 client gets access tokens from `oauth::access_token`: grants are shared in the process by
   grant id, refreshed 5 minutes before expiry or after a 401, and the rotated secret is saved back through the
   `SecretSync` each app installs at launch (GPUI: `sync_with_store`; macOS: `CloudflareSignIn.installSecretSync`).
-  `d1::accounts` / `d1::databases` fill the editors' pickers. `DBEAR_CF_OAUTH` / `DBEAR_CF_OAUTH_CLIENT_ID`
+  `d1::accounts` / `d1::databases` fill the editors' pickers. Several processes (the apps, `dbear-cli`) may hold
+  the same grant: a refresh takes a file lock per grant (`<app data>/dbear/locks/oauth-<sha256 prefix>.lock`, polled
+  with `try_lock`, 45 s timeout, then it goes ahead unlocked), re-reads the stored secret through `SecretSync` and
+  adopts a copy another process already rotated instead of spending a stale refresh token. Lock files are never
+  deleted; unit tests use `<tmp>/dbear-test-locks`. `DBEAR_CF_OAUTH` / `DBEAR_CF_OAUTH_CLIENT_ID`
   override the endpoints and client. Try it with `cargo run -p dbcore --example d1_oauth -- --url d1:///<database>`.
 - Dump / restore: `dbcore::dump` writes from one consistent snapshot, streaming to `<file>.partial`
   until done. Turso dumps use the SQLite format; SQL Server dumps are T-SQL with `GO` batches,
@@ -190,3 +209,42 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   (`vendor/README.md`): rustls on ring, row counts for scripts, exact MONEY. Each `GO` batch runs on
   the script session, so temp tables and `SET` options persist. SSL "Disable" (shown as "Login Only")
   still encrypts the login.
+- Service layer (`crates/dbservice`): `Service` (`Clone + Send + Sync`, async methods executor-agnostic like
+  `Connection`; keychain and SQLite work runs through `dbservice::unblock`). `Service::open(Options)` opens the
+  connection store (`DBEAR_CONNECTIONS_FILE`), `state.db` beside it and the keychain (`Secrets::Keyring | Store |
+  Disabled`; `DBEAR_NO_KEYRING=1` turns the keychain off for tests and sandboxes), and installs
+  `oauth::sync_with_store`. `open_lenient` never fails and lists what didn't open in `problems()` (GPUI's notices).
+  `find(spec)`: an id, an exact name (trimmed, case-insensitive; ambiguous names are an error listing the ids) or a
+  URL (id `url:<hex>`, kept in memory, never saved, password from the URL). `Target { connection_id, database }`:
+  `database` is always a name (`default_database()` when it's the connection's own); with none asked for, a
+  connection that browses databases opens its `last_database`. `connection(&target)` fills both secrets (not the
+  SSH one for Agent auth) and caches one `Connection` per target; `new_connection` is uncached, for sessions of
+  their own. Schemas, database lists and completion catalogs are cached per target and dropped by `schema_changed`
+  (scripts that `dialect::changes_schema`), restores and `forget`. `run_script` → `ScriptOutcome` (result,
+  duration, `schema_changed`, sources): 10 000-row cap, history as the apps record it (rows affected or rows
+  returned; cancelled runs aren't recorded). `save` writes the store, then the keychain (the SSH secret is deleted
+  without a tunnel or with Agent auth); `delete` also removes both keychain entries, the history and the caches.
+  `dump_options` / `restore_options` normalize per kind (Insert unless Postgres, `create_database` MySQL only,
+  MySQL restores outside a transaction). GPUI keeps paging, edit staging and the session JSON.
+- CLI (`apps/cli`, binary `dbear-cli`; the GPUI binary is `dbear`): `ls`, `dbs`, `tables`, `describe`, `rows`,
+  `query`, `dump`, `restore`, `history`, `url`, `serve`. `<conn>` is a name, id or URL. Every command is a JSON-RPC
+  client of the server code (`server.rs`): over the socket of a running `serve --socket` for the same store
+  (checked with `server.info`'s `store_path` and protocol), else an in-process session on an in-memory pipe
+  (`--no-server` forces it). Output: an aligned table on a TTY, TSV when piped, `--format` for `dbcore::export`'s
+  formats, `--json` for the serde models. `query` records history only with `--history` (scripts would push the
+  user's queries out of the newest 1000); Ctrl-C sends `query.cancel` (exit 130). Exit codes: 1 errors, 2 usage.
+- `serve`: JSON-RPC 2.0, one JSON message per line, over stdio (one client) or `--socket [PATH]` (Unix only; default
+  `serve.sock` beside the connection store, `DBEAR_SOCKET` overrides; mode 0600; a stale file is replaced, a live
+  server refused; removed on exit). The `Service` (stores, keychain, OAuth grants, one metadata connection per target
+  and its caches) is shared; each client gets its own `query.run` sessions (`new_connection`), so temp tables,
+  transactions and cancel never cross clients, and a socket client that hangs up has its work cancelled. Requests
+  run concurrently. A failing statement is a successful `query.run` with `{"error": …}`; RPC errors carry the
+  serialized `dbcore::Error` in `data`. Dumps and restores are jobs (`*.start` answers with a job id, then
+  `*.progress` / `*.finished` notifications; `job.cancel`). The store is re-read at most every 2 s. Everything is in
+  `apps/cli/PROTOCOL.md` (protocol version 1: new methods and fields don't bump it).
+- Neovim plugin (`plugins/nvim`, Neovim 0.10+, no deps): `dbear.rpc` is the JSON-RPC client (no UI code; starts
+  `dbear-cli serve` on the first request and again after it exits), `dbear.render` turns results into lines and
+  highlights, `dbear` (init.lua) has the commands (`:Dbear`, `:DbearDatabase`, `:DbearRun`, `:DbearTables`,
+  `:DbearDescribe`, `:DbearCancel`, `:DbearHistory`), the `dbear://results` split and the `omnifunc` (a synchronous
+  `complete` call; offsets are UTF-8 bytes on both sides). A buffer's connection is `b:dbear_connection`. It records
+  history (`record_history = true` by default).
