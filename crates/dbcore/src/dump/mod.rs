@@ -31,7 +31,8 @@ use crate::driver::{Error, Result};
 use crate::model::{ConnectionConfig, DatabaseKind, TableInfo};
 
 /// What goes into the dump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DumpContent {
     #[default]
     SchemaAndData,
@@ -51,7 +52,8 @@ impl DumpContent {
 
 /// Which objects to dump. Schemas are Postgres and SQL Server schemas; a MySQL connection dumps
 /// its one database, and SQLite and Turso their `main` database, whatever schema names are given.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DumpScope {
     #[default]
     Database,
@@ -82,7 +84,8 @@ impl DumpScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Compression {
     #[default]
     None,
@@ -90,14 +93,16 @@ pub enum Compression {
 }
 
 /// How rows are written. `Copy` is Postgres only (other engines always use INSERTs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DataStyle {
     #[default]
     Copy,
     Insert,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DumpOptions {
     pub content: DumpContent,
     pub scope: DumpScope,
@@ -109,7 +114,8 @@ pub struct DumpOptions {
     pub create_database: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DumpPhase {
     Connecting,
     /// Types, tables, functions…
@@ -121,7 +127,7 @@ pub enum DumpPhase {
     Finishing,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DumpProgress {
     pub phase: DumpPhase,
     /// The table (or other object) being written, e.g. `public.users`.
@@ -163,7 +169,7 @@ pub fn target_name(config: &ConnectionConfig) -> String {
     if config.database.is_empty() { config.name.clone() } else { config.database.clone() }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DumpSummary {
     pub tables: u32,
     pub rows: u64,

@@ -28,7 +28,8 @@ use crate::dump::{CancelToken, ProgressFn};
 use crate::model::{ConnectionConfig, DatabaseKind};
 use split::{Item, Splitter};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RestoreOptions {
     /// Run everything in one transaction (Postgres, SQLite): all or nothing. The script's own
     /// `BEGIN`/`COMMIT` are skipped. MySQL commits DDL implicitly, so it only helps data there.
@@ -44,7 +45,7 @@ impl Default for RestoreOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RestoreProgress {
     /// Bytes of the file read so far (compressed bytes for a gzipped file).
     pub bytes_read: u64,
@@ -60,7 +61,7 @@ impl RestoreProgress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RestoreSummary {
     /// Statements (and COPY blocks) that ran.
     pub statements: u64,

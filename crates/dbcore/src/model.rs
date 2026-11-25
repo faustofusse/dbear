@@ -71,24 +71,35 @@ pub enum SslMode {
     VerifyFull,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Serde: secrets never serialize (`password` is skipped; a client may still pass one in). Only
+/// `id`, `name` and `kind` are required when deserializing.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub group: String,
     pub kind: DatabaseKind,
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
     pub port: Option<u16>,
+    #[serde(default)]
     pub database: String,
+    #[serde(default)]
     pub user: Option<String>,
     /// Supplied by the frontend from the platform keychain; never persisted by the core.
+    #[serde(default, skip_serializing)]
     pub password: Option<String>,
+    #[serde(default)]
     pub ssl_mode: SslMode,
     /// Offer every database on the server, not just `database`, to switch between (Postgres, MySQL).
     /// `database` stays the one opened first.
+    #[serde(default)]
     pub show_all_databases: bool,
     /// Reach the server through an SSH server (Postgres, MySQL, SQL Server). `host` and `port` are
     /// then as seen from the SSH server.
+    #[serde(default)]
     pub ssh: Option<SshTunnel>,
 }
 
@@ -105,7 +116,9 @@ pub enum SshAuth {
 }
 
 /// An SSH server the database is reached through (port forwarding, like `ssh -L`).
-#[derive(Clone, PartialEq, Eq, Hash, Default)]
+/// Serde: `secret` is skipped on serialize like `ConnectionConfig::password`; `forwarded_port` never crosses.
+#[derive(Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SshTunnel {
     pub host: String,
     /// `None`: 22.
@@ -116,8 +129,10 @@ pub struct SshTunnel {
     pub key_path: String,
     /// The SSH password, or the key's passphrase. Supplied by the frontend from the platform
     /// keychain (see `secrets::ssh_account`); never persisted by the core.
+    #[serde(skip_serializing)]
     pub secret: Option<String>,
     /// Set by the core while a tunnel is open: the local port it listens on. Leave `None`.
+    #[serde(skip)]
     pub forwarded_port: Option<u16>,
 }
 
@@ -248,13 +263,14 @@ impl ConnectionConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TableKind {
     Table,
     View,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableInfo {
     pub schema: String,
     pub name: String,
@@ -272,13 +288,13 @@ impl TableInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Schema {
     pub name: String,
     pub tables: Vec<TableInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnInfo {
     pub name: String,
     pub type_name: String,
@@ -287,7 +303,7 @@ pub struct ColumnInfo {
 }
 
 /// Columns of one table or view, for SQL completion (`Driver::list_columns`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableColumns {
     pub schema: String,
     pub table: String,
@@ -295,7 +311,7 @@ pub struct TableColumns {
 }
 
 /// One `ORDER BY` term for table browsing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SortKey {
     pub column: String,
     pub descending: bool,
@@ -303,7 +319,8 @@ pub struct SortKey {
 
 /// How to browse a table: user sort and a `WHERE` filter. The default is the table's natural
 /// order (primary key, else physical order) with no filter.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RowQuery {
     /// Applied in order; the driver appends the primary key (or row id) so paging stays stable.
     pub sort: Vec<SortKey>,
@@ -313,7 +330,7 @@ pub struct RowQuery {
 }
 
 /// A column as described in the structure view.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnDetail {
     pub name: String,
     pub type_name: String,
@@ -325,7 +342,7 @@ pub struct ColumnDetail {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IndexInfo {
     pub name: String,
     /// Column names in index order; expressions are shown as written (`lower(email)`).
@@ -336,7 +353,7 @@ pub struct IndexInfo {
     pub definition: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ForeignKeyInfo {
     /// Constraint name (empty for SQLite, which doesn't name them).
     pub name: String,
@@ -352,7 +369,7 @@ pub struct ForeignKeyInfo {
 
 /// A foreign key in another table that points at this one: rows of `schema.table` whose `columns`
 /// hold this table's `referenced_columns` belong to that row.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReferencingKey {
     /// The table holding the key.
     pub schema: String,
@@ -366,7 +383,8 @@ pub struct ReferencingKey {
 }
 
 /// Everything the structure view shows for a table or view (`Driver::describe_table`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TableStructure {
     pub columns: Vec<ColumnDetail>,
     /// Primary key columns in key order (empty for views and keyless tables).
@@ -380,6 +398,16 @@ pub struct TableStructure {
 }
 
 /// A single cell. Drivers decode wire types into one of these.
+///
+/// Serde (JSON wire format, lossless and compact; the common cases are plain JSON):
+/// - `Null` → `null`, `Bool` → `true`/`false`, `Text` → `"…"`;
+/// - `Int` → a number when |n| ≤ 2^53 − 1 (exact in every JSON reader), else `{"int":"9007199254740993"}`;
+/// - `Float` → `{"float":1.5}`, or `{"float":"NaN"|"Infinity"|"-Infinity"}` (JSON has no such numbers);
+/// - `Decimal` → `{"decimal":"12.30"}`.
+///
+/// Reading also accepts `{"int":n}` with a number, any integer number (→ `Int`) and a number with a
+/// fraction or exponent (→ `Float`). Binary columns are already `Text` (a hex preview) in the core.
+/// For human-friendly JSON use `export::format_rows(CopyFormat::Json, …)` instead.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -408,8 +436,135 @@ impl Value {
     }
 }
 
+/// Largest integer every JSON reader (JavaScript, Lua) holds exactly.
+const MAX_SAFE_INT: i64 = (1 << 53) - 1;
+
+impl Serialize for Value {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        fn tagged<S: serde::Serializer>(s: S, tag: &str, payload: Payload) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            let mut map = s.serialize_map(Some(1))?;
+            map.serialize_entry(tag, &payload)?;
+            map.end()
+        }
+        match self {
+            Self::Null => s.serialize_unit(),
+            Self::Bool(b) => s.serialize_bool(*b),
+            Self::Int(i) if (-MAX_SAFE_INT..=MAX_SAFE_INT).contains(i) => s.serialize_i64(*i),
+            Self::Int(i) => tagged(s, "int", Payload::Text(&i.to_string())),
+            Self::Float(f) if f.is_nan() => tagged(s, "float", Payload::Text("NaN")),
+            Self::Float(f) if f.is_infinite() => tagged(s, "float", Payload::Text(if *f > 0.0 { "Infinity" } else { "-Infinity" })),
+            Self::Float(f) => tagged(s, "float", Payload::Float(*f)),
+            Self::Decimal(d) => tagged(s, "decimal", Payload::Text(d)),
+            Self::Text(t) => s.serialize_str(t),
+        }
+    }
+}
+
+/// The inside of a tagged `Value`.
+enum Payload<'a> {
+    Text(&'a str),
+    Float(f64),
+}
+
+impl Serialize for Payload<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(t) => s.serialize_str(t),
+            Self::Float(f) => s.serialize_f64(*f),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(ValueVisitor)
+    }
+}
+
+struct ValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("null, a boolean, a string, an integer, or {\"int\"|\"float\"|\"decimal\": …}")
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        Value::deserialize(d)
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Value, E> {
+        Ok(Value::Bool(b))
+    }
+
+    fn visit_i64<E>(self, i: i64) -> Result<Value, E> {
+        Ok(Value::Int(i))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, u: u64) -> Result<Value, E> {
+        i64::try_from(u).map(Value::Int).map_err(|_| E::custom(format!("integer {u} is out of range")))
+    }
+
+    fn visit_f64<E>(self, f: f64) -> Result<Value, E> {
+        Ok(Value::Float(f))
+    }
+
+    fn visit_str<E>(self, t: &str) -> Result<Value, E> {
+        Ok(Value::Text(t.into()))
+    }
+
+    fn visit_string<E>(self, t: String) -> Result<Value, E> {
+        Ok(Value::Text(t))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        use serde::de::Error as _;
+        let tag: String = map.next_key()?.ok_or_else(|| A::Error::custom("empty object is not a value"))?;
+        let payload: Scalar = map.next_value()?;
+        if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(A::Error::custom("a tagged value has exactly one key"));
+        }
+        let bad = || A::Error::custom(format!("bad \"{tag}\" value"));
+        Ok(match (tag.as_str(), payload) {
+            ("int", Scalar::Int(i)) => Value::Int(i),
+            ("int", Scalar::Text(t)) => Value::Int(t.trim().parse().map_err(|_| bad())?),
+            ("float", Scalar::Int(i)) => Value::Float(i as f64),
+            ("float", Scalar::Float(f)) => Value::Float(f),
+            ("float", Scalar::Text(t)) => Value::Float(match t.as_str() {
+                "NaN" => f64::NAN,
+                "Infinity" => f64::INFINITY,
+                "-Infinity" => f64::NEG_INFINITY,
+                other => other.parse().map_err(|_| bad())?,
+            }),
+            ("decimal", Scalar::Text(t)) => Value::Decimal(t),
+            ("int" | "decimal", _) => return Err(bad()),
+            _ => return Err(A::Error::unknown_field(&tag, &["int", "float", "decimal"])),
+        })
+    }
+}
+
+/// The payload of a tagged value, as read.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Scalar {
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
 /// One page of rows. Rows are sent in pages, never cell by cell.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QueryResult {
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Vec<Value>>,
@@ -426,7 +581,7 @@ pub struct QueryResult {
 }
 
 /// The table column a result column reads, unchanged (not an expression of it).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnOrigin {
     pub schema: String,
     pub table: String,

@@ -39,7 +39,7 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 /// One script run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryEntry {
     pub id: i64,
     pub connection_id: String,

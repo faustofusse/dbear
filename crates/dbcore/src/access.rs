@@ -20,7 +20,7 @@ use crate::driver::{Error, Result};
 use crate::model::DatabaseKind;
 
 /// A role (Postgres) or account (MySQL, where `host` is set).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct RoleRef {
     pub name: String,
     pub host: Option<String>,
@@ -40,7 +40,7 @@ impl RoleRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Role {
     pub name: String,
     /// MySQL account host (`%`, `localhost`…); `None` for Postgres.
@@ -68,7 +68,7 @@ impl Role {
 }
 
 /// A role as it should be: for [`AccessChange::CreateRole`] and [`AccessChange::AlterRole`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RoleSpec {
     pub name: String,
     pub host: Option<String>,
@@ -84,7 +84,8 @@ pub struct RoleSpec {
     pub member_of: Vec<RoleRef>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GrantObjectKind {
     Server,
     Database,
@@ -96,7 +97,8 @@ pub enum GrantObjectKind {
 }
 
 /// What a privilege is on. For MySQL, `Table::schema` is the database.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum GrantObject {
     /// MySQL `*.*`.
     Server,
@@ -151,7 +153,7 @@ impl GrantObject {
 }
 
 /// One privilege a role holds on an object (directly, not through membership).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Grant {
     pub object: GrantObject,
     /// Upper case, as the server names it: `SELECT`, `CREATE TEMPORARY TABLES`…
@@ -161,14 +163,15 @@ pub struct Grant {
 }
 
 /// The privileges a role holds on one object, before or after an edit.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PrivilegeSet {
     pub privileges: Vec<String>,
     /// All of them `WITH GRANT OPTION`.
     pub grantable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum AccessChange {
     CreateRole(RoleSpec),
     /// `role` is the role as listed; `spec` what it should become (renames included).
@@ -192,7 +195,7 @@ impl AccessChange {
 }
 
 /// A role's privileges on one database of the server (every database is listed, for an access editor).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DatabaseAccess {
     pub database: String,
     /// Granted directly to the role on the database itself (Postgres `CONNECT`…, MySQL `db.*`).
@@ -209,7 +212,8 @@ pub struct DatabaseAccess {
 /// How much a role may do in one database, as offered in an access menu. Postgres levels cover the
 /// database, its schemas, tables and sequences, and those created later (default privileges);
 /// MySQL's are privileges on `db.*`, which already covers future tables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DatabaseLevel {
     NoAccess,
     /// Postgres: `CONNECT` only, nothing inside.
@@ -263,7 +267,7 @@ pub fn database_levels(kind: DatabaseKind) -> Vec<DatabaseLevel> {
 }
 
 /// What a role has in one database, plus what's needed to change it (detected in that database).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DatabaseLevelContext {
     pub database: String,
     /// The role's current level there.
@@ -390,14 +394,14 @@ pub fn generate_password(length: usize) -> Result<String> {
 }
 
 /// A statement to run, and how to show it (passwords masked).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccessStatement {
     pub sql: String,
     pub display: String,
 }
 
 /// What a database supports, so frontends only offer what will work.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccessFeatures {
     /// Accounts have a host (`'user'@'host'`).
     pub hosts: bool,

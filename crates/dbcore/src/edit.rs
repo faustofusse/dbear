@@ -12,7 +12,8 @@ use crate::driver::{Error, Result};
 use crate::model::{ColumnInfo, DatabaseKind, TableInfo, Value};
 
 /// A new cell value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EditValue {
     Null,
     /// The column's default: `DEFAULT` in an UPDATE, the column left out of an INSERT.
@@ -21,20 +22,21 @@ pub enum EditValue {
     Text(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CellEdit {
     pub column: String,
     pub value: EditValue,
 }
 
 /// A primary key column and the row's current (original) value in it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KeyValue {
     pub column: String,
     pub value: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RowChange {
     Update { key: Vec<KeyValue>, set: Vec<CellEdit> },
     Insert { values: Vec<CellEdit> },
@@ -42,7 +44,7 @@ pub enum RowChange {
 }
 
 /// One statement to run, and how to check it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditStatement {
     pub sql: String,
     /// UPDATE/DELETE by primary key: anything but exactly one row means the row changed or vanished.

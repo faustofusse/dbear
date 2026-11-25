@@ -5,7 +5,8 @@ use crate::dialect::Dialect;
 use crate::edit::is_binary;
 use crate::model::{ColumnInfo, DatabaseKind, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CopyFormat {
     /// Tab-separated, what spreadsheets paste into cells. NULL is an empty field.
     Tsv,

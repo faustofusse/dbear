@@ -95,10 +95,34 @@ impl PageCursor {
 }
 
 /// One page of a table and where the next one starts (`None`: this was the last page).
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// Serde: `{"result": QueryResult, "next": "<opaque cursor>" | null}`; the cursor is
+/// [`PageCursor::encode`]'s string, passed back as is for the next page.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RowPage {
     pub result: QueryResult,
+    #[serde(default, with = "encoded_cursor")]
     pub next: Option<PageCursor>,
+}
+
+/// `Option<PageCursor>` as its encoded string.
+mod encoded_cursor {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::PageCursor;
+
+    pub fn serialize<S: Serializer>(cursor: &Option<PageCursor>, s: S) -> Result<S::Ok, S::Error> {
+        match cursor {
+            Some(c) => s.serialize_str(&c.encode()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PageCursor>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|token| PageCursor::decode(&token).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 impl RowPage {

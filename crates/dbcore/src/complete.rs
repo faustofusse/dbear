@@ -71,7 +71,8 @@ fn eq_ident(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CompletionKind {
     Keyword,
     Schema,
@@ -81,7 +82,7 @@ pub enum CompletionKind {
     Function,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionItem {
     pub label: String,
     pub insert_text: String,
@@ -89,7 +90,7 @@ pub struct CompletionItem {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Completions {
     /// Byte range of `sql` to replace with `insert_text` (the word being typed).
     pub replace_start: usize,

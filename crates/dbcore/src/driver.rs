@@ -6,7 +6,10 @@ use crate::edit::EditStatement;
 use crate::keyset::{PageCursor, RowPage};
 use crate::model::{ConnectionConfig, QueryResult, RowQuery, Schema, TableColumns, TableInfo, TableStructure};
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Serde: `{"kind": "query", "message": "…"}`, the kind in kebab-case and the message without the
+/// `Display` prefix (`Cancelled` has no message). `to_string()` is the text to show.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "message", rename_all = "kebab-case")]
 pub enum Error {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),

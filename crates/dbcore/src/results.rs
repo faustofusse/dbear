@@ -15,7 +15,7 @@ use crate::edit::{self, CellEdit, EditStatement, EditValue, KeyValue, RowChange}
 use crate::model::{ColumnInfo, ColumnOrigin, DatabaseKind, TableInfo, TableKind, TableStructure, Value};
 
 /// A table some result columns come from.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SourceTable {
     pub table: TableInfo,
     /// The table's columns, primary key flagged (what [`edit::statements`] checks against).
@@ -27,7 +27,7 @@ pub struct SourceTable {
 }
 
 /// A foreign key whose columns are all in the result: a cell in it opens the row it points at.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ForeignKeyLink {
     /// Result columns holding the key, in the key's column order.
     pub columns: Vec<usize>,
@@ -40,7 +40,7 @@ pub struct ForeignKeyLink {
 }
 
 /// Another table's foreign key pointing at a table in the result: a row opens the rows referencing it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceLink {
     /// Result columns holding the values the key references (the source table's key, usually).
     pub values: Vec<usize>,
@@ -53,7 +53,8 @@ pub struct ReferenceLink {
 }
 
 /// What the result's columns are, as far as the tables they come from tell.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ResultSources {
     pub tables: Vec<SourceTable>,
     /// Per result column: its table (index into `tables`) and its name there.
@@ -63,7 +64,7 @@ pub struct ResultSources {
 }
 
 /// One result row's edits: its values as loaded, and the new values of some cells (or delete it).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RowEdit {
     pub values: Vec<Value>,
     /// Result column → new value.
@@ -72,7 +73,7 @@ pub struct RowEdit {
 }
 
 /// Changes to one table, ready for [`edit::statements`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableChanges {
     pub table: TableInfo,
     pub columns: Vec<ColumnInfo>,
