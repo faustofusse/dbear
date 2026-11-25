@@ -1,11 +1,13 @@
 //! "Import from DBeaver": lists DBeaver's saved connections to pick from, like the macOS sheet.
-//! Finding and decrypting them is `dbcore::import::dbeaver`; this is only the list.
+//! Finding and decrypting them is `dbcore::import::dbeaver` (through `dbservice`, which also flags
+//! the ones already saved); this is only the list.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 use dbcore::ConnectionConfig;
-use dbcore::import::{ImportScan, ImportedConnection, dbeaver};
+use dbcore::import::{ImportScan, ImportedConnection};
+use dbservice::Service;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
@@ -25,16 +27,15 @@ pub struct ImportDialog {
     selected: HashSet<usize>,
     /// The file or folder chosen by hand (`None`: DBeaver's usual folders).
     source: Option<PathBuf>,
-    /// Saved connections, to flag the ones already added.
-    existing: Vec<ConnectionConfig>,
+    service: Service,
     error: Option<String>,
     _scan: Option<Task<()>>,
 }
 
 impl ImportDialog {
-    pub fn new(existing: Vec<ConnectionConfig>, cx: &mut Context<Self>) -> Self {
+    pub fn new(service: Service, cx: &mut Context<Self>) -> Self {
         let mut dialog =
-            Self { state: State::Loading, selected: HashSet::new(), source: None, existing, error: None, _scan: None };
+            Self { state: State::Loading, selected: HashSet::new(), source: None, service, error: None, _scan: None };
         dialog.load(None, cx);
         dialog
     }
@@ -43,19 +44,10 @@ impl ImportDialog {
         self.state = State::Loading;
         self.source = path.clone();
         self.error = None;
-        let existing = self.existing.clone();
+        let service = self.service.clone();
         self._scan = Some(cx.spawn(async move |this, cx| {
             // Reads files and decrypts DBeaver's credentials: off the UI thread.
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let scan = match &path {
-                        Some(path) => dbeaver::scan_path(path),
-                        None => dbeaver::scan_default(),
-                    };
-                    scan.map(|scan| scan.mark_existing(&existing))
-                })
-                .await;
+            let result = cx.background_executor().spawn(async move { service.scan_dbeaver(path.as_deref()) }).await;
             this.update(cx, |this, cx| {
                 match result {
                     Ok(scan) => {

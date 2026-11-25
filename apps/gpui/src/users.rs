@@ -76,7 +76,7 @@ pub fn noun(kind: DatabaseKind) -> &'static str {
 pub struct UsersState {
     pub connection: Arc<Connection>,
     /// The connection id and database it's pointed at.
-    pub key: (String, String),
+    pub key: crate::workspace::TargetKey,
     pub features: AccessFeatures,
     pub roles: Load<Vec<Role>>,
     pub selected: Option<RoleRef>,
@@ -102,7 +102,7 @@ impl EventEmitter<RoleCreated> for UsersState {}
 impl UsersState {
     pub fn new(
         connection: Arc<Connection>,
-        key: (String, String),
+        key: crate::workspace::TargetKey,
         features: AccessFeatures,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -138,7 +138,7 @@ impl UsersState {
     }
 
     /// Points it at another database: Postgres privileges are per database, so they're read again.
-    pub fn retarget(&mut self, connection: Arc<Connection>, key: (String, String), cx: &mut Context<Self>) {
+    pub fn retarget(&mut self, connection: Arc<Connection>, key: crate::workspace::TargetKey, cx: &mut Context<Self>) {
         if key == self.key {
             return;
         }

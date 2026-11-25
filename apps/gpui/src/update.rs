@@ -258,7 +258,7 @@ fn now_ms() -> i64 {
 }
 
 fn state_store() -> Option<StateStore> {
-    let store = std::env::var_os("DBEAR_CONNECTIONS_FILE").map(PathBuf::from).or_else(dbcore::store::default_path)?;
+    let store = std::env::var_os(dbservice::CONNECTIONS_FILE_ENV).map(PathBuf::from).or_else(dbcore::store::default_path)?;
     StateStore::open_beside(&store).map_err(|e| log::warn!("couldn’t open the state file for update settings: {e}")).ok()
 }
 

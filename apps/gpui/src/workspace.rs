@@ -1,15 +1,13 @@
 //! The main window: connections | schemas and tables | tabs (tables and SQL scripts), like the macOS app.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dbcore::dialect::Dialect;
-use dbcore::secrets::{self, KeyringSecretStore, SecretStore as _};
-use dbcore::state::StateStore;
-use dbcore::{Connection, ConnectionConfig, ConnectionStore, DatabaseKind, Schema, TableInfo, TableKind};
+use dbcore::{Connection, ConnectionConfig, DatabaseKind, Schema, TableInfo, TableKind};
+use dbservice::{Options, Part, SaveRequest, SecretKind, Service};
 use serde::{Deserialize, Serialize};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
@@ -33,7 +31,7 @@ use crate::users::{self, RoleCreated, UsersState, UsersTab};
 use crate::menus::MenuState;
 use crate::palette::{self, OpenPalette, Palette, Target};
 use dbcore::palette::{Candidate, Kind};
-use crate::tabs::{AddRow, EditorFontSize, History, OpenResults, ResultTab, ScriptTab, ShowData, ShowStructure, TabEvent, TableTab, count, plural};
+use crate::tabs::{AddRow, EditorFontSize, OpenResults, ResultTab, ScriptTab, ScriptTarget, ShowData, ShowStructure, TabEvent, TableTab, count, plural};
 
 enum Load<T> {
     Idle,
@@ -51,7 +49,7 @@ pub enum PaletteTables {
 }
 
 /// One connection per (connection id, database): Postgres can't switch databases on a session.
-type TargetKey = (String, String);
+pub(crate) type TargetKey = dbservice::Target;
 
 actions!(
     dbear,
@@ -125,23 +123,6 @@ enum SavedTab {
         filter: Option<String>,
     },
     Script { connection: String, database: String, name: String, sql: String },
-}
-
-/// A connection for `config`, with its saved password read off the UI thread (it can block or prompt).
-async fn new_connection(
-    config: ConnectionConfig,
-    secrets: Option<Arc<KeyringSecretStore>>,
-    executor: BackgroundExecutor,
-) -> Arc<Connection> {
-    let config = executor
-        .spawn(async move {
-            match secrets {
-                Some(store) => secrets::with_password(store.as_ref(), config.clone()).unwrap_or(config),
-                None => config,
-            }
-        })
-        .await;
-    Arc::new(Connection::new(config))
 }
 
 pub fn bind_keys(cx: &mut App) {
@@ -246,9 +227,9 @@ impl OpenTab {
 }
 
 pub struct Workspace {
-    store: Option<ConnectionStore>,
-    /// Open tabs and query history (`state.db`, beside the connection store).
-    state: Option<Rc<RefCell<StateStore>>>,
+    /// Saved connections, passwords, open connections and their schemas, history and open tabs
+    /// (`state.db`): shared with the CLI.
+    service: Service,
     /// Reopening last session's tabs; nothing is saved until it's done.
     restoring: bool,
     restore_task: Option<Task<()>>,
@@ -265,12 +246,6 @@ pub struct Workspace {
     notice: Option<String>,
     /// No saved connections: the list shows the samples.
     showing_samples: bool,
-    secrets: Option<Arc<KeyringSecretStore>>,
-    open: HashMap<TargetKey, Arc<Connection>>,
-    /// Schemas already listed per target, so switching back to a database is instant.
-    schema_cache: HashMap<TargetKey, Vec<Schema>>,
-    /// The databases on each connection's server, once listed (connections that show all databases).
-    databases: HashMap<String, Vec<String>>,
     selected: Option<String>,
     /// The database shown for the selected connection.
     database: String,
@@ -319,50 +294,41 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The store (`DBEAR_CONNECTIONS_FILE` overrides it), the keychain (with the Cloudflare
+        // sign-in write-back) and state.db. Without a store, the samples are listed.
+        let service = Service::open_lenient(Options { samples: true, ..Default::default() });
         let mut notices = Vec::new();
-        let store = open_store().map_err(|e| notices.push(format!("Couldn’t open saved connections: {e}"))).ok();
-        let (connections, showing_samples) = Self::listed_connections(store.as_ref());
-        let secrets = match KeyringSecretStore::new() {
-            Ok(store) => {
-                let store = Arc::new(store);
-                // Refreshed "Sign in with Cloudflare" grants go back to the connection's entry.
-                dbcore::d1::oauth::sync_with_store(store.clone());
-                Some(store)
+        for problem in service.problems() {
+            let e = &problem.error;
+            match problem.part {
+                Part::Store => notices.push(format!("Couldn’t open saved connections: {e}")),
+                Part::Secrets => notices.push(format!("Saved passwords are unavailable ({e}).")),
+                Part::State => log::warn!("couldn’t open the state file (no history or restored tabs): {e}"),
             }
-            Err(e) => {
-                notices.push(format!("Saved passwords are unavailable ({e})."));
-                None
-            }
-        };
+        }
+        let (connections, showing_samples) = service.listed_connections();
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         // When the focused element goes away (e.g. the grid, on switching to Structure), nothing would
         // have focus and the window's shortcuts (new script, close tab) would stop working.
         let focus_lost = cx.on_focus_lost(window, |this, window, cx| window.focus(&this.focus, cx));
-        let state = store.as_ref().and_then(|s| match StateStore::open_beside(s.path()) {
-            Ok(state) => Some(Rc::new(RefCell::new(state))),
-            Err(e) => {
-                log::warn!("couldn’t open the state file (no history or restored tabs): {e}");
-                None
-            }
-        });
         // The script editor's text size, as last zoomed; saved whenever it changes.
-        if let Some(size) = state.as_ref().and_then(|s| s.borrow().get(FONT_SIZE_KEY)).and_then(|v| v.parse::<f32>().ok()) {
+        if let Some(size) = service.state_get(FONT_SIZE_KEY).and_then(|v| v.parse::<f32>().ok()) {
             cx.set_global(EditorFontSize(size));
         }
         let font_size = cx.observe_global::<EditorFontSize>(|this, cx| {
             let size = EditorFontSize::get(cx);
-            if let Some(state) = &this.state {
+            if this.service.has_state() {
                 let value = (size != EditorFontSize::DEFAULT).then(|| size.to_string());
-                if let Err(e) = state.borrow_mut().set(FONT_SIZE_KEY, value.as_deref()) {
+                if let Err(e) = this.service.state_set(FONT_SIZE_KEY, value.as_deref()) {
                     log::warn!("couldn’t save the editor’s text size: {e}");
                 }
             }
         });
-        let backups = cx.new(|_| Backups::default());
+        let backups = cx.new(|_| Backups::new(service.clone()));
         // A restore may have created or dropped tables: list them again.
         let restored = cx.subscribe(&backups, |this, _, event: &Restored, cx| {
-            this.schema_changed(&(event.connection_id.clone(), event.database.clone()), cx);
+            this.schema_changed(&event.0, cx);
         });
         // Script text isn't saved as you type: the last of it is saved when the app quits.
         let quit = cx.on_app_quit(|this, cx| {
@@ -374,8 +340,7 @@ impl Workspace {
         let inspector_shown = cx.observe_global::<crate::inspector::ShowInspector>(|this, cx| this.refresh_menus(cx));
         let monitor = cx.spawn(async move |this, cx| Self::monitor(this, cx).await);
         Self {
-            store,
-            state,
+            service,
             restoring: false,
             restore_task: None,
             _quit: Some(quit),
@@ -387,10 +352,6 @@ impl Workspace {
             connections,
             showing_samples,
             notice: (!notices.is_empty()).then(|| notices.join("\n")),
-            secrets,
-            open: HashMap::new(),
-            schema_cache: HashMap::new(),
-            databases: HashMap::new(),
             selected: None,
             database: String::new(),
             schemas: Load::Idle,
@@ -424,18 +385,10 @@ impl Workspace {
         }
     }
 
-    /// Saved connections, or the samples when there are none yet.
-    fn listed_connections(store: Option<&ConnectionStore>) -> (Vec<ConnectionConfig>, bool) {
-        match store.map(|s| s.connections().to_vec()).filter(|c| !c.is_empty()) {
-            Some(connections) => (connections, false),
-            None => (dbcore::mock::connections(), true),
-        }
-    }
-
     /// Lists the saved connections again. When the first ones replace the samples, whatever was
     /// open on a sample (tabs, connections, the selection) goes with them.
     fn reload_connections(&mut self) {
-        let (connections, showing_samples) = Self::listed_connections(self.store.as_ref());
+        let (connections, showing_samples) = self.service.listed_connections();
         if self.showing_samples && !showing_samples {
             let samples: Vec<String> = self.connections.iter().map(|c| c.id.clone()).collect();
             for id in &samples {
@@ -451,25 +404,24 @@ impl Workspace {
         self.showing_samples = showing_samples;
     }
 
-    /// Drops everything opened or cached for connection `id` (it was edited or deleted), its tabs too.
-    fn forget(&mut self, id: &str) {
-        self.tabs.retain(|tab| tab.key.0 != id);
+    /// Drops everything opened or cached for connection `id` (it was edited or deleted), its tabs
+    /// too. Returns its connections, for closing.
+    fn forget(&mut self, id: &str) -> Vec<Arc<Connection>> {
+        self.tabs.retain(|tab| tab.key.connection_id != id);
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
-        self.open.retain(|(open, _), _| open != id);
-        self.schema_cache.retain(|(cached, _), _| cached != id);
-        self.databases.remove(id);
         self.users.remove(id);
         self.expanded.remove(id);
         self.lost.remove(id);
         self.failed.remove(id);
+        self.service.forget(id)
     }
 
     // MARK: editing connections
 
     fn open_editor(&mut self, original: Option<ConnectionConfig>, window: &mut Window, cx: &mut Context<Self>) {
         let title = if original.is_some() { "Edit Connection" } else { "New Connection" };
-        let secrets = self.secrets.clone();
-        let editor = cx.new(|cx| ConnectionEditor::new(original, secrets, window, cx));
+        let service = self.service.clone();
+        let editor = cx.new(|cx| ConnectionEditor::new(original, service, window, cx));
         let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let (editor, workspace) = (editor.clone(), workspace.clone());
@@ -509,38 +461,23 @@ impl Workspace {
             }
         };
         let is_new = editor.read(cx).is_new();
-        let Some(store) = self.store.as_mut() else {
+        if !self.service.has_store() {
             editor.update(cx, |e, cx| e.show_error("The connection store isn’t available.".into(), cx));
             return false;
-        };
-        let saved = match store.upsert(config) {
+        }
+        // The store, then the password and SSH secret (dropped with the tunnel, or for the agent).
+        let dbservice::Saved { config: saved, problems } = match self.service.save(SaveRequest { config, password, ssh_secret }) {
             Ok(saved) => saved,
             Err(e) => {
                 editor.update(cx, |ed, cx| ed.show_error(e.to_string(), cx));
                 return false;
             }
         };
-        if let Some(password) = password {
-            match &self.secrets {
-                Some(secrets) => {
-                    if let Err(e) = secrets::save_password(secrets.as_ref(), &saved.id, Some(&password)) {
-                        editor.update(cx, |ed, cx| ed.show_error(format!("Saved, but the password wasn’t: {e}"), cx));
-                    }
-                }
-                None => log::warn!("no keyring: the password for {} isn’t saved", saved.name),
-            }
-        }
-        // The SSH password or passphrase: saved when typed, dropped with the tunnel (or for the agent).
-        let ssh_account = secrets::ssh_account(&saved.id);
-        let keeps_ssh_secret = saved.ssh.as_ref().is_some_and(|s| s.auth != dbcore::SshAuth::Agent);
-        if let Some(secrets) = &self.secrets {
-            let result = match (&ssh_secret, keeps_ssh_secret) {
-                (Some(secret), true) => secrets::save_password(secrets.as_ref(), &ssh_account, Some(secret)),
-                (_, false) => secrets::save_password(secrets.as_ref(), &ssh_account, None),
-                (None, true) => Ok(()),
-            };
-            if let Err(e) = result {
-                editor.update(cx, |ed, cx| ed.show_error(format!("Saved, but the SSH password wasn’t: {e}"), cx));
+        for problem in problems {
+            if problem.secret == SecretKind::Password && !self.service.has_secrets() {
+                log::warn!("no keyring: the password for {} isn’t saved", saved.name);
+            } else {
+                editor.update(cx, |ed, cx| ed.show_error(problem.to_string(), cx));
             }
         }
         self.reload_connections();
@@ -568,8 +505,7 @@ impl Workspace {
     /// Closes the connection and its tabs; when it's selected, the window goes back to how it
     /// looks at launch (like the macOS app).
     fn disconnect(&mut self, id: &str, cx: &mut Context<Self>) {
-        let open: Vec<Arc<Connection>> = self.open.iter().filter(|((c, _), _)| c == id).map(|(_, c)| c.clone()).collect();
-        self.forget(id);
+        let open = self.forget(id);
         if self.selected.as_deref() == Some(id) {
             self.selected = None;
             self.schemas = Load::Idle;
@@ -584,8 +520,7 @@ impl Workspace {
 
     /// Closes every open connection (see [`Self::disconnect`]).
     fn disconnect_all(&mut self, cx: &mut Context<Self>) {
-        let mut ids: Vec<String> = self.open.keys().map(|(c, _)| c.clone()).collect();
-        ids.sort();
+        let mut ids: Vec<String> = self.service.open_connections().into_iter().map(|(t, _)| t.connection_id).collect();
         ids.dedup();
         for id in ids {
             self.disconnect(&id, cx);
@@ -594,59 +529,43 @@ impl Workspace {
 
     /// Adds a copy named "… copy", with the same password, and selects it.
     fn duplicate(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
-        let Some(store) = self.store.as_mut() else { return };
-        let mut copy = config.clone();
-        copy.id = String::new();
-        copy.name = format!("{} copy", config.name);
-        copy.password = None;
-        let saved = match store.upsert(copy) {
-            Ok(saved) => saved,
-            Err(e) => {
-                self.notice = Some(format!("Couldn’t duplicate “{}”: {e}", config.name));
-                cx.notify();
-                return;
-            }
-        };
-        self.reload_connections();
-        let (secrets, from, to) = (self.secrets.clone(), config.id.clone(), saved.id.clone());
+        if !self.service.has_store() {
+            return;
+        }
+        let service = self.service.clone();
         cx.spawn(async move |this, cx| {
             // The keyring can block (or prompt), so off the UI thread; selected once it's copied.
-            if let Some(secrets) = secrets {
-                cx.background_executor()
-                    .spawn(async move {
-                        if let Ok(Some(password)) = secrets.password(&from) {
-                            if let Err(e) = secrets::save_password(secrets.as_ref(), &to, Some(&password)) {
-                                log::warn!("the copy’s password wasn’t saved: {e}");
-                            }
+            let name = config.name.clone();
+            let result = cx.background_executor().spawn(async move { service.duplicate(&config) }).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(saved) => {
+                        for problem in &saved.problems {
+                            log::warn!("the copy’s {} wasn’t saved: {}", problem.secret.label(), problem.error);
                         }
-                        if let Ok(Some(secret)) = secrets.password(&secrets::ssh_account(&from)) {
-                            if let Err(e) = secrets::save_password(secrets.as_ref(), &secrets::ssh_account(&to), Some(&secret)) {
-                                log::warn!("the copy’s SSH password wasn’t saved: {e}");
-                            }
-                        }
-                    })
-                    .await;
-            }
-            this.update(cx, |this, cx| this.select_connection(saved.id, cx)).ok();
+                        this.reload_connections();
+                        this.select_connection(saved.config.id, cx);
+                    }
+                    Err(e) => this.notice = Some(format!("Couldn’t duplicate “{name}”: {e}")),
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
-        cx.notify();
     }
 
     /// Copies the connection's URL, its saved password included (like the macOS app).
     fn copy_url(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
-        let secrets = self.secrets.clone();
+        let service = self.service.clone();
         cx.spawn(async move |_, cx| {
-            let config = cx
-                .background_executor()
-                .spawn(async move {
-                    match secrets {
-                        Some(store) => secrets::with_password(store.as_ref(), config.clone()).unwrap_or(config),
-                        None => config,
-                    }
-                })
-                .await;
-            cx.update(|cx| copy(config.to_url(true), cx));
+            // The keyring can block (or prompt): off the UI thread.
+            match cx.background_executor().spawn(async move { service.url(&config.id, true) }).await {
+                Ok(url) => {
+                    cx.update(|cx| copy(url, cx));
+                }
+                Err(e) => log::warn!("couldn’t copy the URL: {e}"),
+            }
         })
         .detach();
     }
@@ -700,14 +619,9 @@ impl Workspace {
         };
         dialog.update(cx, |d, cx| d.set_creating(true, cx));
         // Any open session on that server will do; else a short-lived one.
-        let existing = self.open.iter().find(|((id, _), _)| *id == config.id).map(|(_, c)| c.clone());
-        let secrets = self.secrets.clone();
+        let service = self.service.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let connection = match existing {
-                Some(connection) => connection,
-                None => new_connection(config.clone(), secrets, cx.background_executor().clone()).await,
-            };
-            match connection.create_database(name.clone()).await {
+            match service.create_database(&config.id, &name).await {
                 Ok(()) => {
                     this.update_in(cx, |w, window, cx| {
                         window.close_dialog(cx);
@@ -723,14 +637,13 @@ impl Workspace {
         .detach();
     }
 
-    /// Lists the server's databases again and opens the new one.
+    /// Lists the server's databases again (the service forgot them) and opens the new one.
     fn database_created(&mut self, config: ConnectionConfig, name: String, cx: &mut Context<Self>) {
-        self.databases.remove(&config.id);
         self._new_database = None;
         if self.selected.as_deref() != Some(config.id.as_str()) {
             self.select_connection(config.id.clone(), cx);
         }
-        if Self::browses_databases(&config) {
+        if dbservice::browses_databases(&config) {
             self.select_database(name, cx);
         } else {
             self.load_schemas_with(true, false, cx);
@@ -746,18 +659,18 @@ impl Workspace {
         } else {
             config.default_database().to_string()
         };
-        let databases = if Self::browses_databases(config) { self.databases.get(&config.id).cloned().unwrap_or_default() } else { Vec::new() };
+        let databases = if dbservice::browses_databases(config) { self.service.databases(&config.id).unwrap_or_default() } else { Vec::new() };
         (database, databases)
     }
 
     fn open_dump(&mut self, config: ConnectionConfig, preset: DumpPreset, window: &mut Window, cx: &mut Context<Self>) {
         let (database, databases) = self.backup_database(&config);
-        let secrets = self.secrets.clone();
-        let dialog = cx.new(|cx| DumpDialog::new(config, database, databases, preset, secrets, cx));
+        let service = self.service.clone();
+        let dialog = cx.new(|cx| DumpDialog::new(service, config, database, databases, preset, cx));
         let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |modal, _, cx| {
             let ready = dialog.read(cx).can_dump();
-            let title = format!("Dump “{}”", dbcore::dump::target_name(&dialog.read(cx).target()));
+            let title = format!("Dump “{}”", dbcore::dump::target_name(&dialog.read(cx).target_config()));
             let (dialog, workspace) = (dialog.clone(), workspace.clone());
             let footer = h_flex()
                 .w_full()
@@ -777,9 +690,9 @@ impl Workspace {
 
     /// Asks where to save, then dumps in the background.
     fn start_dump(&mut self, dialog: Entity<DumpDialog>, window: &mut Window, cx: &mut Context<Self>) {
-        let (target, options, name, secrets) = {
+        let (target, options, name) = {
             let d = dialog.read(cx);
-            (d.target(), d.options(), d.file_name(), d.secrets())
+            (d.target(), d.options(), d.file_name())
         };
         let directory = dbcore::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let path = cx.prompt_for_new_path(&directory, Some(&name));
@@ -788,7 +701,7 @@ impl Workspace {
             let Ok(Ok(Some(path))) = path.await else { return };
             cx.update(|window, cx| {
                 window.close_dialog(cx);
-                backups.update(cx, |b, cx| b.dump(target, secrets, path, options, cx));
+                backups.update(cx, |b, cx| b.dump(target, path, options, cx));
             })
             .ok();
         })
@@ -811,7 +724,7 @@ impl Workspace {
         let dialog = cx.new(|_| restore);
         let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |modal, _, cx| {
-            let title = format!("Restore into “{}”", dbcore::dump::target_name(&dialog.read(cx).target()));
+            let title = format!("Restore into “{}”", dbcore::dump::target_name(&dialog.read(cx).target_config()));
             let (dialog, workspace) = (dialog.clone(), workspace.clone());
             let footer = h_flex()
                 .w_full()
@@ -821,17 +734,12 @@ impl Workspace {
                 .child(Button::new("restore").primary().label("Restore").on_click({
                     let dialog = dialog.clone();
                     move |_, window, cx| {
-                        let (target, options, file, database) = {
+                        let (target, options, file) = {
                             let d = dialog.read(cx);
-                            (d.target(), d.options(), d.file.clone(), d.database())
+                            (d.target(), d.options(), d.file.clone())
                         };
                         window.close_dialog(cx);
-                        workspace
-                            .update(cx, |w, cx| {
-                                let secrets = w.secrets.clone();
-                                w.backups.update(cx, |b, cx| b.restore(target, secrets, file, options, database, cx));
-                            })
-                            .ok();
+                        workspace.update(cx, |w, cx| w.backups.update(cx, |b, cx| b.restore(target, file, options, cx))).ok();
                     }
                 }));
             modal.title(title).w(px(500.)).child(dialog).footer(footer)
@@ -842,29 +750,15 @@ impl Workspace {
 
     /// Opens the rows a foreign key leads to, in a tab of their own after the current one.
     fn open_related(&mut self, key: TargetKey, related: RelatedRows, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(connection) = self.open.get(&key).cloned() else { return };
-        let table = self
-            .schema_cache
-            .get(&key)
-            .and_then(|schemas| schemas.iter().find(|s| s.name == related.schema))
-            .and_then(|schema| schema.tables.iter().find(|t| t.name == related.table))
-            .cloned()
-            .unwrap_or_else(|| TableInfo::new(related.schema.clone(), related.table.clone()));
-        let dialect = Dialect(connection.config().kind);
-        if !related.columns.is_empty() {
-            let filter = dialect.match_filter(&related.columns, &related.values);
-            return self.open_filtered(key, connection, table, filter, window, cx);
-        }
-        // SQLite can reference a primary key without naming its columns: look them up.
+        let Some(connection) = self.service.cached(&key) else { return };
+        let table = self.service.table_info(&key, &related.schema, &related.table);
+        let service = self.service.clone();
+        // SQLite can reference a primary key without naming its columns: the service looks them up.
         cx.spawn_in(window, async move |this, cx| {
-            let columns: Vec<String> = match connection.describe_table(table.clone()).await {
-                Ok(structure) => structure.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect(),
-                Err(e) => return log::warn!("couldn’t find {}’s primary key: {e}", table.name),
+            let filter = match service.related_filter(&connection, &table, &related.columns, &related.values).await {
+                Ok(filter) => filter,
+                Err(e) => return log::warn!("couldn’t open the related rows: {e}"),
             };
-            if columns.len() != related.values.len() {
-                return log::warn!("{}’s primary key doesn’t match the foreign key", table.name);
-            }
-            let filter = dialect.match_filter(&columns, &related.values);
             this.update_in(cx, |w, window, cx| w.open_filtered(key, connection, table, filter, window, cx)).ok();
         })
         .detach();
@@ -897,9 +791,10 @@ impl Workspace {
         self.activate(ix, window, cx);
     }
 
-    /// A script ran DDL on `key`: its tables are listed again, in the background when shown.
+    /// A script ran DDL on `key` (or a restore ended): its tables are listed again, in the
+    /// background when shown.
     fn schema_changed(&mut self, key: &TargetKey, cx: &mut Context<Self>) {
-        self.schema_cache.remove(key);
+        self.service.schema_changed(key);
         if self.target().is_some_and(|(_, current)| current == *key) {
             self.load_schemas_with(true, true, cx);
         }
@@ -908,8 +803,8 @@ impl Workspace {
     // MARK: importing
 
     fn open_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let existing = self.store.as_ref().map(|s| s.connections().to_vec()).unwrap_or_default();
-        let import = cx.new(|cx| ImportDialog::new(existing, cx));
+        let service = self.service.clone();
+        let import = cx.new(|cx| ImportDialog::new(service, cx));
         let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let (import, workspace) = (import.clone(), workspace.clone());
@@ -953,36 +848,19 @@ impl Workspace {
     /// Saves the dialog's checked connections, their passwords in the keyring. Returns whether to close it.
     fn import_connections(&mut self, dialog: &Entity<ImportDialog>, cx: &mut Context<Self>) -> bool {
         let configs = dialog.read(cx).selected_configs();
-        let Some(store) = self.store.as_mut() else {
+        if !self.service.has_store() {
             dialog.update(cx, |d, cx| d.show_error("The connection store isn’t available.".into(), cx));
             return false;
-        };
-        let mut problems = Vec::new();
-        let mut imported = 0;
-        for mut config in configs {
-            // Imported connections have no id yet, so each one is added (never replaces another).
-            let password = config.password.take().filter(|p| !p.is_empty());
-            let ssh_secret = config.ssh.as_mut().and_then(|s| s.secret.take()).filter(|p| !p.is_empty());
-            let name = config.name.clone();
-            match store.upsert(config) {
-                Ok(saved) => {
-                    imported += 1;
-                    let secrets_to_save = [(saved.id.clone(), password, "password"), (secrets::ssh_account(&saved.id), ssh_secret, "SSH password")];
-                    for (account, secret, what) in secrets_to_save {
-                        let Some(secret) = secret else { continue };
-                        match &self.secrets {
-                            Some(secrets) => {
-                                if let Err(e) = secrets::save_password(secrets.as_ref(), &account, Some(&secret)) {
-                                    problems.push(format!("{name}: the {what} wasn’t saved ({e})"));
-                                }
-                            }
-                            None => problems.push(format!("{name}: the {what} wasn’t saved (no keyring)")),
-                        }
-                    }
-                }
-                Err(e) => problems.push(format!("{name}: {e}")),
-            }
         }
+        // Imported connections have no id yet, so each one is added (never replaces another).
+        let dbservice::Import { imported, problems } = match self.service.import(configs) {
+            Ok(import) => import,
+            Err(e) => {
+                dialog.update(cx, |d, cx| d.show_error(e.to_string(), cx));
+                return false;
+            }
+        };
+        let imported = imported.len();
         if imported == 0 {
             dialog.update(cx, |d, cx| d.show_error(problems.join("\n"), cx));
             return false;
@@ -1014,17 +892,13 @@ impl Workspace {
     }
 
     fn delete_connection(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(store) = self.store.as_mut() else { return };
-        if let Err(e) = store.remove(id) {
-            log::error!("couldn’t delete the connection: {e}");
+        if !self.service.has_store() {
             return;
         }
-        if let Some(secrets) = &self.secrets {
-            let _ = secrets::save_password(secrets.as_ref(), id, None);
-            let _ = secrets::save_password(secrets.as_ref(), &secrets::ssh_account(id), None);
-        }
-        if let Some(state) = &self.state {
-            let _ = state.borrow_mut().clear_history(id);
+        // The store, then its passwords and history.
+        if let Err(e) = self.service.delete(id) {
+            log::error!("couldn’t delete the connection: {e}");
+            return;
         }
         self.forget(id);
         if self.selected.as_deref() == Some(id) {
@@ -1046,7 +920,7 @@ impl Workspace {
             return;
         }
         let Some(config) = self.connections.iter().find(|c| c.id == id) else { return };
-        let database = self.remembered_database(config).unwrap_or_else(|| config.default_database().to_string());
+        let database = self.service.target_for(config, None).database;
         self.selected = Some(id);
         self.database = database;
         self.collapsed.clear();
@@ -1054,29 +928,14 @@ impl Workspace {
         self.save_session(cx);
     }
 
-    /// Whether the title offers the server's other databases.
-    fn browses_databases(config: &ConnectionConfig) -> bool {
-        config.show_all_databases && config.supports_multiple_databases()
-    }
-
-    /// The database last picked for `config`, kept in the connection store (shared with the macOS app).
-    fn remembered_database(&self, config: &ConnectionConfig) -> Option<String> {
-        if !Self::browses_databases(config) {
-            return None;
-        }
-        self.store.as_ref()?.last_database(&config.id).filter(|db| db != config.default_database())
-    }
-
     fn select_database(&mut self, database: String, cx: &mut Context<Self>) {
         let Some(config) = self.selected_connection().cloned() else { return };
         if database == self.database {
             return;
         }
-        let remembered = (database != config.default_database()).then_some(database.as_str());
-        if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store.set_last_database(&config.id, remembered) {
-                log::warn!("couldn’t remember the database: {e}");
-            }
+        // Kept in the connection store (shared with the macOS app).
+        if let Err(e) = self.service.set_last_database(&config.id, &database) {
+            log::warn!("couldn’t remember the database: {e}");
         }
         self.database = database;
         self.collapsed.clear();
@@ -1086,10 +945,7 @@ impl Workspace {
 
     fn target(&self) -> Option<(ConnectionConfig, TargetKey)> {
         let config = self.selected_connection()?;
-        let config =
-            if self.database == config.default_database() { config.clone() } else { config.with_database(&self.database) };
-        let key = (config.id.clone(), self.database.clone());
-        Some((config, key))
+        Some((dbservice::pointed_at(config, &self.database), TargetKey::new(config.id.clone(), self.database.clone())))
     }
 
     fn load_schemas(&mut self, cx: &mut Context<Self>) {
@@ -1099,12 +955,11 @@ impl Workspace {
     /// Lists the selected target's tables. `refresh`: ignore what's cached (and list the databases
     /// again too); `quiet`: keep showing the current list until the new one arrives.
     fn load_schemas_with(&mut self, refresh: bool, quiet: bool, cx: &mut Context<Self>) {
-        let Some((config, key)) = self.target() else { return };
+        let Some((_, key)) = self.target() else { return };
         if refresh {
-            self.schema_cache.remove(&key);
-        }
-        if let Some(schemas) = self.schema_cache.get(&key) {
-            self.schemas = Load::Loaded(schemas.clone());
+            self.service.schema_changed(&key);
+        } else if let Some(schemas) = self.service.cached_schemas(&key) {
+            self.schemas = Load::Loaded(schemas);
             self.schemas_task = None;
             cx.notify();
             return;
@@ -1112,60 +967,32 @@ impl Workspace {
         if !(quiet && matches!(self.schemas, Load::Loaded(_))) {
             self.schemas = Load::Loading;
         }
-        let existing = self.open.get(&key).cloned();
-        let secrets = self.secrets.clone();
-        let list_databases = Self::browses_databases(&config) && (refresh || !self.databases.contains_key(&config.id));
+        let service = self.service.clone();
         self.schemas_task = Some(cx.spawn(async move |this, cx| {
-            let connection = match existing {
-                Some(connection) => connection,
-                None => {
-                    // Reading the keyring can block (or prompt), so keep it off the UI thread.
-                    let config = cx
-                        .background_executor()
-                        .spawn(async move {
-                            match secrets {
-                                Some(store) => secrets::with_password(store.as_ref(), config.clone()).unwrap_or(config),
-                                None => config,
-                            }
-                        })
-                        .await;
-                    Arc::new(Connection::new(config))
-                }
-            };
-            let result = connection.list_schemas().await;
-            // Not fatal when it fails: the connection still works with its own database.
-            let databases = if list_databases && result.is_ok() { connection.list_databases().await.ok() } else { None };
+            // Reuses the target's connection, or opens one (secrets read off the UI thread).
+            let result = service.load(&key, refresh).await;
             this.update(cx, |this, cx| {
                 let current = this.target().map(|(_, k)| k);
                 if current.as_ref() != Some(&key) {
                     return;
                 }
                 match result {
-                    Ok(schemas) => {
-                        this.failed.remove(&key.0);
-                        this.open.insert(key.clone(), connection);
-                        this.schema_cache.insert(key.clone(), schemas.clone());
-                        this.schemas = Load::Loaded(schemas);
+                    Ok(loaded) => {
+                        this.failed.remove(&key.connection_id);
+                        this.schemas = Load::Loaded(loaded.schemas);
+                        // The remembered database was dropped or renamed: back to the connection's own.
+                        if loaded.database_gone {
+                            if let Some(default) = this.selected_connection().map(|c| c.default_database().to_string()) {
+                                this.database = default;
+                                this.load_schemas(cx);
+                            }
+                        }
                     }
                     // A background refresh: keep the list it couldn't replace.
                     Err(e) if quiet && matches!(this.schemas, Load::Loaded(_)) => log::warn!("couldn’t list the tables again: {e}"),
                     Err(e) => {
-                        this.failed.insert(key.0.clone());
+                        this.failed.insert(key.connection_id.clone());
                         this.schemas = Load::Failed(e.to_string());
-                    }
-                }
-                if let Some(databases) = databases {
-                    let (id, database) = key;
-                    let gone = !databases.contains(&database);
-                    this.databases.insert(id.clone(), databases);
-                    // The remembered database was dropped or renamed: back to the connection's own.
-                    let default = this.selected_connection().map(|c| c.default_database().to_string());
-                    if let Some(default) = default.filter(|d| gone && *d != database) {
-                        if let Some(store) = this.store.as_mut() {
-                            let _ = store.set_last_database(&id, None);
-                        }
-                        this.database = default;
-                        this.load_schemas(cx);
                     }
                 }
                 cx.notify();
@@ -1179,7 +1006,7 @@ impl Workspace {
 
     fn open_connection(&self) -> Option<(TargetKey, Arc<Connection>)> {
         let (_, key) = self.target()?;
-        let connection = self.open.get(&key)?.clone();
+        let connection = self.service.cached(&key)?;
         Some((key, connection))
     }
 
@@ -1235,9 +1062,8 @@ impl Workspace {
         let Some((key, connection)) = self.open_connection() else { return };
         self.scripts_made += 1;
         let name = format!("SQL {}", self.scripts_made);
-        let target = self.target_label(&key);
-        let history = self.history_for(&key);
-        let view = TabView::Script(cx.new(|cx| ScriptTab::new(connection, name, target, history, window, cx)));
+        let (label, runs) = (self.target_label(&key), self.script_target(&key));
+        let view = TabView::Script(cx.new(|cx| ScriptTab::new(connection, name, label, runs, window, cx)));
         let events = self.tab_events(&key, &view, window, cx);
         self.tabs.push(OpenTab { key, view, _events: events });
         self.activate(self.tabs.len() - 1, window, cx);
@@ -1268,46 +1094,42 @@ impl Workspace {
 
     /// Opens a script's results in a tab after the current one ("SQL 1 Results", then "… 2").
     fn open_results(&mut self, key: TargetKey, request: OpenResults, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(connection) = self.open.get(&key).cloned() else { return };
+        let Some(connection) = self.service.cached(&key) else { return };
         let base = format!("{} Results", request.source);
         let taken: HashSet<String> = self.tabs.iter().map(|t| t.title(cx)).collect();
         let title = std::iter::once(base.clone())
             .chain((2..).map(|n| format!("{base} {n}")))
             .find(|t| !taken.contains(t))
             .unwrap_or(base);
-        let (target, history) = (self.target_label(&key), self.history_for(&key));
-        let view = TabView::Result(cx.new(|cx| ResultTab::new(connection, title, target, request, history, window, cx)));
+        let (label, runs) = (self.target_label(&key), self.script_target(&key));
+        let view = TabView::Result(cx.new(|cx| ResultTab::new(connection, title, label, request, runs, window, cx)));
         let events = self.tab_events(&key, &view, window, cx);
         let ix = (self.active + 1).min(self.tabs.len());
         self.tabs.insert(ix, OpenTab { key, view, _events: events });
         self.activate(ix, window, cx);
     }
 
-    fn history_for(&self, key: &TargetKey) -> Option<History> {
-        Some(History { state: self.state.clone()?, connection_id: key.0.clone(), database: key.1.clone() })
+    /// Where a script on `key` runs (and records its history).
+    fn script_target(&self, key: &TargetKey) -> ScriptTarget {
+        ScriptTarget { service: self.service.clone(), target: key.clone() }
     }
 
     /// "conn · db" (or just the connection's name) for a script's header.
     fn target_label(&self, key: &TargetKey) -> String {
-        match self.connections.iter().find(|c| c.id == key.0) {
-            Some(c) if Self::browses_databases(c) && c.name != key.1 => format!("{} · {}", c.name, key.1),
-            Some(c) => c.name.clone(),
-            None => key.1.clone(),
-        }
+        self.service.target_label(key)
     }
 
     // MARK: session
 
     fn save_session(&self, cx: &App) {
-        let Some(state) = &self.state else { return };
-        if self.restoring {
+        if !self.service.has_state() || self.restoring {
             return;
         }
         let tabs = self
             .tabs
             .iter()
             .filter_map(|tab| {
-                let (connection, database) = tab.key.clone();
+                let TargetKey { connection_id: connection, database } = tab.key.clone();
                 Some(match &tab.view {
                     // Users tabs aren't reopened: the middle column is back to tables at launch.
                     TabView::Users(_) => return None,
@@ -1339,7 +1161,7 @@ impl Workspace {
         };
         match serde_json::to_string(&session) {
             Ok(json) => {
-                if let Err(e) = state.borrow_mut().set(SESSION_KEY, Some(&json)) {
+                if let Err(e) = self.service.state_set(SESSION_KEY, Some(&json)) {
                     log::warn!("couldn’t save the open tabs: {e}");
                 }
             }
@@ -1349,7 +1171,7 @@ impl Workspace {
 
     /// Reopens last session's selection and tabs (tabs whose connection fails are skipped).
     pub fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(json) = self.state.as_ref().and_then(|s| s.borrow().get(SESSION_KEY)) else { return };
+        let Some(json) = self.service.state_get(SESSION_KEY) else { return };
         let session: Session = match serde_json::from_str(&json) {
             Ok(session) => session,
             Err(e) => return log::warn!("ignoring the saved tabs: {e}"),
@@ -1364,34 +1186,24 @@ impl Workspace {
             return;
         }
         self.restoring = true;
-        let secrets = self.secrets.clone();
+        let service = self.service.clone();
         self.restore_task = Some(cx.spawn_in(window, async move |this, cx| {
             for saved in session.tabs {
                 let key = match &saved {
                     SavedTab::Table { connection, database, .. } | SavedTab::Script { connection, database, .. } => {
-                        (connection.clone(), database.clone())
+                        TargetKey::new(connection.clone(), database.clone())
                     }
                 };
-                let Ok(Some((config, existing))) = this.update(cx, |w, _| {
-                    let config = w.connections.iter().find(|c| c.id == key.0)?;
-                    let config =
-                        if key.1 == config.default_database() { config.clone() } else { config.with_database(&key.1) };
-                    Some((config, w.open.get(&key).cloned()))
-                }) else {
+                let listed = this.update(cx, |w, _| w.connections.iter().any(|c| c.id == key.connection_id)).unwrap_or(false);
+                if !listed {
                     continue;
-                };
-                let connection = match existing {
-                    Some(connection) => connection,
-                    None => {
-                        let connection = new_connection(config, secrets.clone(), cx.background_executor().clone()).await;
-                        if let Err(e) = connection.connect().await {
-                            log::warn!("not reopening a tab on {}: {e}", key.0);
-                            continue;
-                        }
-                        {
-                            let mine = connection.clone();
-                            this.update(cx, |w, _| w.open.entry(key.clone()).or_insert(mine).clone()).unwrap_or(connection)
-                        }
+                }
+                // Connects now; a target that fails isn't kept (its tabs are skipped).
+                let connection = match service.connected(&key).await {
+                    Ok(connection) => connection,
+                    Err(e) => {
+                        log::warn!("not reopening a tab on {}: {e}", key.connection_id);
+                        continue;
                     }
                 };
                 this.update_in(cx, |w, window, cx| w.push_restored(key, saved, connection, window, cx)).ok();
@@ -1423,9 +1235,9 @@ impl Workspace {
                 if let Some(n) = name.strip_prefix("SQL ").and_then(|n| n.parse::<usize>().ok()) {
                     self.scripts_made = self.scripts_made.max(n);
                 }
-                let (target, history) = (self.target_label(&key), self.history_for(&key));
+                let (label, runs) = (self.target_label(&key), self.script_target(&key));
                 TabView::Script(cx.new(|cx| {
-                    let mut tab = ScriptTab::new(connection, name, target, history, window, cx);
+                    let mut tab = ScriptTab::new(connection, name, label, runs, window, cx);
                     tab.set_text(&sql, window, cx);
                     tab
                 }))
@@ -1651,16 +1463,8 @@ impl Workspace {
     async fn monitor(this: WeakEntity<Self>, cx: &mut AsyncApp) {
         loop {
             cx.background_executor().timer(MONITOR_INTERVAL).await;
-            let Ok(open) = this.update(cx, |w, _| w.open.iter().map(|((id, _), c)| (id.clone(), c.clone())).collect::<Vec<_>>())
-            else {
-                return;
-            };
-            let mut alive: HashMap<String, bool> = HashMap::new();
-            for (id, connection) in open {
-                let connected = connection.is_connected().await;
-                *alive.entry(id).or_default() |= connected;
-            }
-            let lost: HashSet<String> = alive.into_iter().filter(|(_, connected)| !connected).map(|(id, _)| id).collect();
+            let Ok(service) = this.update(cx, |w, _| w.service.clone()) else { return };
+            let lost = service.lost_connections().await;
             let updated = this.update(cx, |w, cx| {
                 if w.lost != lost {
                     w.lost = lost;
@@ -1747,9 +1551,9 @@ impl Workspace {
             }
         }
         let current = self.target().map(|(_, key)| key);
-        let mut listed: Vec<&TargetKey> = self.schema_cache.keys().collect();
-        listed.sort_by_key(|key| (Some(*key) != current.as_ref(), self.target_label(key)));
-        for key in listed {
+        let mut listed = self.service.schema_targets();
+        listed.sort_by_key(|key| (Some(key) != current.as_ref(), self.target_label(key)));
+        for key in &listed {
             entries.extend(self.table_entries(key));
         }
         entries
@@ -1759,7 +1563,7 @@ impl Workspace {
     fn table_entries(&self, key: &TargetKey) -> Vec<palette::Entry> {
         let target = self.target_label(key);
         let mut entries = Vec::new();
-        for schema in self.schema_cache.get(key).into_iter().flatten() {
+        for schema in self.service.cached_schemas(key).iter().flatten() {
             for table in &schema.tables {
                 let qualified = if schema.name.is_empty() { table.name.clone() } else { format!("{}.{}", schema.name, table.name) };
                 let detail = if schema.name.is_empty() { target.clone() } else { format!("{} \u{b7} {target}", schema.name) };
@@ -1769,7 +1573,7 @@ impl Workspace {
                     detail: Some(detail.into()),
                     icon: Icon::new(if view { IconName::Eye } else { IconName::FileText }),
                     shortcut: None,
-                    target: Target::Table { connection: key.0.clone(), database: key.1.clone(), table: table.clone() },
+                    target: Target::Table { connection: key.connection_id.clone(), database: key.database.clone(), table: table.clone() },
                 });
             }
         }
@@ -1788,7 +1592,7 @@ impl Workspace {
 
     /// The tables of `key` for the palette, once listed.
     pub(crate) fn palette_tables(&self, key: &TargetKey, _: &App) -> (PaletteTables, Vec<palette::Entry>) {
-        if self.schema_cache.contains_key(key) {
+        if self.service.cached_schemas(key).is_some() {
             return (PaletteTables::Ready, self.table_entries(key));
         }
         let shown = self.target().is_some_and(|(_, k)| &k == key);
@@ -1817,9 +1621,9 @@ impl Workspace {
         } else if any.is::<EditConnection>() {
             self.selected_connection().is_some()
         } else if any.is::<Disconnect>() {
-            self.selected.as_deref().is_some_and(|id| self.open.keys().any(|(c, _)| c == id))
+            self.selected.as_deref().is_some_and(|id| self.is_open(id))
         } else if any.is::<DisconnectAll>() {
-            !self.open.is_empty()
+            !self.service.open_connections().is_empty()
         } else if any.is::<ShowUsers>() {
             self.selected_connection().is_some_and(|c| dbcore::access::features(c.kind).is_some())
         } else if any.is::<ShowData>() || any.is::<ShowStructure>() || any.is::<AddRow>() {
@@ -1873,15 +1677,20 @@ impl Workspace {
         let Some(key) = self.script_after_connect.clone() else { return };
         if self.target().map(|(_, k)| k).as_ref() != Some(&key) || matches!(self.schemas, Load::Failed(_)) {
             self.script_after_connect = None;
-        } else if self.open.contains_key(&key) {
+        } else if self.service.cached(&key).is_some() {
             self.script_after_connect = None;
             self.new_script(&NewScript, window, cx);
         }
     }
 
     /// The databases listed under `config` in the sidebar: once listed, and only when there's a choice.
-    fn sidebar_databases(&self, config: &ConnectionConfig) -> Option<&Vec<String>> {
-        self.databases.get(&config.id).filter(|d| d.len() > 1 && Self::browses_databases(config))
+    fn sidebar_databases(&self, config: &ConnectionConfig) -> Option<Vec<String>> {
+        self.service.databases(&config.id).filter(|d| d.len() > 1 && dbservice::browses_databases(config))
+    }
+
+    /// Whether connection `id` has an open session (its status light).
+    fn is_open(&self, id: &str) -> bool {
+        self.service.open_connections().iter().any(|(target, _)| target.connection_id == id)
     }
 
     fn shows_databases(&self, config: &ConnectionConfig) -> bool {
@@ -2226,7 +2035,7 @@ impl Workspace {
                     if selected {
                         selected_ix = Some(rows.len());
                     }
-                    rows.push(self.database_row(c, database, selected, cx).into_any_element());
+                    rows.push(self.database_row(c, &database, selected, cx).into_any_element());
                 }
             }
         }
@@ -2294,7 +2103,7 @@ impl Workspace {
     /// warnings line up in one column: the status, and the chevron that lists its databases.
     fn connection_row(&self, c: &ConnectionConfig, selected: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
-        let connected = self.open.keys().any(|(id, _)| *id == c.id);
+        let connected = self.is_open(&c.id);
         let lit = connected && !self.lost.contains(&c.id);
         let failed = !connected && self.failed.contains(&c.id);
         let expandable = self.sidebar_databases(c).is_some();
@@ -2480,10 +2289,10 @@ impl Workspace {
             Load::Loading => "Loading…".into(),
             _ => connection.summary(),
         };
-        let title = match self.databases.get(&connection.id).filter(|_| Self::browses_databases(connection)) {
+        let title = match self.service.databases(&connection.id).filter(|_| dbservice::browses_databases(connection)) {
             Some(databases) => {
                 let this = cx.entity().downgrade();
-                let (databases, current) = (databases.clone(), self.database.clone());
+                let current = self.database.clone();
                 let config = connection.clone();
                 // A MySQL connection with no database of its own browses them all: no database to show.
                 let label = if self.database.is_empty() { connection.name.clone() } else { self.database.clone() };
@@ -2855,14 +2664,6 @@ impl Render for Workspace {
 /// write a `create database` for it (not D1's, which are made through Cloudflare's API or wrangler).
 fn can_create_databases(config: &ConnectionConfig) -> bool {
     config.supports_multiple_databases() && Dialect(config.kind).create_database("db").is_ok()
-}
-
-fn open_store() -> dbcore::Result<ConnectionStore> {
-    // DBEAR_CONNECTIONS_FILE points at another store (handy for testing), as in the macOS app.
-    match std::env::var_os("DBEAR_CONNECTIONS_FILE") {
-        Some(path) => ConnectionStore::open(path),
-        None => ConnectionStore::open_default(),
-    }
 }
 
 /// A sidebar group's header (Local, Production…). Clicking it folds the group, like Mail's; the

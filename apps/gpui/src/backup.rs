@@ -1,16 +1,17 @@
 //! Dumps and restores: the options dialogs, and the jobs that run in the background (several at
 //! once; closing a dialog doesn't stop them), shown as cards over the window's bottom-right corner.
-//! The work itself is `dbcore::dump` / `dbcore::restore`, like the macOS app.
+//! The work itself is `dbcore::dump` / `dbcore::restore` (through `dbservice`, which fills the
+//! password and SSH secret and applies the per-database option rules), like the macOS app.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use dbcore::dump::{self, CancelToken, Compression, DataStyle, DumpContent, DumpOptions, DumpProgress, DumpScope, DumpSummary, ProgressFn};
-use dbcore::restore::{self, RestoreOptions, RestoreProgress, RestoreSummary};
-use dbcore::secrets::{self, KeyringSecretStore};
-use dbcore::{Connection, ConnectionConfig, DatabaseKind, Schema, TableInfo, TableKind};
+use dbcore::restore::{RestoreOptions, RestoreProgress, RestoreSummary};
+use dbcore::{ConnectionConfig, DatabaseKind, Schema, TableInfo, TableKind};
+use dbservice::{DumpChoices, Service, Target};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -23,18 +24,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::tabs::plural;
-
-/// `config` with its saved password, read off the UI thread (the keyring can block or prompt).
-async fn with_password(config: ConnectionConfig, secrets: Option<Arc<KeyringSecretStore>>, executor: BackgroundExecutor) -> ConnectionConfig {
-    executor
-        .spawn(async move {
-            match secrets {
-                Some(store) => secrets::with_password(store.as_ref(), config.clone()).unwrap_or(config),
-                None => config,
-            }
-        })
-        .await
-}
 
 /// `12.3 MB`.
 pub fn format_bytes(bytes: u64) -> String {
@@ -49,26 +38,6 @@ pub fn format_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
-}
-
-/// Today's date (UTC) as `2025-06-01`, for default file names.
-fn today() -> String {
-    let days = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86_400) as i64;
-    // Howard Hinnant's civil-from-days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-fn pointed_at(base: &ConnectionConfig, database: &str) -> ConnectionConfig {
-    if database == base.default_database() { base.clone() } else { base.with_database(database) }
 }
 
 /// A row of a form: a label, then the control.
@@ -116,6 +85,7 @@ enum Tables {
 }
 
 pub struct DumpDialog {
+    service: Service,
     /// The saved connection (no password), as stored.
     pub base: ConnectionConfig,
     /// Databases to pick from (servers that show all databases).
@@ -130,33 +100,33 @@ pub struct DumpDialog {
     drop_objects: bool,
     create_database: bool,
     preset: DumpPreset,
-    secrets: Option<Arc<KeyringSecretStore>>,
     _load: Option<Task<()>>,
 }
 
 impl DumpDialog {
     pub fn new(
+        service: Service,
         base: ConnectionConfig,
         database: String,
         databases: Vec<String>,
         preset: DumpPreset,
-        secrets: Option<Arc<KeyringSecretStore>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let choices = DumpChoices::default();
         let mut dialog = Self {
+            service,
             base,
             databases,
             database,
             everything: matches!(preset, DumpPreset::Database),
             tables: Tables::Loading,
             selected: BTreeSet::new(),
-            content: DumpContent::SchemaAndData,
-            compression: Compression::None,
-            data_style: DataStyle::Copy,
-            drop_objects: false,
-            create_database: false,
+            content: choices.content,
+            compression: choices.compression,
+            data_style: choices.data_style,
+            drop_objects: choices.drop_objects,
+            create_database: choices.create_database,
             preset,
-            secrets,
             _load: None,
         };
         dialog.load_tables(cx);
@@ -167,13 +137,14 @@ impl DumpDialog {
         self.base.kind
     }
 
-    /// The connection pointed at the database to dump (no password yet).
-    pub fn target(&self) -> ConnectionConfig {
-        pointed_at(&self.base, &self.database)
+    /// The connection and database to dump.
+    pub fn target(&self) -> Target {
+        Target::new(self.base.id.clone(), self.database.clone())
     }
 
-    pub fn secrets(&self) -> Option<Arc<KeyringSecretStore>> {
-        self.secrets.clone()
+    /// The connection pointed at the database to dump (no password).
+    pub fn target_config(&self) -> ConnectionConfig {
+        dbservice::pointed_at(&self.base, &self.database)
     }
 
     fn set_database(&mut self, database: String, cx: &mut Context<Self>) {
@@ -185,12 +156,17 @@ impl DumpDialog {
 
     fn load_tables(&mut self, cx: &mut Context<Self>) {
         self.tables = Tables::Loading;
-        let (target, secrets) = (self.target(), self.secrets.clone());
+        let (service, target) = (self.service.clone(), self.target());
         self._load = Some(cx.spawn(async move |this, cx| {
-            let config = with_password(target, secrets, cx.background_executor().clone()).await;
-            let connection = Connection::new(config);
-            let result = connection.list_schemas().await;
-            connection.disconnect().await;
+            // A session of its own (with the saved secrets), closed once listed.
+            let result = match service.new_connection(&target).await {
+                Ok(connection) => {
+                    let result = connection.list_schemas().await;
+                    connection.disconnect().await;
+                    result
+                }
+                Err(e) => Err(e),
+            };
             this.update(cx, |this, cx| {
                 this.tables = match result {
                     Ok(schemas) => {
@@ -218,39 +194,27 @@ impl DumpDialog {
     /// Whole database, whole schemas (with their functions, types…), or just some tables.
     fn scope(&self) -> DumpScope {
         let Tables::Loaded(schemas) = &self.tables else { return DumpScope::Database };
-        if self.everything {
-            return DumpScope::Database;
-        }
-        let picked = |t: &TableInfo| self.selected.contains(&(t.schema.clone(), t.name.clone()));
-        let all: Vec<&TableInfo> = schemas.iter().flat_map(|s| &s.tables).collect();
-        if all.iter().all(|t| picked(t)) && schemas.iter().all(|s| !s.tables.is_empty()) {
-            return DumpScope::Database;
-        }
-        let whole: Vec<&Schema> = schemas.iter().filter(|s| !s.tables.is_empty() && s.tables.iter().all(picked)).collect();
-        let rest = all.iter().any(|t| picked(t) && !whole.iter().any(|s| s.name == t.schema));
-        if !rest {
-            return DumpScope::Schemas(whole.iter().map(|s| s.name.clone()).collect());
-        }
-        DumpScope::Tables(all.into_iter().filter(|t| picked(t)).cloned().collect())
+        dbservice::dump_scope(schemas, &self.selected, self.everything)
     }
 
     pub fn can_dump(&self) -> bool {
         self.everything || !self.selected.is_empty()
     }
 
+    /// The choices, with only what applies to this kind of database.
     pub fn options(&self) -> DumpOptions {
-        DumpOptions {
+        let choices = DumpChoices {
             content: self.content,
-            scope: self.scope(),
             compression: self.compression,
-            data_style: if self.kind() == DatabaseKind::Postgres { self.data_style } else { DataStyle::Insert },
-            drop_objects: self.content != DumpContent::DataOnly && self.drop_objects,
-            create_database: self.kind() == DatabaseKind::Mysql && self.content != DumpContent::DataOnly && self.create_database,
-        }
+            data_style: self.data_style,
+            drop_objects: self.drop_objects,
+            create_database: self.create_database,
+        };
+        dbservice::dump_options(self.kind(), choices, self.scope())
     }
 
     pub fn file_name(&self) -> String {
-        dump::default_file_name(&dump::target_name(&self.target()), &today(), self.compression)
+        dbservice::default_dump_file_name(&self.target_config(), self.compression)
     }
 
     fn toggle_table(&mut self, key: (String, String), cx: &mut Context<Self>) {
@@ -348,7 +312,7 @@ impl Render for DumpDialog {
                 })
                 .into_any_element()
         } else {
-            div().text_sm().child(dump::target_name(&self.target())).into_any_element()
+            div().text_sm().child(dump::target_name(&self.target_config())).into_any_element()
         };
         let everything = self.everything;
         let contents = RadioGroup::vertical("dump-what")
@@ -445,22 +409,21 @@ pub struct RestoreDialog {
 impl RestoreDialog {
     pub fn new(base: ConnectionConfig, database: String, databases: Vec<String>, file: PathBuf) -> Self {
         // MySQL commits schema changes as it goes: a transaction can't make it all or nothing.
-        let single_transaction = base.kind != DatabaseKind::Mysql;
-        Self { base, databases, database, file, single_transaction, stop_on_error: true }
+        let RestoreOptions { single_transaction, stop_on_error } = dbservice::default_restore_options(base.kind);
+        Self { base, databases, database, file, single_transaction, stop_on_error }
     }
 
-    pub fn target(&self) -> ConnectionConfig {
-        pointed_at(&self.base, &self.database)
+    /// The connection and database to restore into.
+    pub fn target(&self) -> Target {
+        Target::new(self.base.id.clone(), self.database.clone())
+    }
+
+    pub fn target_config(&self) -> ConnectionConfig {
+        dbservice::pointed_at(&self.base, &self.database)
     }
 
     pub fn options(&self) -> RestoreOptions {
-        let transaction = self.base.kind != DatabaseKind::Mysql && self.single_transaction;
-        RestoreOptions { single_transaction: transaction, stop_on_error: transaction || self.stop_on_error }
-    }
-
-    /// The database's key in the workspace (connection id, database), to refresh it afterwards.
-    pub fn database(&self) -> String {
-        self.database.clone()
+        dbservice::restore_options(self.base.kind, self.single_transaction, self.stop_on_error)
     }
 }
 
@@ -494,7 +457,7 @@ impl Render for RestoreDialog {
                 })
                 .into_any_element()
         } else {
-            div().text_sm().child(dump::target_name(&self.target())).into_any_element()
+            div().text_sm().child(dump::target_name(&self.target_config())).into_any_element()
         };
         let mysql = self.base.kind == DatabaseKind::Mysql;
         let transaction = !mysql && self.single_transaction;
@@ -612,13 +575,10 @@ impl Job {
 }
 
 /// A restore finished (or failed part way): the database's tables may have changed.
-pub struct Restored {
-    pub connection_id: String,
-    pub database: String,
-}
+pub struct Restored(pub Target);
 
-#[derive(Default)]
 pub struct Backups {
+    service: Service,
     jobs: Vec<Job>,
     next_id: usize,
 }
@@ -659,6 +619,10 @@ impl<P: Clone + Send + 'static, R: Send + 'static> Watch<P, R> {
 }
 
 impl Backups {
+    pub fn new(service: Service) -> Self {
+        Self { service, jobs: Vec::new(), next_id: 0 }
+    }
+
     fn push(&mut self, kind: JobKind, name: String, file: PathBuf, detail: String) -> (usize, CancelToken) {
         self.next_id += 1;
         let cancel = CancelToken::new();
@@ -681,20 +645,19 @@ impl Backups {
         self.jobs.iter_mut().find(|j| j.id == id)
     }
 
-    /// Dumps the database `target` points at (its password read here) into `path`.
-    pub fn dump(
-        &mut self,
-        target: ConnectionConfig,
-        secrets: Option<Arc<KeyringSecretStore>>,
-        path: PathBuf,
-        options: DumpOptions,
-        cx: &mut Context<Self>,
-    ) {
-        let (id, cancel) = self.push(JobKind::Dump, dump::target_name(&target), path.clone(), "Connecting…".into());
+    /// The job's name: the database's (or file's) name.
+    fn name(&self, target: &Target) -> String {
+        self.service.target_config(target).map(|config| dump::target_name(&config)).unwrap_or_else(|_| target.database.clone())
+    }
+
+    /// Dumps `target`'s database into `path` (its password and SSH secret read by the service).
+    pub fn dump(&mut self, target: Target, path: PathBuf, options: DumpOptions, cx: &mut Context<Self>) {
+        let (id, cancel) = self.push(JobKind::Dump, self.name(&target), path.clone(), "Connecting…".into());
+        let service = self.service.clone();
         let task = cx.spawn(async move |this, cx| {
-            let config = with_password(target, secrets, cx.background_executor().clone()).await;
-            let watch: Watch<DumpProgress, DumpSummary> =
-                Watch::start(cx.background_executor(), |report| dump::dump(config, path, options, report, cancel));
+            let watch: Watch<DumpProgress, DumpSummary> = Watch::start(cx.background_executor(), |report| async move {
+                service.dump(&target, path, options, report, cancel).await
+            });
             loop {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 let (progress, result) = watch.take();
@@ -734,23 +697,16 @@ impl Backups {
         cx.notify();
     }
 
-    /// Runs the script at `path` against `target` (connection `connection_id`, database `database`).
-    pub fn restore(
-        &mut self,
-        target: ConnectionConfig,
-        secrets: Option<Arc<KeyringSecretStore>>,
-        path: PathBuf,
-        options: RestoreOptions,
-        database: String,
-        cx: &mut Context<Self>,
-    ) {
+    /// Runs the script at `path` against `target`'s database (the service then drops its schemas).
+    pub fn restore(&mut self, target: Target, path: PathBuf, options: RestoreOptions, cx: &mut Context<Self>) {
         let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let (id, cancel) = self.push(JobKind::Restore, dump::target_name(&target), path.clone(), file);
-        let connection_id = target.id.clone();
+        let (id, cancel) = self.push(JobKind::Restore, self.name(&target), path.clone(), file);
+        let service = self.service.clone();
         let task = cx.spawn(async move |this, cx| {
-            let config = with_password(target, secrets, cx.background_executor().clone()).await;
-            let watch: Watch<RestoreProgress, RestoreSummary> =
-                Watch::start(cx.background_executor(), |report| restore::restore(config, path, options, report, cancel));
+            let watch: Watch<RestoreProgress, RestoreSummary> = Watch::start(cx.background_executor(), |report| {
+                let target = target.clone();
+                async move { service.restore(&target, path, options, report, cancel).await }
+            });
             loop {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 let (progress, result) = watch.take();
@@ -778,7 +734,7 @@ impl Backups {
                             None => {}
                         }
                         if finished {
-                            cx.emit(Restored { connection_id: connection_id.clone(), database: database.clone() });
+                            cx.emit(Restored(target.clone()));
                         }
                         cx.notify();
                         !finished

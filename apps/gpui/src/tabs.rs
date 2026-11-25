@@ -1,6 +1,6 @@
 //! What the right pane shows: a table (rows or structure), or a SQL script with its results.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,9 +28,8 @@ use crate::inspector::{self, Inspector};
 use crate::sql_complete::{SharedCatalog, SqlCompletion};
 use crate::highlight;
 use crate::keys;
-use dbcore::complete::Catalog;
 use dbcore::dialect::Dialect;
-use dbcore::state::{NewHistoryEntry, StateStore};
+use dbservice::{RunOptions, SCRIPT_ROW_LIMIT, Service, Target};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 
 /// What a tab asks of the workspace.
@@ -42,9 +41,6 @@ pub enum TabEvent {
     /// Show a script's results in a tab of their own.
     OpenResults(OpenResults),
 }
-
-/// Rows kept from one script result (like the macOS app); the rest are counted, not shown.
-pub const SCRIPT_ROW_LIMIT: u32 = 10_000;
 
 actions!(
     dbear,
@@ -1125,12 +1121,12 @@ enum Outcome {
     Cancelled,
 }
 
-/// Where a script records its runs: the shared state store, and the connection and database.
+/// Where a script runs: the service (its history, and the schema caches DDL drops) and the
+/// connection and database.
 #[derive(Clone)]
-pub struct History {
-    pub state: Rc<RefCell<StateStore>>,
-    pub connection_id: String,
-    pub database: String,
+pub struct ScriptTarget {
+    pub service: Service,
+    pub target: Target,
 }
 
 /// A run that returned rows, kept so it can move to a results tab of its own.
@@ -1150,11 +1146,9 @@ pub struct OpenResults {
     pub ran: Option<Ran>,
 }
 
-/// A run finished, also when it failed (a script can create a table, then fail on a later
-/// statement). Not sent for cancelled runs.
-pub struct RunFinished {
-    pub sql: String,
-}
+/// A run may have changed the tables (DDL), also when it failed (a script can create a table, then
+/// fail on a later statement). Not sent for cancelled runs.
+pub struct SchemaChanged;
 
 /// What running SQL shows: rows (with the inspector), rows affected, or the error, and a status
 /// bar. A script tab has one under its editor; a results tab is one on its own.
@@ -1164,7 +1158,7 @@ pub struct Results {
     inspector: Entity<Inspector>,
     outcome: Outcome,
     run_task: Option<Task<()>>,
-    history: Option<History>,
+    runs: ScriptTarget,
     /// The last run that returned rows, for "Open in New Tab".
     last: Option<Ran>,
     /// Edits cells of tables whose primary key is in the result.
@@ -1176,12 +1170,12 @@ pub struct Results {
     _subscriptions: Vec<Subscription>,
 }
 
-impl EventEmitter<RunFinished> for Results {}
+impl EventEmitter<SchemaChanged> for Results {}
 /// Related rows to open (`TabEvent::OpenRelated`), passed on by the owning tab.
 impl EventEmitter<TabEvent> for Results {}
 
 impl Results {
-    fn new(connection: Arc<Connection>, history: Option<History>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(connection: Arc<Connection>, runs: ScriptTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = new_grid(window, cx);
         let inspector = cx.new(|cx| Inspector::new(grid.clone(), window, cx));
         // The grid's menu starts edits and opens related rows through the results.
@@ -1217,7 +1211,7 @@ impl Results {
             inspector,
             outcome: Outcome::Idle,
             run_task: None,
-            history,
+            runs,
             last: None,
             settle: Settle::default(),
             menu: CellMenu::default(),
@@ -1249,45 +1243,24 @@ impl Results {
             return;
         }
         self.editor.notice = None;
-        let started = Instant::now();
-        self.outcome = Outcome::Running(started);
+        self.outcome = Outcome::Running(Instant::now());
         let connection = self.connection.clone();
+        let ScriptTarget { service, target } = self.runs.clone();
         self.run_task = Some(cx.spawn(async move |this, cx| {
-            let result = connection.execute_limited(sql.clone(), Some(SCRIPT_ROW_LIMIT)).await;
+            // Capped at SCRIPT_ROW_LIMIT rows, recorded in the history (unless cancelled).
+            let outcome = service.run_script(&target, &connection, sql.clone(), RunOptions::default()).await;
+            if let Some(e) = &outcome.history_error {
+                log::warn!("couldn’t record the query: {e}");
+            }
             this.update(cx, |this, cx| {
-                let took = started.elapsed();
-                this.record(&sql, &result, took);
-                let cancelled = matches!(result, Err(dbcore::Error::Cancelled));
-                this.show(sql.clone(), result, took, cx);
-                if !cancelled {
-                    cx.emit(RunFinished { sql });
+                this.show(sql, outcome.result, outcome.duration, cx);
+                if outcome.schema_changed {
+                    cx.emit(SchemaChanged);
                 }
             })
             .ok();
         }));
         cx.notify();
-    }
-
-    /// Adds the run to the connection's history (cancelled runs aren't kept).
-    fn record(&self, sql: &str, result: &dbcore::Result<QueryResult>, took: Duration) {
-        let Some(history) = &self.history else { return };
-        let (rows, error) = match result {
-            Ok(r) if r.columns.is_empty() => (r.rows_affected, None),
-            Ok(r) => (Some(r.total_count.unwrap_or(r.rows.len() as u64)), None),
-            Err(dbcore::Error::Cancelled) => return,
-            Err(e) => (None, Some(e.to_string())),
-        };
-        let entry = NewHistoryEntry {
-            connection_id: history.connection_id.clone(),
-            database: history.database.clone(),
-            sql: sql.to_string(),
-            duration: Some(took),
-            rows,
-            error,
-        };
-        if let Err(e) = history.state.borrow_mut().add_history(entry) {
-            log::warn!("couldn’t record the query: {e}");
-        }
     }
 
     fn show(&mut self, sql: String, result: dbcore::Result<QueryResult>, took: Duration, cx: &mut Context<Self>) {
@@ -1416,11 +1389,7 @@ fn stop_button(results: &Entity<Results>) -> Button {
 /// may have changed).
 fn forward_results_events<T: EventEmitter<TabEvent>>(results: &Entity<Results>, cx: &mut Context<T>) -> [Subscription; 2] {
     [
-        cx.subscribe(results, |_, _, event: &RunFinished, cx| {
-            if dbcore::dialect::changes_schema(&event.sql) {
-                cx.emit(TabEvent::SchemaMayHaveChanged);
-            }
-        }),
+        cx.subscribe(results, |_, _, _: &SchemaChanged, cx| cx.emit(TabEvent::SchemaMayHaveChanged)),
         cx.subscribe(results, |_, _, event: &TabEvent, cx| {
             if let TabEvent::OpenRelated(related) = event {
                 cx.emit(TabEvent::OpenRelated(related.clone()));
@@ -1445,7 +1414,7 @@ impl ScriptTab {
         connection: Arc<Connection>,
         name: String,
         target: String,
-        history: Option<History>,
+        runs: ScriptTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1457,21 +1426,18 @@ impl ScriptTab {
             state.lsp_mut().completion_provider = Some(Rc::new(completion));
             state
         });
-        let results = cx.new(|cx| Results::new(connection.clone(), history, window, cx));
-        let mut subscriptions = vec![cx.observe_global::<EditorFontSize>(|_, cx| cx.notify()), cx.observe(&results, |_, _, cx| cx.notify())];
-        subscriptions.extend(forward_results_events(&results, cx));
-        // Tables and columns for completion. Keywords complete meanwhile, and if this fails.
+        // Tables and columns for completion, listed once per target. Keywords complete meanwhile,
+        // and if this fails.
         let catalog_task = cx.spawn({
-            let connection = connection.clone();
-            async move |_, _| {
-                let schemas = connection.list_schemas().await;
-                let columns = connection.list_columns().await;
-                match (schemas, columns) {
-                    (Ok(schemas), Ok(columns)) => *catalog.borrow_mut() = Some(Rc::new(Catalog::new(schemas, columns))),
-                    (Err(e), _) | (_, Err(e)) => log::warn!("couldn’t load the completion catalog: {e}"),
-                }
+            let ScriptTarget { service, target } = runs.clone();
+            async move |_, _| match service.catalog(&target).await {
+                Ok(listed) => *catalog.borrow_mut() = Some(listed),
+                Err(e) => log::warn!("couldn’t load the completion catalog: {e}"),
             }
         });
+        let results = cx.new(|cx| Results::new(connection.clone(), runs, window, cx));
+        let mut subscriptions = vec![cx.observe_global::<EditorFontSize>(|_, cx| cx.notify()), cx.observe(&results, |_, _, cx| cx.notify())];
+        subscriptions.extend(forward_results_events(&results, cx));
         Self { name, target, editor, results, _catalog_task: catalog_task, _subscriptions: subscriptions }
     }
 
@@ -1504,7 +1470,8 @@ impl ScriptTab {
 
     fn history_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
-        let history = self.results.read(cx).history.clone();
+        let runs = self.results.read(cx).runs.clone();
+        let history = runs.service.has_state().then_some(runs);
         Button::new("history")
             .ghost()
             .small()
@@ -1514,7 +1481,7 @@ impl ScriptTab {
             .dropdown_menu(move |mut menu, _, _| {
                 let Some(history) = history.clone() else { return menu };
                 // Read when the menu opens, so it's always current.
-                let entries = history.state.borrow().history(&history.connection_id, 25).unwrap_or_default();
+                let entries = history.service.history(&history.target.connection_id, 25).unwrap_or_default();
                 if entries.is_empty() {
                     return menu.item(PopupMenuItem::new("No queries yet").disabled(true));
                 }
@@ -1532,10 +1499,8 @@ impl ScriptTab {
                         this.update(cx, |tab, cx| tab.insert_from_history(&sql, window, cx)).ok();
                     }));
                 }
-                let state = history.state.clone();
-                let id = history.connection_id.clone();
                 menu.separator().item(PopupMenuItem::new("Clear History").on_click(move |_, _, _| {
-                    if let Err(e) = state.borrow_mut().clear_history(&id) {
+                    if let Err(e) = history.service.clear_history(&history.target.connection_id) {
                         log::warn!("couldn’t clear the history: {e}");
                     }
                 }))
@@ -1671,12 +1636,12 @@ impl ResultTab {
         title: String,
         target: String,
         request: OpenResults,
-        history: Option<History>,
+        runs: ScriptTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let OpenResults { sql, ran, .. } = request;
-        let results = cx.new(|cx| Results::new(connection, history, window, cx));
+        let results = cx.new(|cx| Results::new(connection, runs, window, cx));
         let mut subscriptions = vec![cx.observe(&results, |_, _, cx| cx.notify())];
         subscriptions.extend(forward_results_events(&results, cx));
         results.update(cx, |results, cx| match ran {

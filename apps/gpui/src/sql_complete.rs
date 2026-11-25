@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dbcore::complete::{Catalog, CompletionKind, complete};
 use dbcore::dialect::Dialect;
@@ -10,8 +11,8 @@ use gpui_kit::component::input::{CompletionProvider, Rope, RopeExt as _};
 use gpui_kit::*;
 use lsp_types::{CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, TextEdit};
 
-/// The catalog arrives after the editor exists (it's loaded from the server), hence the cell.
-pub type SharedCatalog = Rc<RefCell<Option<Rc<Catalog>>>>;
+/// The catalog arrives after the editor exists (the service lists it, once per target), hence the cell.
+pub type SharedCatalog = Rc<RefCell<Option<Arc<Catalog>>>>;
 
 pub struct SqlCompletion {
     pub catalog: SharedCatalog,
@@ -39,7 +40,7 @@ impl CompletionProvider for SqlCompletion {
         _: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         // Keywords still complete before the catalog has loaded.
-        let catalog = self.catalog.borrow().clone().unwrap_or_else(|| Rc::new(Catalog::new(Vec::new(), Vec::new())));
+        let catalog = self.catalog.borrow().clone().unwrap_or_default();
         let sql = text.to_string();
         let found = complete(&sql, offset, &catalog, self.dialect);
         let range = lsp_types::Range {

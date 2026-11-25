@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use dbcore::d1::oauth::{self, SignIn};
-use dbcore::secrets::{self, KeyringSecretStore, SecretStore as _};
-use dbcore::{Connection, ConnectionConfig, DatabaseKind, SshAuth, SshTunnel, SslMode};
+use dbcore::{ConnectionConfig, DatabaseKind, SshAuth, SshTunnel, SslMode};
+use dbservice::Service;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -84,7 +84,7 @@ impl ConnectionEditor {
 
     /// Editing a signed-in connection: reads its sign-in in the background and fills the menus.
     fn load_saved_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(store), Some(id)) = (self.secrets.clone(), self.original.as_ref().map(|c| c.id.clone())) else { return };
+        let (Some(store), Some(id)) = (self.service.secret_store(), self.original.as_ref().map(|c| c.id.clone())) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let secret = cx.background_executor().spawn(async move { store.password(&id).ok().flatten() }).await;
             let Some(secret) = secret.filter(|s| oauth::is_secret(s)) else { return };
@@ -128,7 +128,7 @@ pub struct ConnectionEditor {
     /// The SSH password or the key's passphrase.
     ssh_secret: Entity<InputState>,
     status: Option<Status>,
-    secrets: Option<Arc<KeyringSecretStore>>,
+    service: Service,
     test_task: Option<Task<()>>,
     d1: D1Auth,
 }
@@ -136,7 +136,7 @@ pub struct ConnectionEditor {
 impl ConnectionEditor {
     pub fn new(
         original: Option<ConnectionConfig>,
-        secrets: Option<Arc<KeyringSecretStore>>,
+        service: Service,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -184,7 +184,7 @@ impl ConnectionEditor {
             ssh_key,
             ssh_secret,
             status: None,
-            secrets,
+            service,
             test_task: None,
             d1: D1Auth {
                 saved: config.kind == DatabaseKind::D1 && config.user.is_some(),
@@ -478,25 +478,15 @@ impl ConnectionEditor {
             Err(e) => return self.show_error(e, cx),
         };
         // Editing without retyping a password: test with the saved one.
-        let saved = if !self.is_new() { self.secrets.clone() } else { None };
+        let use_saved = !self.is_new();
         config.password = password;
         if let Some(ssh) = config.ssh.as_mut() {
             ssh.secret = ssh_secret;
         }
         self.status = Some(Status::Testing);
+        let service = self.service.clone();
         self.test_task = Some(cx.spawn(async move |this, cx| {
-            let config = cx
-                .background_executor()
-                .spawn(async move {
-                    match saved {
-                        Some(store) => secrets::with_password(store.as_ref(), config.clone()).unwrap_or(config),
-                        None => config,
-                    }
-                })
-                .await;
-            let connection = Connection::new(config);
-            let result = connection.connect().await;
-            connection.disconnect().await;
+            let result = service.test(config, use_saved).await;
             this.update(cx, |this, cx| {
                 this.status = Some(match result {
                     Ok(()) => Status::Ok("Connected".into()),

@@ -11,7 +11,9 @@ name = "dbear"
 path = "src/main.rs"
 
 [dependencies]
-dbcore = { workspace = true, features = ["os-keyring"] }
+dbcore = { workspace = true }
+# Saved connections, keychain, caches, scripts with history, dump/restore: shared with the CLI.
+dbservice = { workspace = true }
 dbear-update = { path = "../../crates/update" }
 # GPUI is pre-1.0: pin exact versions. gpui-kit 0.7.1 pins GPUI itself (gpui-pre 0.3.8).
 gpui-kit = "=0.7.1"

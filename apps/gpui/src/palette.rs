@@ -110,7 +110,7 @@ impl List {
 
 /// The connection (and database) the palette was narrowed to with Tab: only its tables.
 struct Scope {
-    key: (String, String),
+    key: crate::workspace::TargetKey,
     name: SharedString,
     tables: PaletteTables,
     list: List,
