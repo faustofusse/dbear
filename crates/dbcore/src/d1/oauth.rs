@@ -22,10 +22,15 @@
 //!   process by grant id, so every client of a connection (browsing, dumps, the editor's test)
 //!   refreshes once and sees the rotated refresh token. The new secret goes back to the keychain
 //!   through the [`SecretSync`] the app installs ([`set_secret_sync`]).
+//! - Several processes (the two apps, `dbear-cli`) may use the same grant. A refresh takes a file
+//!   lock per grant (`<app data>/dbear/locks/oauth-<hash>.lock`) and re-reads the stored secret
+//!   under it, so a grant another process already rotated is adopted instead of refreshed with a
+//!   refresh token that no longer works.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -424,18 +429,17 @@ fn sync() -> Option<Arc<dyn SecretSync>> {
 }
 
 /// The process's grants, by grant id: the newest tokens of every sign-in in use.
-static GRANTS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<Grant>>>>> = LazyLock::new(Default::default);
+static GRANTS: LazyLock<Grants> = LazyLock::new(|| Grants::new(default_lock_dir()));
 
 fn remember(grant: Grant) -> Arc<tokio::sync::Mutex<Grant>> {
-    let mut grants = GRANTS.lock().unwrap_or_else(|p| p.into_inner());
-    grants.entry(grant.grant.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(grant))).clone()
+    GRANTS.remember(grant)
 }
 
 /// The newest version of `secret` this process knows (after refreshes). Save this one when a form
 /// that holds a secret is saved: the refresh token in an older copy may no longer work.
 pub fn latest_secret(secret: &str) -> String {
     let Some(grant) = Grant::decode(secret) else { return secret.to_string() };
-    let entry = GRANTS.lock().unwrap_or_else(|p| p.into_inner()).get(&grant.grant).cloned();
+    let entry = GRANTS.entries.lock().unwrap_or_else(|p| p.into_inner()).get(&grant.grant).cloned();
     match entry.and_then(|e| e.try_lock().ok().map(|g| g.clone())) {
         Some(newest) if newest.expires_at >= grant.expires_at => newest.encode(),
         _ => secret.to_string(),
@@ -445,46 +449,138 @@ pub fn latest_secret(secret: &str) -> String {
 /// A current access token for a connection's secret, refreshing it when it expires within five
 /// minutes (or always, with `force`: after Cloudflare refused the current one).
 pub async fn access_token(connection_id: &str, secret: &str, force: bool) -> Result<String> {
-    let given = Grant::decode(secret).ok_or_else(|| Error::InvalidConfig("The Cloudflare sign-in is damaged. Sign in again.".into()))?;
-    let entry = remember(given.clone());
-    let mut grant = entry.lock().await;
-    if given.expires_at > grant.expires_at {
-        *grant = given;
-    }
-    if !force && !grant.expires_soon() {
-        return Ok(grant.access_token.clone());
-    }
-    let refreshed = refresh_grant(&grant).await;
-    let fresh = match refreshed {
-        Ok(fresh) => fresh,
-        Err(e) => {
-            // The other app may have refreshed it first (refresh tokens rotate): its copy works.
-            let stored = sync()
-                .filter(|_| !connection_id.is_empty())
-                .and_then(|s| s.load(connection_id))
-                .and_then(|s| Grant::decode(&s))
-                .filter(|s| s.grant == grant.grant && s.refresh_token != grant.refresh_token);
-            let Some(stored) = stored else { return Err(e) };
-            if !force && !stored.expires_soon() {
-                *grant = stored;
-                return Ok(grant.access_token.clone());
-            }
-            refresh_grant(&stored).await?
-        }
-    };
-    *grant = fresh;
-    if let Some(sync) = sync().filter(|_| !connection_id.is_empty()) {
-        sync.save(connection_id, &grant.encode());
-    }
-    Ok(grant.access_token.clone())
+    GRANTS.access_token(sync(), connection_id, secret, force).await
 }
 
-async fn refresh_grant(grant: &Grant) -> Result<Grant> {
+/// How long a refresh waits for another process's refresh of the same grant before going ahead
+/// without the lock: longer than that one's two token requests normally take.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(45);
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// `<app data>/dbear/locks`, shared by every dbear process of the user.
+fn default_lock_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        // Unit tests don't leave files in the user's app data.
+        return Some(std::env::temp_dir().join("dbear-test-locks"));
+    }
+    Some(crate::paths::app_data_dir()?.join("dbear").join("locks"))
+}
+
+/// A process's grants. Tests make several to play separate processes.
+struct Grants {
+    entries: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Grant>>>>,
+    /// Where the cross-process refresh locks live. `None` (or a folder that can't be written):
+    /// refreshes aren't coordinated with other processes.
+    lock_dir: Option<PathBuf>,
+    /// The token endpoint's base, when not [`oauth_base`] (tests).
+    base: Option<String>,
+}
+
+impl Grants {
+    fn new(lock_dir: Option<PathBuf>) -> Self {
+        Self { entries: Mutex::default(), lock_dir, base: None }
+    }
+
+    fn remember(&self, grant: Grant) -> Arc<tokio::sync::Mutex<Grant>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries.entry(grant.grant.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(grant))).clone()
+    }
+
+    async fn access_token(&self, sync: Option<Arc<dyn SecretSync>>, connection_id: &str, secret: &str, force: bool) -> Result<String> {
+        let given = Grant::decode(secret).ok_or_else(|| Error::InvalidConfig("The Cloudflare sign-in is damaged. Sign in again.".into()))?;
+        let sync = sync.filter(|_| !connection_id.is_empty());
+        // Serializes the process's refreshes of this grant, so the file lock below is never
+        // wanted twice by the same process (it would wait for itself).
+        let entry = self.remember(given.clone());
+        let mut grant = entry.lock().await;
+        if given.expires_at > grant.expires_at {
+            *grant = given;
+        }
+        if !force && !grant.expires_soon() {
+            return Ok(grant.access_token.clone());
+        }
+        let _lock = match &self.lock_dir {
+            Some(dir) => RefreshLock::acquire(dir, &grant.grant).await,
+            None => None,
+        };
+        // Another process may have rotated the grant while this one waited (or before): under the
+        // lock the stored copy is the newest, and our refresh token may already be spent.
+        let id = grant.grant.clone();
+        let stored = || sync.as_ref().and_then(|s| s.load(connection_id)).and_then(|s| Grant::decode(&s)).filter(|s| s.grant == id);
+        if let Some(stored) = stored().filter(|s| *s != *grant && s.expires_at >= grant.expires_at) {
+            let refused = force.then(|| grant.access_token.clone());
+            *grant = stored;
+            // With `force`, the refused token was ours; the other process's is worth a try.
+            if !grant.expires_soon() && refused.as_ref() != Some(&grant.access_token) {
+                return Ok(grant.access_token.clone());
+            }
+        }
+        let fresh = match self.refresh_grant(&grant).await {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                // Without the lock (or when the other process holds it too long) the other one may
+                // still have refreshed first: its copy works.
+                let Some(stored) = stored().filter(|s| s.refresh_token != grant.refresh_token) else { return Err(e) };
+                if !force && !stored.expires_soon() {
+                    *grant = stored;
+                    return Ok(grant.access_token.clone());
+                }
+                self.refresh_grant(&stored).await?
+            }
+        };
+        *grant = fresh;
+        if let Some(sync) = &sync {
+            sync.save(connection_id, &grant.encode());
+        }
+        Ok(grant.access_token.clone())
+    }
+
+    async fn refresh_grant(&self, grant: &Grant) -> Result<Grant> {
+        refresh_grant(grant, self.base.clone()).await
+    }
+}
+
+/// An advisory lock on a grant's refreshes across processes. Released when dropped (and by the OS
+/// when the process dies).
+struct RefreshLock(std::fs::File);
+
+impl RefreshLock {
+    /// Waits up to [`LOCK_TIMEOUT`] without blocking the runtime's threads. `None` when the lock
+    /// file can't be made or locked, or the wait times out: the refresh goes ahead without it.
+    async fn acquire(dir: &Path, grant_id: &str) -> Option<Self> {
+        let digest = ring::digest::digest(&ring::digest::SHA256, grant_id.as_bytes());
+        let name: String = digest.as_ref()[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let file = std::fs::create_dir_all(dir)
+            .and_then(|_| {
+                std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(format!("oauth-{name}.lock")))
+            })
+            .ok()?;
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Some(Self(file)),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => tokio::time::sleep(LOCK_POLL).await,
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+async fn refresh_grant(grant: &Grant, base: Option<String>) -> Result<Grant> {
     let refresh_token = grant
         .refresh_token
         .as_deref()
         .ok_or_else(|| Error::ConnectionFailed("The Cloudflare sign-in expired. Sign in again (Edit Connection).".into()))?;
-    let client = OAuthClient::new(grant.client_id.clone());
+    let mut client = OAuthClient::new(grant.client_id.clone());
+    if let Some(base) = base {
+        client.base = base;
+    }
     let tokens = client.refresh(refresh_token).await?;
     Ok(Grant { access_token: tokens.access_token, refresh_token: tokens.refresh_token, expires_at: tokens.expires_at, ..grant.clone() })
 }
@@ -802,6 +898,217 @@ mod tests {
         let newest = Grant::decode(&saved[0].1).unwrap();
         assert_eq!((newest.access_token.as_str(), newest.refresh_token.as_deref()), ("at-2", Some("rt-2")));
         assert_eq!(latest_secret(&secret), saved[0].1);
+    }
+
+    /// A token endpoint that rotates refresh tokens like Cloudflare: each refresh with the current
+    /// refresh token answers `at-N`/`rt-N` (after `delay`, so refreshes overlap), a spent one gets
+    /// `invalid_grant`. Counts the requests.
+    struct Rotating {
+        current: Mutex<(u32, String)>,
+        requests: std::sync::atomic::AtomicU32,
+    }
+
+    async fn rotating_server(delay: Duration) -> (String, Arc<Rotating>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/oauth2", listener.local_addr().unwrap());
+        let state = Arc::new(Rotating { current: Mutex::new((0, "rt-0".into())), requests: Default::default() });
+        let server = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let state = server.clone();
+                tokio::spawn(async move {
+                    let form = read_form(&mut stream).await;
+                    state.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let form: HashMap<String, String> = url::form_urlencoded::parse(form.as_bytes()).into_owned().collect();
+                    let answer = {
+                        let mut current = state.current.lock().unwrap();
+                        if form.get("refresh_token") == Some(&current.1) {
+                            current.0 += 1;
+                            current.1 = format!("rt-{}", current.0);
+                            Ok(format!(r#"{{"access_token":"at-{0}","refresh_token":"rt-{0}","expires_in":3600}}"#, current.0))
+                        } else {
+                            Err(r#"{"error":"invalid_grant"}"#.to_string())
+                        }
+                    };
+                    tokio::time::sleep(delay).await;
+                    let (status, body) = match answer {
+                        Ok(body) => ("200 OK", body),
+                        Err(body) => ("400 Bad Request", body),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (base, state)
+    }
+
+    async fn read_form(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            request.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&request).to_string();
+            if let Some(split) = text.find("\r\n\r\n") {
+                let length: usize = text
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                    .unwrap_or(0);
+                if request.len() >= split + 4 + length || n == 0 {
+                    return text[split + 4..].to_string();
+                }
+            }
+            if n == 0 {
+                return String::new();
+            }
+        }
+    }
+
+    /// A keychain shared by the test's "processes".
+    #[derive(Default)]
+    struct Keychain(Mutex<HashMap<String, String>>);
+
+    impl SecretSync for Keychain {
+        fn load(&self, id: &str) -> Option<String> {
+            self.0.lock().unwrap().get(id).cloned()
+        }
+        fn save(&self, id: &str, secret: &str) {
+            self.0.lock().unwrap().insert(id.into(), secret.into());
+        }
+    }
+
+    /// A keychain in a file, for child processes.
+    struct FileKeychain(PathBuf);
+
+    impl SecretSync for FileKeychain {
+        fn load(&self, _: &str) -> Option<String> {
+            std::fs::read_to_string(&self.0).ok()
+        }
+        fn save(&self, _: &str, secret: &str) {
+            let partial = self.0.with_extension(format!("{}.partial", std::process::id()));
+            std::fs::write(&partial, secret).unwrap();
+            std::fs::rename(partial, &self.0).unwrap();
+        }
+    }
+
+    fn expiring_secret(refresh_token: &str) -> String {
+        let tokens = Tokens { access_token: "at-0".into(), refresh_token: Some(refresh_token.into()), expires_at: now() + 10, scopes: vec![] };
+        Grant::new("client-1", tokens).unwrap().encode()
+    }
+
+    fn grants(lock_dir: Option<PathBuf>, base: &str) -> Grants {
+        Grants { base: Some(base.into()), ..Grants::new(lock_dir) }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_processes_refresh_once() {
+        let (base, server) = rotating_server(Duration::from_millis(300)).await;
+        let locks = tempfile::tempdir().unwrap();
+        let secret = expiring_secret("rt-0");
+        let keychain = Arc::new(Keychain::default());
+        keychain.save("conn-1", &secret);
+        // Two processes: their own grants (and in-process mutexes), the same lock folder and keychain.
+        let (a, b) = (grants(Some(locks.path().into()), &base), grants(Some(locks.path().into()), &base));
+        let sync: Arc<dyn SecretSync> = keychain.clone();
+        let (ta, tb) =
+            tokio::join!(a.access_token(Some(sync.clone()), "conn-1", &secret, false), b.access_token(Some(sync), "conn-1", &secret, false));
+        assert_eq!((ta.unwrap(), tb.unwrap()), ("at-1".to_string(), "at-1".to_string()));
+        assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let stored = Grant::decode(&keychain.load("conn-1").unwrap()).unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rt-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tasks_of_one_process_refresh_once() {
+        let (base, server) = rotating_server(Duration::from_millis(100)).await;
+        let locks = tempfile::tempdir().unwrap();
+        let secret = expiring_secret("rt-0");
+        let one = grants(Some(locks.path().into()), &base);
+        let sync: Arc<dyn SecretSync> = Arc::new(Keychain::default());
+        let call = || tokio::time::timeout(Duration::from_secs(10), one.access_token(Some(sync.clone()), "conn-1", &secret, false));
+        let (x, y, z) = tokio::join!(call(), call(), call());
+        for token in [x, y, z] {
+            assert_eq!(token.expect("deadlocked").unwrap(), "at-1");
+        }
+        assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn adopts_a_grant_another_process_rotated() {
+        // Nothing listens there: a refresh would fail.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/oauth2", closed.local_addr().unwrap());
+        drop(closed);
+        let locks = tempfile::tempdir().unwrap();
+        let secret = expiring_secret("rt-0");
+        let mut rotated = Grant::decode(&secret).unwrap();
+        (rotated.access_token, rotated.refresh_token, rotated.expires_at) = ("at-9".into(), Some("rt-9".into()), now() + 3600);
+        let keychain = Arc::new(Keychain::default());
+        keychain.save("conn-1", &rotated.encode());
+        let process = grants(Some(locks.path().into()), &base);
+        assert_eq!(process.access_token(Some(keychain.clone()), "conn-1", &secret, false).await.unwrap(), "at-9");
+        // After a 401 on at-9 it refreshes with rt-9 (and fails here), instead of handing at-9 back.
+        assert!(process.access_token(Some(keychain), "conn-1", &secret, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refreshes_without_a_lock_folder() {
+        let (base, server) = rotating_server(Duration::ZERO).await;
+        // A "folder" under a file can't be created (like a read-only app data folder).
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let process = grants(Some(file.path().join("locks")), &base);
+        let keychain = Arc::new(Keychain::default());
+        assert_eq!(process.access_token(Some(keychain.clone()), "conn-1", &expiring_secret("rt-0"), false).await.unwrap(), "at-1");
+        assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(keychain.load("conn-1").is_some());
+    }
+
+    /// Two real processes (this test binary, running [`child_refresh`]) refresh the same grant once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_processes_refresh_once() {
+        let (base, server) = rotating_server(Duration::from_millis(300)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = expiring_secret("rt-0");
+        let keychain = dir.path().join("keychain");
+        std::fs::write(&keychain, &secret).unwrap();
+        let spawn = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "d1::oauth::tests::child_refresh", "--ignored", "--nocapture", "--test-threads=1"])
+                .env("DBEAR_TEST_OAUTH_BASE", &base)
+                .env("DBEAR_TEST_OAUTH_LOCKS", dir.path().join("locks"))
+                .env("DBEAR_TEST_OAUTH_KEYCHAIN", &keychain)
+                .env("DBEAR_TEST_OAUTH_SECRET", &secret)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let children = [spawn(), spawn()];
+        let outputs = tokio::task::spawn_blocking(move || children.map(|c| c.wait_with_output().unwrap())).await.unwrap();
+        for output in outputs {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}");
+            assert!(stdout.contains("TOKEN=at-1\n"), "{stdout}");
+        }
+        assert_eq!(server.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let stored = Grant::decode(&std::fs::read_to_string(&keychain).unwrap()).unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rt-1"));
+    }
+
+    /// One of [`child_processes_refresh_once`]'s processes.
+    #[tokio::test]
+    #[ignore = "run by child_processes_refresh_once"]
+    async fn child_refresh() {
+        let Ok(base) = std::env::var("DBEAR_TEST_OAUTH_BASE") else { return };
+        let var = |key: &str| std::env::var(key).unwrap();
+        let process = grants(Some(var("DBEAR_TEST_OAUTH_LOCKS").into()), &base);
+        let keychain = Arc::new(FileKeychain(var("DBEAR_TEST_OAUTH_KEYCHAIN").into()));
+        let token = process.access_token(Some(keychain), "conn-1", &var("DBEAR_TEST_OAUTH_SECRET"), false).await.unwrap();
+        println!("TOKEN={token}");
     }
 
     #[test]
