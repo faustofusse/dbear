@@ -3,6 +3,7 @@
 //! state, keychain or a running server: `DBEAR_CONNECTIONS_FILE`, `DBEAR_SOCKET`, `HOME` and
 //! `DBEAR_NO_KEYRING=1` point everything at the temp dir.
 
+mod edit;
 mod oneshot;
 mod serve;
 

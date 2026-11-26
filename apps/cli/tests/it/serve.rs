@@ -85,6 +85,31 @@ fn stdio_methods() {
 }
 
 #[test]
+fn columns_list() {
+    let fx = Fixture::new();
+    let mut peer = Peer::stdio(&fx);
+    let got = peer.call(1, "columns.list", json!({"connection": "App"}));
+    assert_eq!(got["target"]["connection_id"], fx.app.as_str());
+    let tables = got["tables"].as_array().unwrap();
+    let users = tables.iter().find(|t| t["table"] == "users").unwrap();
+    assert_eq!(users["schema"], "main");
+    assert_eq!(users["columns"][0], json!({"name": "id", "type_name": "integer", "is_primary_key": true, "is_nullable": false}));
+    assert_eq!(users["columns"].as_array().unwrap().len(), 4);
+    // Views too.
+    let named = tables.iter().find(|t| t["table"] == "named").unwrap();
+    let names: Vec<&str> = named["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["id", "name"]);
+
+    // Another database on a server (the mock Postgres).
+    let other = peer.call(2, "columns.list", json!({"connection": "Staging", "database": "app_test"}));
+    assert_eq!(other["target"], json!({"connection_id": "staging-pg", "database": "app_test"}));
+    assert!(!other["tables"].as_array().unwrap().is_empty());
+
+    let err = peer.error(3, "columns.list", json!({"connection": "ghost"}));
+    assert_eq!(err["data"]["kind"], "invalid-config");
+}
+
+#[test]
 fn stdio_errors() {
     let fx = Fixture::new();
     let mut peer = Peer::stdio(&fx);

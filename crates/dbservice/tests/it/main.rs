@@ -3,6 +3,7 @@
 
 mod backup;
 mod crud;
+mod editing;
 mod lookup;
 mod schemas;
 mod scripts;

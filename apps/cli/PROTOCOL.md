@@ -30,8 +30,9 @@ Environment (read by both the server and the one-shot commands):
 
 Shared across all clients: the saved connections (read-only), the keychain, query history, and
 Cloudflare OAuth grants. Also shared: one cached connection per target, used for metadata
-(`schemas.list`, `table.describe`, `table.rows`, `databases.list`, `complete`), with its schema and
-completion caches.
+(`schemas.list`, `columns.list`, `table.describe`, `table.rows`, `table.editable`, `databases.list`, `complete`),
+with its schema and completion caches. Row edits (`table.changes.apply`) run there too, in a
+transaction of their own on the driver's edit session.
 
 Per client: the connections that `query.run` uses. Each client gets one session per target, so
 temp tables, `SET`, open transactions and `query.cancel` never cross clients. These sessions close
@@ -176,6 +177,11 @@ A bare number is always an integer. Text that looks like a number (`"42"`) is st
 - Result: `{"target":Target,"schemas":[{"name":"public","tables":[{"schema":"public","name":"users","kind":"table"|"view","estimated_row_count":248|null}]}]}`.
 - The result is cached per target until DDL runs through `query.run`, a restore finishes, `refresh: true` is passed, or `disconnect` is called.
 
+### `columns.list`
+- Params: `{"connection","database"?}`.
+- Result: `{"target":Target,"tables":[{"schema":"public","table":"users","columns":[{"name":"id","type_name":"int8","is_primary_key":true,"is_nullable":false}]}]}`.
+- Every table's and view's columns in the target, in one call (dbcore's `Driver::list_columns`, what completion uses). Use it instead of a `table.describe` per table when you only need names and types. Not cached: each call asks the database.
+
 ### `table.describe`
 - Params: `{"connection","database"?,"schema"?,"table"}`.
 - Result: `{"target","table":TableInfo,"structure":TableStructure}`.
@@ -193,6 +199,36 @@ A bare number is always an integer. Text that looks like a number (`"42"`) is st
 - To get the next page, pass `next` back as `cursor` together with the same `query`. Treat it as opaque.
 - `filter` is a single SQL boolean expression; a `;` between statements is rejected.
 - This method runs on the shared metadata session.
+
+### `table.editable`
+- Params: `{"connection","database"?,"schema"?,"table"}` (found like `table.describe`).
+- Result: `{"target","table":TableInfo,"read_only":"“named” is a view."|null,"key":["id"],"columns":[EditableColumn…],"foreign_keys":[…],"referenced_by":[…]}`.
+  - `read_only`: why no row can be changed (a view, no primary key); `null` when they can. `key` is the primary key, in key order (empty when read-only).
+  - `EditableColumn`: `{"name","type_name","is_primary_key","is_nullable","default_value","binary","read_only"}`. `binary` columns come as a hex preview (`"0x…"`, cut), so only `null`/`default` can be written to them; `read_only` says why a column can't be changed.
+  - `foreign_keys`: `{"columns":["user_id"],"schema","table","target_columns":["id"],"label"}`: a row's `columns` point at `target_columns` of `schema.table` (empty: its primary key, an implicit SQLite reference).
+  - `referenced_by`: `{"values":["id"],"schema","table","columns":["user_id"],"label"}`: rows of `schema.table` whose `columns` hold this row's `values` columns.
+- The rules are the apps' table grids' (`dbcore::results::ResultSources`). Names, not indexes: match them with `table.rows`' `columns`.
+
+### `table.changes.preview`
+- Params: `{"connection","database"?,"schema"?,"table","changes":[RowChange…]}`.
+  - `RowChange` (dbcore's `edit::RowChange`):
+    - `{"kind":"update","key":[KeyValue…],"set":[CellEdit…]}`
+    - `{"kind":"delete","key":[KeyValue…]}`
+    - `{"kind":"insert","values":[CellEdit…]}`
+  - `KeyValue`: `{"column","value":Value}`, every primary key column with the row's value **as loaded** (send back what `table.rows` returned).
+  - `CellEdit`: `{"column","value":EditValue}`; `EditValue` is `"null"`, `"default"` (UPDATE: `DEFAULT`, not on SQLite; INSERT: the column is left out) or `{"text":"…"}`. Text is sent as a string literal and cast by the database (`'42'` into an integer, `'{a,b}'` into an array).
+- Result: `{"target","table","statements":[{"sql","expect_one_row","target"}]}`, in the order they'd run: deletes, updates, inserts. Nothing runs.
+- Refused (`unsupported` or `query` errors) before any SQL: any change to a read-only table, text into a binary or read-only column, an unknown column, a key that isn't the whole primary key.
+
+### `table.changes.apply`
+- Params: those of `table.changes.preview`, plus `"reviewed"?:["DELETE …", …]`: the `sql` of the statements the user confirmed. When given, the server refuses (nothing runs) unless it would run exactly those, e.g. if the table changed since the preview.
+- Result: `{"target","table","rows_affected":3}`.
+- Runs in one transaction on the target's shared connection (the driver's edit session): every UPDATE and DELETE must match exactly one row, and a failing statement or check rolls everything back. The error then says which row and that nothing was saved.
+
+### `table.related`
+- Params: `{"connection","database"?,"schema"?,"table","columns"?:["user_id"],"values":[Value…]}`.
+- Result: `{"target","table","filter":"\"user_id\" = 1"}`, a `filter` for `table.rows` that selects the rows of `table` whose `columns` hold `values` (`is null` for nulls). Without `columns`, the table's primary key.
+- Follow a foreign key with its `table`/`target_columns` and the row's values in `columns`; list the rows referencing a row with a `referenced_by`'s `table`/`columns` and the values in its `values`.
 
 ### `query.run`
 - Params: `{"connection","database"?,"sql","max_rows"?,"record_history"?: false,"describe_sources"?: false}`.

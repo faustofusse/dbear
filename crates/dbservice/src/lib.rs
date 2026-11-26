@@ -15,6 +15,7 @@
 
 mod backup;
 mod crud;
+mod editing;
 mod script;
 
 use std::collections::{HashMap, HashSet};
@@ -34,6 +35,7 @@ pub use backup::{
     restore_options, today, DumpChoices,
 };
 pub use crud::{Import, SaveRequest, Saved, SecretKind, SecretProblem};
+pub use editing::{EditableColumn, ForeignKeyRef, ReferenceRef, TableEditing};
 pub use script::{history_entry, RunOptions, ScriptOutcome, SCRIPT_ROW_LIMIT};
 
 /// The environment variable that points the apps (and this crate) at another connection store.

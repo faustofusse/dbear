@@ -309,6 +309,12 @@ impl Session {
                 }
                 to_json(Schemas { target, schemas: loaded.schemas })?.into()
             }
+            "columns.list" => {
+                let p: On = params(p)?;
+                let target = server.resolve(&p).await?;
+                let tables = service.connection(&target).await?.list_columns().await?;
+                to_json(ColumnsList { target, tables })?.into()
+            }
             "table.describe" => {
                 let p: TableParams = params(p)?;
                 let target = server.resolve(&p.on).await?;
@@ -323,6 +329,35 @@ impl Session {
                 let cursor = p.cursor.as_deref().map(PageCursor::decode).transpose()?;
                 let page = service.connection(&target).await?.fetch_page(table.clone(), p.query, p.limit.max(1), cursor).await?;
                 to_json(Rows { target, table, page })?.into()
+            }
+            "table.editable" => {
+                let p: TableParams = params(p)?;
+                let target = server.resolve(&p.on).await?;
+                let table = server.table(&target, p.schema.as_deref(), &p.table).await?;
+                let (editing, _) = service.table_editing(&target, &table).await?;
+                to_json(Editable { target, editing })?.into()
+            }
+            "table.changes.preview" => {
+                let p: ChangesParams = params(p)?;
+                let target = server.resolve(&p.table.on).await?;
+                let table = server.table(&target, p.table.schema.as_deref(), &p.table.table).await?;
+                let statements = service.preview_table_changes(&target, &table, &p.changes).await?;
+                to_json(ChangesPreview { target, table, statements })?.into()
+            }
+            "table.changes.apply" => {
+                let p: ChangesParams = params(p)?;
+                let target = server.resolve(&p.table.on).await?;
+                let table = server.table(&target, p.table.schema.as_deref(), &p.table.table).await?;
+                let rows_affected = service.apply_table_changes(&target, &table, p.changes, p.reviewed.as_deref()).await?;
+                to_json(ChangesApplied { target, table, rows_affected })?.into()
+            }
+            "table.related" => {
+                let p: RelatedParams = params(p)?;
+                let target = server.resolve(&p.table.on).await?;
+                let table = server.table(&target, p.table.schema.as_deref(), &p.table.table).await?;
+                let connection = service.connection(&target).await?;
+                let filter = service.related_filter(&connection, &table, &p.columns, &p.values).await?;
+                to_json(Related { target, table, filter })?.into()
             }
             "query.run" => {
                 let p: RunParams = params(p)?;

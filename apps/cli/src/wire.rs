@@ -5,10 +5,11 @@ use std::path::PathBuf;
 
 use dbcore::complete::Completions;
 use dbcore::dump::{Compression, DataStyle, DumpContent, DumpScope};
+use dbcore::edit::{EditStatement, RowChange};
 use dbcore::keyset::RowPage;
 use dbcore::state::HistoryEntry;
-use dbcore::{ConnectionConfig, Error, RowQuery, Schema, TableInfo, TableStructure};
-use dbservice::{Problem, ScriptOutcome, Target};
+use dbcore::{ConnectionConfig, Error, RowQuery, Schema, TableColumns, TableInfo, TableStructure, Value};
+use dbservice::{Problem, ScriptOutcome, TableEditing, Target};
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
@@ -76,6 +77,27 @@ pub struct RowsParams {
     pub limit: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+}
+
+/// `table.changes.preview` / `table.changes.apply`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChangesParams {
+    #[serde(flatten)]
+    pub table: TableParams,
+    pub changes: Vec<RowChange>,
+    /// `apply` only: the SQL the user confirmed; anything else is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<Vec<String>>,
+}
+
+/// `table.related`: the rows of `table` whose `columns` hold `values` (no columns: its primary key).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelatedParams {
+    #[serde(flatten)]
+    pub table: TableParams,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    pub values: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -233,6 +255,13 @@ pub struct Schemas {
     pub schemas: Vec<Schema>,
 }
 
+/// `columns.list`: every table's and view's columns, in one call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnsList {
+    pub target: Target,
+    pub tables: Vec<TableColumns>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Described {
     pub target: Target,
@@ -246,6 +275,36 @@ pub struct Rows {
     pub table: TableInfo,
     #[serde(flatten)]
     pub page: RowPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Editable {
+    pub target: Target,
+    #[serde(flatten)]
+    pub editing: TableEditing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesPreview {
+    pub target: Target,
+    pub table: TableInfo,
+    /// In the order they run: deletes, updates, inserts.
+    pub statements: Vec<EditStatement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangesApplied {
+    pub target: Target,
+    pub table: TableInfo,
+    pub rows_affected: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Related {
+    pub target: Target,
+    pub table: TableInfo,
+    /// A `filter` for `table.rows`.
+    pub filter: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
