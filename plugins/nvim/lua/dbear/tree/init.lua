@@ -16,11 +16,11 @@
 
 local fs = require("dbear.tree.fs")
 local manifest = require("dbear.tree.manifest")
+local progress = require("dbear.tree.progress")
 local sync = require("dbear.tree.sync")
 
 local M = {}
 
-local ns = vim.api.nvim_create_namespace("dbear.tree.status")
 local group = vim.api.nvim_create_augroup("dbear.tree", { clear = true })
 local files_group = vim.api.nvim_create_augroup("dbear.tree.files", { clear = true })
 
@@ -61,45 +61,79 @@ local function folder_of(buf)
 end
 M.folder_of = folder_of
 
---- The status line for a folder: listing, or the last listing's error.
-local function status(path)
+--- The listing a folder shows: its key, the connection (nil at the root), the last listing's
+--- error and the key of the listing that failed. A database or schema folder of a connection that
+--- browses databases is its database's listing (its error, else its connection's databases'); any
+--- other folder below the root is its connection's.
+local function listing_of(path)
   local rel = fs.rel(path)
   if rel == "" then
-    if sync.busy.root then
-      return "listing connections…", "DbearSummary"
-    end
-    local err = manifest.get().error
-    return err and ("✗ " .. err .. " (:DbearSync retries)"), "DbearError"
+    return "root", nil, manifest.exists() and manifest.get().error or nil, "root"
   end
-  local hit = rel and manifest.lookup(rel)
+  local hit = rel and manifest.exists() and manifest.lookup(rel)
   if not hit then
-    return sync.busy.root and "listing connections…" or nil, "DbearSummary"
+    return nil
   end
   local c, d = hit.conn, hit.db
-  if sync.busy[sync.conn_key(c.id)] then
-    return (c.browses and "listing databases of " or "listing ") .. c.name .. "…", "DbearSummary"
+  local ck = sync.conn_key(c.id)
+  if hit.level ~= "conn" and c.browses and d then
+    local dk = sync.db_key(c.id, d.name)
+    return dk, c, d.error or c.error, d.error and dk or ck
   end
-  if d and sync.busy[sync.db_key(c.id, d.name)] then
-    return "listing " .. d.name .. "…", "DbearSummary"
+  return ck, c, c.error, ck
+end
+
+--- Failures per listing key in this session, and the failure each key's warning was given for.
+local failures, warned = {}, {}
+
+--- What a listing is about, for its progress: "connections", "databases of Staging", "Staging / app".
+local function label(key)
+  if key == "root" then
+    return "connections"
   end
-  local err = (d and d.error) or c.error
+  local id, db = key:match("^d:(.-)%z(.*)$")
+  id = id or key:match("^c:(.*)$")
+  local c = id and manifest.connection(id)
+  local name = c and c.name or id or key
+  if db then
+    return name .. " / " .. db
+  end
+  return (c and c.browses and "databases of " or "") .. name
+end
+
+sync.on_start = function(key)
+  progress.start(key, label(key))
+end
+
+sync.on_finish = function(key, err)
+  progress.finish(key, err)
   if err then
-    return "✗ " .. err .. " (:DbearSync " .. c.name .. " retries)", "DbearError"
+    failures[key] = (failures[key] or 0) + 1
   end
 end
 
-local function show_status(buf)
-  local path = folder_of(buf)
-  if not path or not vim.api.nvim_buf_is_loaded(buf) then
+--- Coming back to a folder whose last listing failed (and that isn't being listed again): one
+--- warning per failure, with how to retry. The failure itself was an error message; "coming
+--- back" is entering the folder in a window that showed something else, so focusing a window,
+--- `:edit` or a redraw of the same folder says nothing. A failure recorded in an earlier session
+--- (in the manifest) warns once too.
+local function warn_failed(win, path)
+  local was = vim.w[win].dbear_tree_folder
+  vim.w[win].dbear_tree_folder = path
+  if was == path then
     return
   end
-  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-  local text, hl = status(path)
-  vim.b[buf].dbear_tree_status = text
-  if text then
-    -- A line of its own under the first one (`../` in oil): long errors stay readable.
-    pcall(vim.api.nvim_buf_set_extmark, buf, ns, 0, 0, { virt_lines = { { { "dbear: " .. text, hl } } } })
+  local key, c, err, failed = listing_of(path)
+  if not key or not err or sync.busy[key] or sync.busy[failed] then
+    return
   end
+  local n = failures[failed] or 0
+  if warned[failed] == n then
+    return
+  end
+  warned[failed] = n
+  notify("the last listing of " .. (c and label(failed) or "the connections") .. " failed: " .. err .. " "
+    .. sync.retry_hint(c), vim.log.levels.WARN)
 end
 
 --- Shows a folder buffer's new contents: oil re-reads it, other buffers are `:edit`ed.
@@ -116,7 +150,7 @@ local function reload(buf, is_oil)
     local ok, view = pcall(require, "oil.view")
     if ok and view.render_buffer_async then
       if #wins > 0 then
-        pcall(view.render_buffer_async, buf, {}, function() show_status(buf) end)
+        pcall(view.render_buffer_async, buf, {})
       else
         vim.b[buf].oil_dirty = {}
       end
@@ -126,33 +160,19 @@ local function reload(buf, is_oil)
   end
 end
 
-local timer
-local function refresh_all(reread)
+local function refresh_all()
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     local path, is_oil = folder_of(buf)
     if path then
-      if reread then
-        reload(buf, is_oil)
-      end
-      show_status(buf)
+      reload(buf, is_oil)
     end
-  end
-  -- While something is listed, keep the statuses up (folder plugins redraw their buffers).
-  if not sync.idle() and not timer then
-    timer = vim.uv.new_timer()
-    timer:start(300, 300, vim.schedule_wrap(function()
-      refresh_all(false)
-      if sync.idle() and timer then
-        timer:stop()
-        timer:close()
-        timer = nil
-      end
-    end))
   end
 end
 
 sync.on_change = function(changed)
-  vim.schedule(function() refresh_all(changed) end)
+  if changed then
+    vim.schedule(refresh_all)
+  end
 end
 
 -- MARK: Renamed folders
@@ -730,7 +750,9 @@ function M.attach()
           root_buffer_modifiable(ev.buf)
         end
         M.entered(path)
-        show_status(ev.buf)
+        warn_failed(vim.api.nvim_get_current_win(), path)
+      elseif vim.w.dbear_tree_folder then
+        vim.w.dbear_tree_folder = nil -- left the mirror's folders: entering one again is coming back
       end
     end,
   })

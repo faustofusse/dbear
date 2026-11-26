@@ -18,6 +18,9 @@ M.busy = {}
 M.listed = {}
 --- Called when a listing starts (`false`) and ends (`true`: folders may have changed).
 M.on_change = function(_) end
+--- Called when the listing of `key` starts, and when it ends (however it ends) with its error.
+M.on_start = function(_) end
+M.on_finish = function(_, _) end
 
 local waiters = {}
 
@@ -41,6 +44,11 @@ function M.db_key(id, db)
   return "d:" .. id .. "\0" .. db
 end
 
+--- How to list a failed listing again: `(:DbearSync[ <conn>] retries)`.
+function M.retry_hint(c)
+  return "(:DbearSync " .. (c and c.name .. " " or "") .. "retries)"
+end
+
 --- Runs `work(done)` once for `key`; callers that come while it runs get the same result.
 local function once(key, cb, work)
   cb = cb or function() end
@@ -50,12 +58,18 @@ local function once(key, cb, work)
   end
   M.busy[key] = true
   waiters[key] = { cb }
+  M.on_start(key)
   M.on_change(false)
-  work(function(err)
+  -- `done(err, msg)`: `msg` is the error message, shown once its progress has ended.
+  work(function(err, msg)
     M.busy[key] = nil
     local list = waiters[key]
     waiters[key] = nil
     M.listed[key] = true
+    M.on_finish(key, err)
+    if msg then
+      notify(msg, vim.log.levels.ERROR)
+    end
     M.on_change(true)
     for _, f in ipairs(list) do
       f(err)
@@ -67,8 +81,7 @@ end
 local function apply(done, fn)
   local ok, err = pcall(fn)
   if not ok then
-    notify(tostring(err), vim.log.levels.ERROR)
-    return done(err)
+    return done(err, tostring(err))
   end
   done(nil)
 end
@@ -284,8 +297,7 @@ function M.root(opts, cb)
         if err then
           manifest.get().error = message(err)
           pcall(manifest.save)
-          notify("can't list the connections: " .. message(err), vim.log.levels.ERROR)
-          return done(err)
+          return done(err, "can't list the connections: " .. message(err) .. " " .. M.retry_hint())
         end
         local again = false
         apply(done, function()
@@ -420,8 +432,7 @@ function M.database(id, db, opts, cb)
           c.error = msg
         end
         pcall(manifest.save)
-        notify("can't list " .. c.name .. (db and " / " .. db or "") .. ": " .. msg, vim.log.levels.ERROR)
-        return done(failed)
+        return done(failed, "can't list " .. c.name .. (db and " / " .. db or "") .. ": " .. msg .. " " .. M.retry_hint(c))
       end
       apply(done, function()
         local database = schemas.target.database
@@ -543,8 +554,7 @@ function M.connection(id, opts, cb)
       if err then
         c.error = message(err)
         pcall(manifest.save)
-        notify("can't list the databases of " .. c.name .. ": " .. message(err), vim.log.levels.ERROR)
-        return done(err)
+        return done(err, "can't list the databases of " .. c.name .. ": " .. message(err) .. " " .. M.retry_hint(c))
       end
       apply(done, function()
         local list = {}

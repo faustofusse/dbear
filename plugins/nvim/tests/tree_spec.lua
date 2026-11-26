@@ -21,12 +21,16 @@ local function print(s)
 end
 
 local messages = {}
+local progressed = {} -- Progress events (see below)
+local seq = 0 -- orders messages and progress events
 vim.notify = function(msg, level)
-  messages[#messages + 1] = { msg = msg, level = level }
+  seq = seq + 1
+  messages[#messages + 1] = { msg = msg, level = level, seq = seq }
 end
 
 local function test(name, fn)
   messages = {}
+  progressed = {}
   local ok, err = pcall(fn)
   if ok then
     passed = passed + 1
@@ -65,13 +69,38 @@ local function keys(k)
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = vim.api.nvim_get_current_buf(), modeline = false })
 end
 
--- Every request the plugin sends.
+-- Every request the plugin sends. With `slow` > 0, answers arrive that many ms late.
 local calls = {}
+local slow = 0
 local client = dbear.rpc()
 local request = client.request
 client.request = function(self, method, params, cb, fast)
   calls[#calls + 1] = { method = method, connection = params and params.connection, database = params and params.database }
+  if slow > 0 and cb then
+    local answer, ms = cb, slow
+    cb = function(...)
+      local args = { n = select("#", ...), ... }
+      vim.defer_fn(function() answer(unpack(args, 1, args.n)) end, ms)
+    end
+  end
   return request(self, method, params, cb, fast)
+end
+
+-- Progress messages (`nvim_echo` with kind = "progress"), where this Neovim has them.
+local progress = require("dbear.tree.progress")
+local has_progress = vim.fn.exists("##Progress") == 1
+if has_progress then
+  vim.api.nvim_create_autocmd("Progress", {
+    pattern = "dbear",
+    callback = function(ev)
+      local text = ev.data.text
+      if type(text) == "table" then -- chunks
+        text = table.concat(vim.tbl_map(function(c) return type(c) == "table" and c[1] or c end, text))
+      end
+      seq = seq + 1
+      progressed[#progressed + 1] = { id = ev.data.id, status = ev.data.status, text = text, seq = seq }
+    end,
+  })
 end
 local function methods()
   return vim.tbl_map(function(c) return c.method .. (c.connection and " " .. c.connection or "") end, calls)
@@ -229,15 +258,179 @@ test("a browsing connection: databases first, then each database when entered", 
   eq({ "staging-pg", "app_test", true }, { h.connection, h.database, h.browses }, "header")
 end)
 
-test("an unreachable server: the error is shown, nothing is created", function()
+--- Messages at `level` that contain `text`.
+local function notified(level, text)
+  local out = {}
+  for _, m in ipairs(messages) do
+    if m.level == level and (not text or m.msg:find(text, 1, true)) then
+      out[#out + 1] = m.msg
+    end
+  end
+  return out
+end
+
+--- Extmarks (any namespace) in the folder buffers: the mirror never adds any.
+local function folder_marks()
+  local n = 0
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) and tree.folder_of(buf) then
+      n = n + #vim.api.nvim_buf_get_extmarks(buf, -1, 0, -1, {})
+    end
+  end
+  return n
+end
+
+test("an unreachable server: the error is notified once, nothing is created", function()
   calls = {}
   enter("Replica")
   eq({ "databases.list prod-replica" }, methods(), "tried")
   eq({}, ls("Replica"), "nothing")
-  local st = vim.b.dbear_tree_status or ""
-  assert(st:find("✗", 1, true) and st:find("could not connect", 1, true), "status: " .. st)
-  assert(messages[#messages].msg:find("could not connect", 1, true), "notified")
+  local errs = notified(vim.log.levels.ERROR)
+  eq(1, #errs, "one error: " .. vim.inspect(messages))
+  assert(errs[1]:find("could not connect", 1, true) and errs[1]:find("(:DbearSync Replica retries)", 1, true), errs[1])
   assert(manifest.connection("prod-replica").error, "recorded")
+  -- Entering the same folder again (focus, :edit, a redraw) says nothing more.
+  vim.cmd("doautocmd BufEnter")
+  enter("Replica")
+  eq(1, #messages, "no repeat: " .. vim.inspect(messages))
+  -- Coming back to it (it isn't listed again): one warning with the hint, once per failure.
+  local buf = vim.api.nvim_get_current_buf()
+  enter("")
+  vim.cmd("buffer " .. buf) -- the same buffer, as oil does
+  local warns = notified(vim.log.levels.WARN)
+  eq(1, #warns, "one warning: " .. vim.inspect(messages))
+  assert(warns[1]:find("the last listing of databases of Replica failed", 1, true) and warns[1]:find("(:DbearSync Replica retries)", 1, true), warns[1])
+  enter("")
+  vim.cmd("buffer " .. buf)
+  eq(1, #notified(vim.log.levels.WARN), "not again for the same failure")
+  eq(0, folder_marks(), "no extmarks")
+  eq(nil, vim.b.dbear_tree_status, "no status variable")
+  eq({}, progressed, "a quick failure shows no progress")
+end)
+
+test("a slow listing shows one progress item, which ends; nothing stays", function()
+  slow = 600
+  enter("Staging/postgres")
+  slow = 0
+  assert(#ls("Staging/postgres") > 0, "listed")
+  eq(false, progress.active(), "nothing pending")
+  eq({}, notified(vim.log.levels.INFO), "no messages: " .. vim.inspect(messages))
+  if has_progress then
+    eq("echo", progress.backend(), "this Neovim's progress messages")
+    assert(#progressed >= 2, vim.inspect(progressed))
+    local id = progressed[1].id
+    for _, p in ipairs(progressed) do
+      eq(id, p.id, "one item")
+    end
+    eq("running", progressed[1].status, "first")
+    assert(progressed[1].text:find("listing Staging / postgres…", 1, true), progressed[1].text)
+    eq("success", progressed[#progressed].status, "ended")
+    assert(progressed[#progressed].text:find("listed Staging / postgres", 1, true), progressed[#progressed].text)
+  else
+    eq("notify", progress.backend(), "no progress messages in this Neovim")
+  end
+  eq(0, folder_marks(), "no extmarks")
+end)
+
+test("an instant listing shows no progress", function()
+  local done
+  require("dbear.tree.sync").root(nil, function(e) done = { e } end)
+  wait("root", function() return done ~= nil end)
+  eq(nil, done[1], "listed")
+  vim.wait(progress.delay + 150)
+  eq({}, progressed, "no progress item")
+  eq({}, messages, "no message")
+  eq(false, progress.active(), "nothing pending")
+end)
+
+test("a slow failure ends its progress and notifies the error once; coming back warns once", function()
+  slow = 600
+  local err = sync("Replica")
+  slow = 0
+  assert(err, "fails")
+  eq(false, progress.active(), "nothing pending")
+  local errs = notified(vim.log.levels.ERROR)
+  eq(1, #errs, "one error: " .. vim.inspect(messages))
+  assert(errs[1]:find("(:DbearSync Replica retries)", 1, true), errs[1])
+  if has_progress then
+    assert(#progressed >= 2, vim.inspect(progressed))
+    eq("running", progressed[1].status, "first")
+    eq("failed", progressed[#progressed].status, "ended as failed")
+    assert(progressed[#progressed].text:find("couldn't list databases of Replica", 1, true), progressed[#progressed].text)
+    local err_seq
+    for _, m in ipairs(messages) do
+      if m.level == vim.log.levels.ERROR then
+        err_seq = m.seq
+      end
+    end
+    assert(progressed[#progressed].seq < err_seq, "the progress ends before the error, which stays on screen")
+  end
+  -- Coming back to the folder (it isn't listed again): one warning with the hint, then quiet.
+  messages = {}
+  calls = {}
+  enter("Replica")
+  eq({}, methods(), "not retried by entering")
+  local warns = notified(vim.log.levels.WARN)
+  eq(1, #warns, "one warning: " .. vim.inspect(messages))
+  assert(warns[1]:find("the last listing of databases of Replica failed", 1, true) and warns[1]:find("(:DbearSync Replica retries)", 1, true), warns[1])
+  vim.cmd("doautocmd BufEnter")
+  enter("Replica")
+  local buf = vim.api.nvim_get_current_buf()
+  vim.cmd("enew")
+  vim.cmd("buffer " .. buf)
+  eq(1, #messages, "no repeats: " .. vim.inspect(messages))
+  eq(false, progress.active(), "nothing pending")
+  eq(0, folder_marks(), "no extmarks")
+end)
+
+test("fidget's progress API when it's installed; else one message when a listing starts", function()
+  local handles = {}
+  package.loaded["fidget.progress"] = nil
+  package.preload["fidget.progress"] = function()
+    return {
+      handle = {
+        create = function(msg)
+          local h = { created = vim.deepcopy(msg), reports = {}, finished = 0 }
+          function h:report(p) table.insert(self.reports, p) end
+          function h:finish() self.finished = self.finished + 1 end
+          handles[#handles + 1] = h
+          return h
+        end,
+      },
+    }
+  end
+  local ok, err = pcall(function()
+    eq("fidget", progress.backend(), "fidget first")
+    require("dbear.tree.sync").listed[require("dbear.tree.sync").db_key("staging-pg", "postgres")] = nil
+    vim.cmd("enew")
+    slow = 600
+    enter("Staging/postgres")
+    slow = 0
+    eq(1, #handles, "one handle")
+    eq("listing Staging / postgres…", handles[1].created.message, "its message")
+    eq(1, handles[1].finished, "finished")
+    eq("listed Staging / postgres", handles[1].reports[#handles[1].reports].message, "done")
+    eq({}, progressed, "not also a progress message")
+    eq({}, messages, "no other message")
+  end)
+  package.preload["fidget.progress"] = nil
+  package.loaded["fidget.progress"] = nil
+  assert(ok, err)
+  -- Without fidget nor progress messages (Neovim 0.10, 0.11): one INFO message when it starts.
+  progress.force = "notify"
+  ok, err = pcall(function()
+    require("dbear.tree.sync").listed[require("dbear.tree.sync").db_key("staging-pg", "postgres")] = nil
+    vim.cmd("enew")
+    slow = 600
+    enter("Staging/postgres")
+    slow = 0
+    eq({ "dbear: listing Staging / postgres…" }, vim.tbl_map(function(m) return m.msg end, messages), "one message")
+    eq(vim.log.levels.INFO, messages[1].level, "INFO")
+    eq({}, progressed, "no progress message")
+  end)
+  progress.force = nil
+  slow = 0
+  assert(ok, err)
 end)
 
 test("a failed listing keeps the previous tree", function()
@@ -247,13 +440,18 @@ test("a failed listing keeps the previous tree", function()
   assert(err, "fails")
   eq(before, ls("Shop/shop.db/main"), "files kept")
   assert(read("Shop/shop.db/main/users.table"):find("email", 1, true), "content kept")
+  eq(1, #notified(vim.log.levels.ERROR, "(:DbearSync Shop retries)"), "error once: " .. vim.inspect(messages))
+  messages = {}
   enter("Shop/shop.db/main")
-  local st = vim.b.dbear_tree_status or ""
-  assert(st:find("✗", 1, true), "status shows the error: " .. st)
+  local warns = notified(vim.log.levels.WARN)
+  eq(1, #warns, "coming back warns: " .. vim.inspect(messages))
+  assert(warns[1]:find("the last listing of Shop failed", 1, true) and warns[1]:find("(:DbearSync Shop retries)", 1, true), warns[1])
   store("update connections set database = '" .. os.getenv("DBEAR_TEST_SHOP") .. "' where id = 'shop'")
   eq(nil, sync("shop"), "works again")
+  messages = {}
+  vim.cmd("enew")
   enter("Shop/shop.db/main")
-  eq(nil, vim.b.dbear_tree_status, "error cleared")
+  eq({}, messages, "nothing once it works")
 end)
 
 test("sync adds and removes tables, renames and removes connections, on read-only folders", function()

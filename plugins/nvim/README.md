@@ -192,10 +192,15 @@ the columns.
 any directory buffer) reads the connections from the store (no network). Entering a connection's
 folder lists its databases (or, for a connection with one database, its tables); entering a
 database or schema folder lists its tables. Each folder is listed again the first time you enter it
-in a session (`relist = "never"`: only once). While it's listed, the folder's buffer says so under
-its first line (`dbear: listing Staging…`), and it's redrawn when done (oil's `watch_for_changes`
-isn't needed). A failed listing (server down, keychain denied) leaves the previous tree as it was;
-the error is shown there (`dbear: ✗ …`) and as a message, and `:DbearSync <conn>` tries again.
+in a session (`relist = "never"`: only once). The folder's buffer is redrawn when its listing is done
+(oil's `watch_for_changes` isn't needed). A listing that takes more than a moment (a quarter of a
+second) shows one progress item, `listing Staging…`, ended when the listing ends: with
+[fidget.nvim](https://github.com/j-hui/fidget.nvim) when it's installed (its progress API), else as
+a Neovim progress message (`nvim_echo` with `kind = "progress"`, Neovim 0.12+), else as one message
+when it starts. Quick listings (the root's, which only reads the store) show nothing. A failed
+listing (server down, keychain denied) leaves the previous tree as it was and is reported once as
+an error (`vim.notify`), with how to retry (`:DbearSync <conn> retries`). Entering that folder again
+doesn't retry it: it warns, once per folder buffer, that its last listing failed.
 `:DbearSync` (no argument) only lists what was listed before, so it never reaches a server you
 haven't browsed. Dropped tables and removed connections disappear on the next listing; a renamed
 connection's folder is renamed with its contents.

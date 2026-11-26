@@ -276,8 +276,11 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   (`#dbear-mirror v1 {json target}`) and the column list (`columns.list`, one call per database); a `BufReadCmd`
   on them opens `browse.grid` instead (`-` goes to the folder). Nothing is listed at startup: a `BufEnter` on a
   mirror folder (oil://, netrw, any directory buffer) lists it once per session (`tree.sync`: root =
-  `connections.list`, connection = `databases.list`, database = `schemas.list` + `columns.list`); failures keep
-  the tree and show `dbear: ✗ …` under the folder's first line. `tree.names` escapes names reversibly (`%XX`,
+  `connections.list`, connection = `databases.list`, database = `schemas.list` + `columns.list`); listings that run
+  over 250 ms show one progress item until they end (`tree.progress`: fidget.nvim's progress API if installed, else
+  `nvim_echo` `kind = "progress"` (0.12+), else one INFO `vim.notify`); failures keep the tree and are one ERROR
+  `vim.notify` with the `:DbearSync <conn>` hint, and entering a failed folder again warns once per buffer (no
+  virtual text in folder buffers). `tree.names` escapes names reversibly (`%XX`,
   `%-` empty, `%~N` for siblings the file system can't tell apart, `%+hash` cut), but entries map to targets
   through `<root>/.dbear-mirror.json` (`tree.manifest`) and the headers, never by parsing names. Folders are
   555 and files 444 (a file is 644 while its rows buffer is loaded: Vim refuses `:w` otherwise); every disk
