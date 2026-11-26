@@ -224,6 +224,9 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   duration, `schema_changed`, sources): 10 000-row cap, history as the apps record it (rows affected or rows
   returned; cancelled runs aren't recorded). `save` writes the store, then the keychain (the SSH secret is deleted
   without a tunnel or with Agent auth); `delete` also removes both keychain entries, the history and the caches.
+  `table_editing` / `preview_table_changes` / `apply_table_changes` (`editing.rs`): what a client may edit in a
+  table (`TableEditing`: read-only reason, key, binary/read-only columns, links by column name), checked before any
+  SQL, applied in one transaction, optionally only if the SQL is what the user reviewed.
   `dump_options` / `restore_options` normalize per kind (Insert unless Postgres, `create_database` MySQL only,
   MySQL restores outside a transaction). GPUI keeps paging, edit staging and the session JSON.
 - CLI (`apps/cli`, binary `dbear-cli`; the GPUI binary is `dbear`): `ls`, `dbs`, `tables`, `describe`, `rows`,
@@ -248,3 +251,29 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   `:DbearDescribe`, `:DbearCancel`, `:DbearHistory`), the `dbear://results` split and the `omnifunc` (a synchronous
   `complete` call; offsets are UTF-8 bytes on both sides). A buffer's connection is `b:dbear_connection`. It records
   history (`record_history = true` by default).
+  The browser (`dbear.browse.*`, oil.nvim style; `:DbearOpen!`, or `:e dbear://…`): `dbear://` lists connections,
+  `dbear://<conn>/` its databases or tables, `dbear://<conn>/[<db>/]<schema>.<table>[?where=…&sort=…]` is the table's
+  rows as an editable buffer (`browse.grid`). Each line starts with a concealed row id (`/007:`) mapping to the row
+  as loaded (its key values); `browse.diff` compares the text with the loaded rows: a missing id is a DELETE, a
+  changed cell an UPDATE of that cell only, a repeated id (yyp) or a line without one an INSERT. Cells are separated
+  by `|` with lossless escapes (`browse.cells`: `\\ \| \n \t \r \s \xHH`, whole-cell `\N` NULL, `\D` DEFAULT,
+  `\e` ''); values wider than `browse.max_width` are cut (`…`) and refused if edited in the line: `<CR>` edits a
+  cell's whole value in a buffer of its own. `:w` sends `RowChange`s to `table.changes.preview`, shows the SQL in a
+  float, then `table.changes.apply` with the reviewed SQL (Lua never builds SQL). Loading rows never leaves an undo
+  step (undoing it would look like deletes): the history restarts when a page loads; realigning joins the edit's
+  undo step and is skipped on undo/redo states. What can be edited comes from `dbservice::TableEditing`
+  (`table.editable`), which also checks the changes server-side.
+  The mirror (`dbear.tree.*`; `:DbearOpen` opens its root, `:DbearSync[!]`, `:DbearFind`, `:DbearGrep`): real
+  folders `<root>/<connection>/<database>/<schema>/<table>.table|.view` (root `tree.root`, default
+  `stdpath("cache")/dbear/tree`; always four levels: one database folder for connections that don't browse
+  databases, SQLite's named after its file) for oil, netrw, telescope… Table files hold a header line
+  (`#dbear-mirror v1 {json target}`) and the column list (`columns.list`, one call per database); a `BufReadCmd`
+  on them opens `browse.grid` instead (`-` goes to the folder). Nothing is listed at startup: a `BufEnter` on a
+  mirror folder (oil://, netrw, any directory buffer) lists it once per session (`tree.sync`: root =
+  `connections.list`, connection = `databases.list`, database = `schemas.list` + `columns.list`); failures keep
+  the tree and show `dbear: ✗ …` under the folder's first line. `tree.names` escapes names reversibly (`%XX`,
+  `%-` empty, `%~N` for siblings the file system can't tell apart, `%+hash` cut), but entries map to targets
+  through `<root>/.dbear-mirror.json` (`tree.manifest`) and the headers, never by parsing names. Folders are
+  555 and files 444 (a file is 644 while its rows buffer is loaded: Vim refuses `:w` otherwise); every disk
+  change goes through `tree.fs`, which refuses anything outside the root (symlinks resolved, never followed)
+  and a non-empty root without a manifest. URL connections aren't mirrored.

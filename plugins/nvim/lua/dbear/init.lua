@@ -15,6 +15,15 @@ M.config = {
   null = "NULL", -- how NULL looks (highlighted DbearNull, so it differs from the text "NULL")
   max_width = 60, -- cut cells wider than this (display cells; 0: never)
   split = "botright 15split", -- how the results window opens
+  browse = {
+    page_size = 100, -- rows per page in table buffers
+    max_width = 40, -- longer values are cut (…) in table buffers; edit them with <CR>
+  },
+  tree = { -- the mirror: connections as folders, tables as files (see :h dbear / README)
+    enabled = true, -- false: no mirror; :DbearOpen opens the dbear:// list
+    root = nil, -- default: stdpath("cache") .. "/dbear/tree"
+    relist = "session", -- list a folder again the first time it's entered in a session; "never": only once
+  },
 }
 
 local client
@@ -42,8 +51,9 @@ end
 M.rpc = rpc
 
 function M.setup(opts)
-  M.config = vim.tbl_extend("force", M.config, opts or {})
+  M.config = vim.tbl_deep_extend("force", M.config, opts or {})
   render.opts.null, render.opts.max_width = M.config.null, M.config.max_width
+  require("dbear.tree").attach()
   if client then -- the next request starts the server with the new options
     client:stop()
     client = nil

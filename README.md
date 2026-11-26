@@ -163,6 +163,10 @@ tunnels.
 
 The [Neovim plugin](plugins/nvim/README.md) runs the buffer or a selection on a saved connection
 (`:Dbear`, `:DbearRun`). It shows the results in a split, and completes table and column names.
+Your connections, databases and tables are mirrored as folders and files (listed lazily, when you
+enter them), so [oil.nvim](https://github.com/stevearc/oil.nvim), netrw or telescope browse them and
+find a table or a column (`:DbearOpen`, `:DbearFind`, `:DbearGrep`). Opening a table shows its rows
+as a buffer you edit with Vim commands, and `:w` shows the SQL before it runs.
 
 ## Building from source
 
