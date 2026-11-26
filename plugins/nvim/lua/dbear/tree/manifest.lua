@@ -1,19 +1,23 @@
 --- The mirror's manifest (`<root>/.dbear-mirror.json`): what each folder and file stands for, by
 --- exact name, so nothing is ever read back from an escaped file name.
 ---
----   { version = 1, error?, connections = { {
+---   { version = 2, error?, connections = { {
 ---       id, name, kind, browses, dir, listed?, error?,
 ---       databases = { { name, dir, listed?, error?,
 ---         schemas = { { name, dir, tables = { { name, kind, file } } } } } } } } }
 ---
 --- `dir`/`file` are the entry's file name in its parent folder. `listed` is when it was last listed
 --- (os.time()), `error` why the last listing failed (the previous entries are kept).
+---
+--- Version 1 named table files `<table>.table` and `<view>.view`; version 2 names them `<table>`.
+--- A version 1 manifest is loaded as it is, with `migrate_from = 1` (never saved): `sync.migrate`
+--- renames its files and saves it as version 2 before anything else touches the mirror.
 
 local fs = require("dbear.tree.fs")
 
 local M = {}
 
-M.VERSION = 1
+M.VERSION = 2
 
 local data -- the manifest, loaded once per root
 
@@ -30,6 +34,9 @@ function M.get()
   local ok, decoded = pcall(vim.json.decode, text or "", { luanil = { object = true, array = true } })
   if ok and type(decoded) == "table" and decoded.version == M.VERSION then
     data = decoded
+  elseif ok and type(decoded) == "table" and decoded.version == 1 then
+    data = decoded
+    data.migrate_from = 1
   else
     data = { version = M.VERSION }
   end
@@ -52,7 +59,11 @@ function M.exists()
 end
 
 function M.save()
-  fs.write_manifest(vim.json.encode(M.get()))
+  local m = M.get()
+  if m.migrate_from then
+    error("dbear mirror: the manifest hasn't been migrated yet", 0)
+  end
+  fs.write_manifest(vim.json.encode(m))
 end
 
 function M.connection(id)

@@ -1,13 +1,15 @@
 --- The mirror: the saved connections as real folders and files, so oil.nvim, netrw, telescope or
 --- anything else that works on paths can browse them.
 ---
----   <root>/<connection>/<database>/<schema>/<table>.table   (and <view>.view)
+---   <root>/<connection>/<database>/<schema>/<table>   (views too: no suffix)
 ---
 --- Always four levels. Database folders are what `databases.list` returns for connections that
 --- browse their server's databases; other connections have one, their own database (for SQLite the
 --- file's name). Schema folders are `schemas.list`'s (`main` for SQLite, the database again for
 --- MySQL, which has no schemas below databases). A table file holds a header line with its exact
---- target and its column list; opening it shows the editable rows buffer (`browse.grid`) instead.
+--- target and kind and its column list; opening it shows the editable rows buffer (`browse.grid`)
+--- instead. A table file is recognized by where it is (a regular file exactly four levels below the
+--- root) and its header (`is_table_file`), never by its name: anything else is read as usual.
 ---
 --- Nothing is listed at startup. Entering the root lists the connections (from the store, no
 --- network); entering a connection folder lists its databases, or its own database's tables;
@@ -20,6 +22,8 @@ local progress = require("dbear.tree.progress")
 local sync = require("dbear.tree.sync")
 
 local M = {}
+
+local migrate
 
 local group = vim.api.nvim_create_augroup("dbear.tree", { clear = true })
 local files_group = vim.api.nvim_create_augroup("dbear.tree.files", { clear = true })
@@ -428,6 +432,14 @@ end
 
 -- MARK: Lazy listing
 
+--- An old mirror (table files named `*.table`, `*.view`) is renamed before anything uses it.
+migrate = function()
+  local ok, err = pcall(sync.migrate)
+  if not ok then
+    notify(tostring(err), vim.log.levels.ERROR)
+  end
+end
+
 local last_root = 0
 
 local function listed(key, entry)
@@ -443,6 +455,7 @@ function M.entered(path)
   if not rel then
     return
   end
+  migrate()
   if rel == "" or not manifest.exists() then
     if vim.uv.now() - last_root > 2000 then
       last_root = vim.uv.now()
@@ -470,15 +483,50 @@ end
 
 -- MARK: Table files
 
---- BufReadCmd for a table file: the rows buffer of the target in its header.
+--- The header of the table file at `path` (a buffer name: under the root or its realpath), or
+--- nil when it isn't one: a regular file (not a symlink) exactly four levels below the root whose
+--- first line is a mirror header.
+function M.table_header(path)
+  local rel = fs.rel(path)
+  if not rel or select(2, rel:gsub("/", "")) ~= 3 then
+    return nil
+  end
+  local file = fs.inside(path)
+  if fs.kind(file) ~= "file" then
+    return nil
+  end
+  return sync.parse_header((fs.read(file) or ""):match("^[^\n]*"))
+end
+
+--- What BufReadCmd does for a file it caught that isn't a table file: what Vim does without one
+--- (read the file, or start a new one; filetype detection and modelines through BufReadPost).
+local function plain_read(buf, path)
+  vim.api.nvim_buf_call(buf, function()
+    local name = vim.api.nvim_buf_get_name(buf)
+    if vim.uv.fs_stat(path) then
+      vim.api.nvim_exec_autocmds("BufReadPre", { buffer = buf, modeline = false })
+      local undolevels = vim.bo[buf].undolevels
+      vim.bo[buf].undolevels = -1 -- reading isn't a change to undo
+      vim.cmd("silent keepalt keepjumps read ++edit " .. vim.fn.fnameescape(path))
+      vim.cmd("silent keepjumps 1delete _")
+      vim.bo[buf].undolevels = undolevels
+      vim.bo[buf].modified = false
+      vim.api.nvim_exec_autocmds("BufReadPost", { buffer = buf })
+    else
+      vim.api.nvim_exec_autocmds("BufNewFile", { buffer = buf })
+    end
+    if name ~= vim.api.nvim_buf_get_name(buf) then
+      pcall(vim.api.nvim_buf_set_name, buf, name)
+    end
+  end)
+end
+
+--- BufReadCmd for a file four or more levels below the root: a table file's rows buffer (the
+--- target in its header), anything else read as usual.
 function M.read_file(buf, path)
-  local text = fs.read(path) or ""
-  local h = sync.parse_header(text:match("^[^\n]*"))
+  local h = M.table_header(path)
   if not h then
-    vim.bo[buf].buftype = "nofile"
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "Error: not a dbear mirror table file (no header): " .. path })
-    vim.bo[buf].modified = false
-    return
+    return plain_read(buf, path)
   end
   require("dbear.browse.grid").open(buf, {
     kind = "table",
@@ -636,6 +684,7 @@ function M.files()
   if not manifest.exists() then
     return out
   end
+  migrate()
   for _, c in ipairs(manifest.get().connections) do
     for _, d in ipairs(c.databases) do
       for _, s in ipairs(d.schemas) do
@@ -645,7 +694,14 @@ function M.files()
       end
     end
   end
+  table.sort(out)
   return out
+end
+
+--- Whether `rel` (relative to the root) is where a table file can be: four levels down. The
+--- manifest (`.dbear-mirror.json`, at the root) and anything else never is.
+local function table_level(rel)
+  return select(2, rel:gsub("/", "")) == 3
 end
 
 local function telescope()
@@ -653,31 +709,51 @@ local function telescope()
   return ok and builtin or nil
 end
 
---- `:DbearFind`: pick a table (telescope's find_files on the root, else vim.ui.select).
+--- `:DbearFind`: pick a table (a telescope file picker over the manifest's table files, else
+--- vim.ui.select).
 function M.find()
   if not manifest.exists() then
     return notify("nothing in the mirror yet: browse it (:DbearOpen) or :DbearSync", vim.log.levels.WARN)
   end
-  local builtin = telescope()
-  if builtin then
-    return builtin.find_files({ cwd = fs.root(), prompt_title = "dbear tables" })
+  local files = M.files()
+  if telescope() then
+    local pickers = require("telescope.pickers")
+    local finders = require("telescope.finders")
+    local make_entry = require("telescope.make_entry")
+    local conf = require("telescope.config").values
+    local opts = { cwd = fs.root() }
+    return pickers.new(opts, {
+      prompt_title = "dbear tables",
+      finder = finders.new_table({ results = files, entry_maker = make_entry.gen_from_file(opts) }),
+      previewer = conf.file_previewer(opts),
+      sorter = conf.file_sorter(opts),
+    }):find()
   end
-  vim.ui.select(M.files(), { prompt = "dbear table" }, function(file)
+  vim.ui.select(files, { prompt = "dbear table" }, function(file)
     if file then
       vim.cmd.edit(vim.fn.fnameescape(fs.root() .. "/" .. file))
     end
   end)
 end
 
---- `:DbearGrep [pattern]`: search the column lists (telescope's live_grep on the root, else
---- ripgrep or grep into the quickfix list).
+--- Globs that keep searches to table files: not the manifest (nor its temp file).
+local EXCLUDE = fs.MANIFEST .. "*"
+
+--- `:DbearGrep [pattern]`: search the table files (columns, and `table`/`view` in their comment
+--- line): telescope's live_grep on the root, else ripgrep or grep into the quickfix list.
 function M.grep(pattern)
   if not manifest.exists() then
     return notify("nothing in the mirror yet: browse it (:DbearOpen) or :DbearSync", vim.log.levels.WARN)
   end
+  migrate()
   local builtin = telescope()
   if builtin then
-    return builtin.live_grep({ cwd = fs.root(), prompt_title = "dbear columns", default_text = pattern })
+    return builtin.live_grep({
+      cwd = fs.root(),
+      prompt_title = "dbear columns",
+      default_text = pattern,
+      glob_pattern = { "!" .. EXCLUDE },
+    })
   end
   if not pattern or pattern == "" then
     return vim.ui.input({ prompt = "dbear grep: " }, function(p)
@@ -686,13 +762,14 @@ function M.grep(pattern)
       end
     end)
   end
-  local cmd = vim.fn.executable("rg") == 1 and { "rg", "--vimgrep", "--no-heading", "-g", "*.table", "-g", "*.view", "--", pattern, "." }
-    or { "grep", "-rnI", "--include=*.table", "--include=*.view", "--", pattern, "." }
+  local cmd = vim.fn.executable("rg") == 1
+      and { "rg", "--vimgrep", "--no-heading", "--color", "never", "--max-depth", "4", "-g", "!" .. EXCLUDE, "--", pattern, "." }
+    or { "grep", "-rnI", "--exclude=" .. EXCLUDE, "--", pattern, "." }
   local out = vim.system(cmd, { cwd = fs.root(), text = true }):wait()
   local items = {}
   for line in (out.stdout or ""):gmatch("[^\n]+") do
     local file, lnum, text = line:match("^%./?([^:]+):(%d+):(.*)$")
-    if file then
+    if file and table_level(file) then
       text = text:gsub("^%d+:", "") -- rg's column
       items[#items + 1] = { filename = fs.root() .. "/" .. file, lnum = tonumber(lnum), text = text }
     end
@@ -730,10 +807,11 @@ function M.attach()
   if fs.real_root() and fs.real_root() ~= fs.root() then
     roots[2] = fs.real_root()
   end
+  -- Table files have no suffix: everything four (`*` also matches `/`: or more) levels below the
+  -- root is caught, and `read_file` reads what isn't a table file as Vim would.
   local patterns = {}
   for _, r in ipairs(roots) do
-    patterns[#patterns + 1] = pattern(r) .. "/*.table"
-    patterns[#patterns + 1] = pattern(r) .. "/*.view"
+    patterns[#patterns + 1] = pattern(r) .. "/*/*/*/*"
   end
   vim.api.nvim_create_autocmd("BufReadCmd", {
     group = group,

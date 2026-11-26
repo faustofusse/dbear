@@ -136,10 +136,10 @@ test("oil: root → connection (listed on entering) → table → rows → :w �
   select("shop.db")
   wait("main", function() return oil_ready() and vim.tbl_contains(entries(), "main") end)
   select("main")
-  wait("tables", function() return oil_ready() and vim.tbl_contains(entries(), "users.table") end)
-  select("users.table")
+  wait("tables", function() return oil_ready() and vim.tbl_contains(entries(), "users") end)
+  select("users")
   wait("rows", function() return state() and state().ready end)
-  eq(mirror .. "/Shop/shop.db/main/users.table", bufname(), "the file")
+  eq(mirror .. "/Shop/shop.db/main/users", bufname(), "the file")
   local st = state()
   local l = lines()[2]
   vim.api.nvim_win_set_cursor(0, { 2, l:find("Bo", 1, true) - 1 })
@@ -151,17 +151,17 @@ test("oil: root → connection (listed on entering) → table → rows → :w �
   wait("saved", function() return not st.saving and not st.loading end)
   eq({ { "Bob" } }, run("shop", "select name from users where id = 2"), "saved in the database")
   keys("-")
-  wait("oil folder", function() return oil_ready() and vim.tbl_contains(entries(), "users.table") end)
+  wait("oil folder", function() return oil_ready() and vim.tbl_contains(entries(), "users") end)
   eq("oil://" .. mirror .. "/Shop/shop.db/main/", bufname(), "back in oil, in the table's folder")
 end)
 
 test("oil: deleting or renaming a table line fails harmlessly, the mirror stays", function()
   vim.cmd.edit(vim.fn.fnameescape(mirror .. "/Shop/shop.db/main"))
-  wait("oil", function() return oil_ready() and vim.tbl_contains(entries(), "users.table") end)
+  wait("oil", function() return oil_ready() and vim.tbl_contains(entries(), "users") end)
   local before = entries()
   for i = 1, vim.api.nvim_buf_line_count(0) do
     local e = require("oil").get_entry_on_line(0, i)
-    if e and e.name == "orders.table" then
+    if e and e.name == "orders" then
       vim.api.nvim_win_set_cursor(0, { i, 0 })
     end
   end
@@ -184,7 +184,7 @@ test("oil: deleting or renaming a table line fails harmlessly, the mirror stays"
     end
   end
   wait("oil gave up", function() return not require("oil.mutator").is_mutating() and denied() end)
-  assert(uv.fs_lstat(mirror .. "/Shop/shop.db/main/orders.table"), "the file is still there")
+  assert(uv.fs_lstat(mirror .. "/Shop/shop.db/main/orders"), "the file is still there")
   -- A rename is a "simple edit" (no confirmation with skip_confirm_for_simple_edits): it fails too.
   vim.cmd("edit!")
   wait("oil", function() return oil_ready() and #entries() > 0 end)
@@ -192,15 +192,15 @@ test("oil: deleting or renaming a table line fails harmlessly, the mirror stays"
   vim.bo.modifiable = true
   for i = 1, vim.api.nvim_buf_line_count(0) do
     local e = require("oil").get_entry_on_line(0, i)
-    if e and e.name == "users.table" then
+    if e and e.name == "users" then
       local l = vim.api.nvim_buf_get_lines(0, i - 1, i, false)[1]
-      vim.api.nvim_buf_set_lines(0, i - 1, i, false, { (l:gsub("users%.table", "people.table")) })
+      vim.api.nvim_buf_set_lines(0, i - 1, i, false, { (l:gsub("users$", "people")) })
     end
   end
   vim.cmd("write")
   wait("oil gave up", function() return not require("oil.mutator").is_mutating() and denied() end)
-  assert(uv.fs_lstat(mirror .. "/Shop/shop.db/main/users.table"), "not renamed")
-  eq(nil, uv.fs_lstat(mirror .. "/Shop/shop.db/main/people.table"), "no new name")
+  assert(uv.fs_lstat(mirror .. "/Shop/shop.db/main/users"), "not renamed")
+  eq(nil, uv.fs_lstat(mirror .. "/Shop/shop.db/main/people"), "no new name")
   eq({ { 1 } }, run("shop", "select count(*) from sqlite_master where name = 'orders'"), "the table is still in the database")
   -- After a refresh, oil shows the mirror as it is.
   vim.cmd("edit!")
@@ -216,14 +216,14 @@ test("telescope find_files on the root finds a table and opens its rows", functi
     return prompt
   end)
   local action_state = require("telescope.actions.state")
-  keys("users.table")
+  keys("users")
   wait("results", function()
     local e = action_state.get_selected_entry()
-    return e and (e.value or e[1]) == "Shop/shop.db/main/users.table"
+    return e and (e.value or e[1]) == "Shop/shop.db/main/users"
   end, 5000)
   require("telescope.actions").select_default(prompt)
   wait("rows", function() return state() and state().ready end, 10000)
-  eq(mirror .. "/Shop/shop.db/main/users.table", bufname(), "opened")
+  eq(mirror .. "/Shop/shop.db/main/users", bufname(), "opened")
   eq("dbear_table", vim.bo.filetype, "rows buffer")
 end)
 
@@ -238,13 +238,13 @@ test("telescope live_grep on the root finds a column and opens the rows", functi
   keys("email  text")
   wait("results", function()
     local e = action_state.get_selected_entry()
-    return e and e.filename and e.filename:find("users.table", 1, true)
+    return e and e.filename and e.filename:find("users", 1, true)
   end)
   local e = action_state.get_selected_entry()
-  assert(e.filename:find("Shop/shop.db/main/users.table", 1, true), e.filename)
+  assert(e.filename:find("Shop/shop.db/main/users", 1, true), e.filename)
   require("telescope.actions").select_default(prompt)
   wait("rows", function() return state() and state().ready end, 10000)
-  eq(mirror .. "/Shop/shop.db/main/users.table", bufname(), "opened")
+  eq(mirror .. "/Shop/shop.db/main/users", bufname(), "opened")
 end)
 
 -- MARK: renaming connections from oil
@@ -359,7 +359,7 @@ test("oil: renaming a connection folder renames the connection; nothing else cha
   assert(("\n" .. cli_names()):find("[\t\n]Store[\t\n]"), "dbear-cli ls sees it: " .. cli_names())
   eq(false, vim.tbl_contains(ls(""), "Shop"), "no Shop folder")
   eq(shop, ident("Store"), "the same folder, contents and all")
-  assert(uv.fs_lstat(mirror .. "/Store/shop.db/main/users.table"), "contents kept")
+  assert(uv.fs_lstat(mirror .. "/Store/shop.db/main/users"), "contents kept")
   eq("shop", manifest.lookup("Store").conn.id, "manifest")
   eq("555", mode(""), "root read-only again")
   eq("555", mode("Store"), "folder read-only again")
@@ -440,7 +440,7 @@ test("oil: odd characters, a case-only change, a left-over %~N and a duplicate n
   wait("folders", function() return idle() and manifest.lookup("Shop") and manifest.lookup("Replica") end)
   eq("prod-replica", manifest.lookup("Replica").conn.id, "Replica's folder is plain again")
   eq("other", manifest.lookup("shop%~2").conn.id, "shop is numbered again")
-  assert(uv.fs_lstat(mirror .. "/Shop/shop.db/main/users.table"), "contents followed every rename")
+  assert(uv.fs_lstat(mirror .. "/Shop/shop.db/main/users"), "contents followed every rename")
 end)
 
 test("oil: deleting, creating, copying and moving at the root fail; the store is unchanged", function()
@@ -537,7 +537,7 @@ end)
 test("oil: renaming with a table buffer open (pending edit) keeps the buffer working", function()
   oil_root()
   local folder = manifest.connection("shop").dir
-  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/" .. folder .. "/shop.db/main/users.table"))
+  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/" .. folder .. "/shop.db/main/users"))
   wait("rows", function() return state() and state().ready end)
   local rows = vim.api.nvim_get_current_buf()
   local st = state()
@@ -546,17 +546,17 @@ test("oil: renaming with a table buffer open (pending edit) keeps the buffer wor
   keys("ciwBobby<Esc>")
   vim.api.nvim_exec_autocmds("TextChanged", { buffer = 0 })
   eq(true, vim.bo.modified, "pending edit")
-  eq("644", mode(folder .. "/shop.db/main/users.table"), "writable while loaded")
+  eq("644", mode(folder .. "/shop.db/main/users"), "writable while loaded")
   vim.cmd("split")
   oil_root()
   rename_line(folder, "Renamed")
   oil_write()
   wait("the store", function() return vim.tbl_contains(saved(), "shop=Renamed") end)
   wait("listed", function() return idle() and vim.tbl_contains(ls(""), "Renamed") end)
-  eq(mirror .. "/Renamed/shop.db/main/users.table", fs.inside(vim.api.nvim_buf_get_name(rows)), "the buffer moved with its file")
+  eq(mirror .. "/Renamed/shop.db/main/users", fs.inside(vim.api.nvim_buf_get_name(rows)), "the buffer moved with its file")
   eq(true, vim.bo[rows].modified, "the pending edit is still there")
-  eq("644", mode("Renamed/shop.db/main/users.table"), "still writable while loaded")
-  eq(-1, vim.fn.bufnr("^" .. mirror .. "/" .. folder .. "/shop.db/main/users.table$"), "no buffer left on the old path")
+  eq("644", mode("Renamed/shop.db/main/users"), "still writable while loaded")
+  eq(-1, vim.fn.bufnr("^" .. mirror .. "/" .. folder .. "/shop.db/main/users$"), "no buffer left on the old path")
   vim.cmd("close")
   vim.api.nvim_set_current_buf(rows)
   vim.cmd("write")
@@ -565,10 +565,95 @@ test("oil: renaming with a table buffer open (pending edit) keeps the buffer wor
   wait("saved", function() return not st.saving and not st.loading and not vim.bo[rows].modified end)
   eq({ { "Bobby" } }, run("shop", "select name from users where id = 2"), "saved in the database")
   keys("-")
-  wait("oil folder", function() return oil_ready() and vim.tbl_contains(entries(), "users.table") end)
+  wait("oil folder", function() return oil_ready() and vim.tbl_contains(entries(), "users") end)
   eq("oil://" .. mirror .. "/Renamed/shop.db/main/", bufname(), "- goes to the new folder")
   vim.cmd("bwipeout! " .. rows)
-  eq("444", mode("Renamed/shop.db/main/users.table"), "read-only again once closed")
+  eq("444", mode("Renamed/shop.db/main/users"), "read-only again once closed")
+end)
+
+-- MARK: names without a suffix
+
+--- The entries of the telescope picker in `prompt`, once it has `n` or more (or after `ms`).
+local function picker_entries(prompt, ms, text)
+  local picker = require("telescope.actions.state").get_current_picker(prompt)
+  vim.wait(ms or 1500, function() return false end, 50)
+  eq(text or picker:_get_prompt(), picker:_get_prompt(), "the prompt")
+  local out = {}
+  for e in picker.manager:iter() do
+    out[#out + 1] = e
+  end
+  return out
+end
+
+local function open_picker(cmd)
+  vim.cmd(cmd)
+  local prompt
+  wait("picker", function()
+    prompt = vim.bo.filetype == "TelescopePrompt" and vim.api.nvim_get_current_buf() or nil
+    return prompt
+  end)
+  return prompt
+end
+
+test("oil: a table named like a file type and a view open as rows (the view read-only); - back", function()
+  vim.cmd("filetype on")
+  run("shop", [[create table "notes.md" (id integer primary key, v text); insert into "notes.md" values (1, 'hi')]])
+  local done
+  tree.sync("shop", false, function(e) done = { e } end)
+  wait("sync", function() return done end, 20000)
+  eq(nil, done[1], "synced")
+  local folder = require("dbear.tree.manifest").path(manifest.connection("shop"), manifest.connection("shop").databases[1], manifest.connection("shop").databases[1].schemas[1])
+  vim.cmd.edit(vim.fn.fnameescape(folder))
+  wait("oil", function() return oil_ready() and vim.tbl_contains(entries(), "notes.md") end)
+  eq({ "..", "big", "named", "notes.md", "orders", "users" }, entries(), "no suffixes")
+  select("notes.md")
+  wait("rows", function() return state() and state().ready end)
+  eq(folder .. "/notes.md", bufname(), "the file")
+  eq("dbear_table", vim.bo.filetype, "not markdown")
+  assert(lines()[1]:find("hi", 1, true), vim.inspect(lines()))
+  keys("-")
+  wait("oil", function() return oil_ready() and vim.tbl_contains(entries(), "named") end)
+  select("named")
+  wait("rows", function() return state() and state().ready end)
+  assert(state().read_only, "a view is read-only")
+  eq(false, vim.bo.modifiable, "not modifiable")
+  keys("-")
+  wait("oil", function() return oil_ready() and vim.tbl_contains(entries(), "named") end)
+  eq("oil://" .. folder .. "/", bufname(), "back")
+  run("shop", [[drop table "notes.md"]])
+  done = nil
+  tree.sync("shop", false, function(e) done = { e } end)
+  wait("sync", function() return done end, 20000)
+end)
+
+test("telescope: the pickers never show the manifest, even searching hidden files", function()
+  -- Users often search hidden files: the manifest (\"ident\" is only there) is still left out.
+  local args = vim.deepcopy(require("telescope.config").values.vimgrep_arguments)
+  require("telescope").setup({ defaults = { vimgrep_arguments = vim.list_extend(vim.deepcopy(args), { "--hidden" }) } })
+  local raw = vim.system({ "rg", "--hidden", "-l", "ident", "." }, { cwd = fs.root(), text = true }):wait()
+  assert(raw.stdout:find(".dbear-mirror.json", 1, true), "the manifest has it: " .. raw.stdout)
+  local ok, err = pcall(function()
+    local prompt = open_picker("DbearFind")
+    local found = picker_entries(prompt)
+    eq(#tree.files(), #found, "every table file, nothing else")
+    for _, e in ipairs(found) do
+      local v = e.value or e[1]
+      eq(3, #v:gsub("[^/]", ""), "a table file: " .. v)
+    end
+    require("telescope.actions").close(prompt)
+    prompt = open_picker("DbearGrep")
+    require("telescope.actions.state").get_current_picker(prompt):set_prompt("ident")
+    eq({}, picker_entries(prompt, 2000, "ident"), "nothing from the manifest")
+    require("telescope.actions").close(prompt)
+    prompt = open_picker("DbearGrep")
+    require("telescope.actions.state").get_current_picker(prompt):set_prompt("view in")
+    local views = picker_entries(prompt, 2000, "view in")
+    eq(1, #views, "the view, by its kind: " .. vim.inspect(vim.tbl_map(function(e) return e.filename end, views)))
+    assert(views[1].filename:find("/main/named", 1, true), views[1].filename)
+    require("telescope.actions").close(prompt)
+  end)
+  require("telescope").setup({ defaults = { vimgrep_arguments = args } })
+  assert(ok, err)
 end)
 
 print(string.format("\n%d passed, %d failed", passed, failures))

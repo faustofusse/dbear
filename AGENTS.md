@@ -270,11 +270,18 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   undo step and is skipped on undo/redo states. What can be edited comes from `dbservice::TableEditing`
   (`table.editable`), which also checks the changes server-side.
   The mirror (`dbear.tree.*`; `:DbearOpen` opens its root, `:DbearSync[!]`, `:DbearFind`, `:DbearGrep`): real
-  folders `<root>/<connection>/<database>/<schema>/<table>.table|.view` (root `tree.root`, default
+  folders `<root>/<connection>/<database>/<schema>/<table>` (no suffix, views too; root `tree.root`, default
   `stdpath("cache")/dbear/tree`; always four levels: one database folder for connections that don't browse
   databases, SQLite's named after its file) for oil, netrw, telescope… Table files hold a header line
-  (`#dbear-mirror v1 {json target}`) and the column list (`columns.list`, one call per database); a `BufReadCmd`
-  on them opens `browse.grid` instead (`-` goes to the folder). Nothing is listed at startup: a `BufEnter` on a
+  (`#dbear-mirror v1 {json target}`, with `kind`; the comment line says `table`/`view` for grep) and the column list
+  (`columns.list`, one call per database). They're recognized by position and header, never by name: a `BufReadCmd`
+  on `<root>/*/*/*/*` (and the realpath; `*` crosses `/`) opens `browse.grid` for a regular file exactly four levels
+  down with a header (`tree.table_header`; `-` goes to the folder) and reads anything else as Vim would (BufReadPre,
+  `read ++edit`, BufReadPost); rows buffers set `nomodeline` and `b:editorconfig = false`. `:DbearFind` lists the
+  manifest's files (telescope picker or `vim.ui.select`); `:DbearGrep` excludes `.dbear-mirror.json*` (live_grep
+  `glob_pattern`, rg/grep) and keeps four-level files. Manifest v1 (`*.table`/`*.view` files) is migrated in place
+  and offline by `sync.migrate` before any listing, `entered`, find or grep: contents kept, renamed (buffers follow
+  via `on_moved`), entries whose file is gone or headerless dropped and their database un-`listed`; then saved as v2. Nothing is listed at startup: a `BufEnter` on a
   mirror folder (oil://, netrw, any directory buffer) lists it once per session (`tree.sync`: root =
   `connections.list`, connection = `databases.list`, database = `schemas.list` + `columns.list`); listings that run
   over 250 ms show one progress item until they end (`tree.progress`: fidget.nvim's progress API if installed, else

@@ -167,10 +167,10 @@ table, so anything that works on paths can browse your databases: oil.nvim or ne
 (`~/.cache/nvim/dbear/tree` by default):
 
 ```
-<root>/<connection>/<database>/<schema>/<table>.table     (views: <view>.view)
-Shop/shop.db/main/users.table                 SQLite: the file's name, then its schema "main"
-Staging/app/public/users.table                Postgres: each database of the server, then its schemas
-Work/app/app/users.table                      MySQL: the database, then the database again as its schema
+<root>/<connection>/<database>/<schema>/<table>     (views too, no suffix)
+Shop/shop.db/main/users                 SQLite: the file's name, then its schema "main"
+Staging/app/public/users                Postgres: each database of the server, then its schemas
+Work/app/app/users                      MySQL: the database, then the database again as its schema
 ```
 
 The depth is always four, so a path reads the same for every kind of database: the database
@@ -186,7 +186,24 @@ editing rows. `-` goes to the table's folder (in oil if you use it); filtered vi
 `dbear://` buffers, and `-` there also goes back to the mirror's folder. The file holds a header
 line with the table's exact target and its **columns** (name, type, `PK`, `NULL`/`NOT NULL`), so
 `live_grep` on the root finds a column in every table listed so far, and telescope's previewer shows
-the columns.
+the columns. Its second line says whether it's a table or a view (`-- named: view in Shop / shop.db /
+main`), so `:DbearGrep view in` lists the views; a view's rows buffer is read-only and says why.
+
+**Which files are table files.** Table files have no suffix, so they're recognized by where they
+are, not by name: a regular file exactly four levels below the root (or below its realpath, so
+symlinked roots, `/tmp` vs `/private/tmp` and harpoon-style absolute names work) whose first line is
+the mirror header. Opening one (oil, telescope, `:e`, `gf`, a session) gives its rows buffer whatever
+its name: `users.sql`, `README.md` or `Makefile` get no filetype, no modelines, no swap file and no
+`.editorconfig`. Anything else, `.dbear-mirror.json` included, opens as a normal file.
+`:DbearFind` lists the table files from the manifest (a telescope file picker, else
+`vim.ui.select`), and `:DbearGrep` (telescope's `live_grep`, else `rg` or `grep` into the quickfix
+list) leaves `.dbear-mirror.json` out even when your telescope searches hidden files.
+
+**Mirrors from older versions** named table files `users.table` and `named.view`. The first time the
+plugin uses such a mirror (entering any of its folders, a listing, `:DbearSync`, `:DbearFind`) it
+renames those files in place, offline: the files keep their content, nothing connects to a server,
+databases you never listed stay unlisted, and open table buffers follow their files. A file that
+was missing or damaged is left out and its database is listed again when you enter it.
 
 **Lazy.** Opening Neovim lists nothing and connects to nothing. Entering the root (in oil, netrw or
 any directory buffer) reads the connections from the store (no network). Entering a connection's
@@ -255,7 +272,9 @@ the same way), and the saved connection is renamed in dbear's store (`dbear: ren
 
 **Names.** A file name is the database name, escaped where it has to be: `%` → `%25`;
 `/ \ : * ? " < > |`, control characters and bytes that aren't UTF-8 → `%XX`; a leading or trailing
-`.` or space → `%XX`; an empty name → `%-`. Two names that the file system can't tell apart (`Users`
+`.` or space → `%XX` (so no table file is hidden, and none ends in a `.` or space); an empty name →
+`%-`. Everything else is kept: a table called `x.table` or `data.json` is the file `x.table` or
+`data.json`. Two names that the file system can't tell apart (`Users`
 and `users` on macOS, or two Unicode spellings of `é`) are numbered: the second one gets `%~2`.
 Names longer than 200 bytes are cut and end with `%+<hash>`. Connection folders use the
 connection's name (two connections called `Shop` and `shop` give `Shop` and `shop%~2`). Nothing is

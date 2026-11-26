@@ -11,10 +11,17 @@
 ---   `%+<hash>` at the end: a name too long for a file name, cut (not reversible).
 --- `unescape` reverses it. The mirror never relies on it: each entry's exact target is in the
 --- manifest and in the table file's header.
+---
+--- Table files have no suffix (`users`, not `users.table`): a table's escaped name is its file's
+--- whole name. So a trailing `.` or space (escaped) is the end of the file name, a name such as
+--- `x.table`, `users.sql` or `Makefile` is kept as it is (files are recognized by position and
+--- header, never by name), and a table and a view can't collide (they share a namespace in a
+--- schema); names that differ only by case or normalization still get `%~N`.
 
 local M = {}
 
---- File name components above this many bytes are cut (file systems allow 255).
+--- File name components above this many bytes are cut (file systems allow 255). The rest leaves
+--- room for a `%~N` marker and for names tools derive from a file's (`.x.swp`, `x~`, `x.orig`).
 M.MAX = 200
 
 local reserved = {}

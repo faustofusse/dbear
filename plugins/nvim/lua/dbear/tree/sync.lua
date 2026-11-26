@@ -201,6 +201,119 @@ local function file_content(c, d, database, schema, t, cols, cols_err)
   return table.concat(lines, "\n") .. "\n"
 end
 
+-- MARK: Migration
+
+--- Called with the old and new path of a file or folder that moved (its buffers follow it).
+M.on_moved = function(_, _) end
+
+--- Table files in the order they're named in a schema folder, each given its `file`.
+local function table_items(tables)
+  table.sort(tables, function(a, b) return a.name < b.name end)
+  return names.assign(tables)
+end
+
+--- Mirrors written by manifest version 1 named table files `<table>.table` and `<view>.view`.
+--- Renames them in place to today's names (no suffix), offline: each file's content (header and
+--- columns) is kept, only its name changes, so databases that were never listed stay so and
+--- nothing connects. Files that are gone or have no header are left out, and their database is
+--- listed again the next time it's entered. Anything else in a schema folder (the old names) is
+--- removed by the reconcile. Rows buffers open on an old name follow their file (`on_moved`).
+--- Runs once, before any listing; a no-op on a current or missing manifest.
+function M.migrate()
+  if not manifest.exists() then
+    return
+  end
+  local man = manifest.get()
+  if not man.migrate_from then
+    return
+  end
+  local moves = {}
+  for _, c in ipairs(man.connections) do
+    for _, d in ipairs(c.databases) do
+      local ok, err = pcall(function()
+        local lost = false
+        for _, s in ipairs(d.schemas) do
+          local dir = manifest.path(c, d, s)
+          if fs.kind(dir) == "directory" then
+            local items = {}
+            for _, t in ipairs(s.tables) do
+              local old = t.file and dir .. "/" .. t.file
+              local content = old and fs.kind(old) == "file" and fs.read(old)
+              if content and M.parse_header(content:match("^[^\n]*")) then
+                items[#items + 1] = { name = t.name, kind = t.kind, type = "file", content = content, from = old }
+              else
+                lost = true
+              end
+            end
+            table_items(items)
+            -- Open table files keep their mode under their new name.
+            local pairs_ = {}
+            for _, it in ipairs(items) do
+              pairs_[#pairs_ + 1] = { it.from, dir .. "/" .. it.file }
+            end
+            fs.remap(pairs_)
+            reconcile(dir, items)
+            s.tables = {}
+            for _, it in ipairs(items) do
+              s.tables[#s.tables + 1] = { name = it.name, kind = it.kind, file = it.file }
+              if it.from ~= dir .. "/" .. it.file then
+                moves[#moves + 1] = { it.from, dir .. "/" .. it.file }
+              end
+            end
+          elseif #s.tables > 0 then
+            lost = true
+          end
+        end
+        if lost then
+          d.listed = nil
+          if not c.browses then
+            c.listed = nil
+          end
+        end
+      end)
+      if not ok then
+        -- Listed again when entered (its reconcile removes what's left of the old names).
+        notify("migrating " .. tostring(c.name) .. " / " .. tostring(d.name) .. ": " .. tostring(err), vim.log.levels.WARN)
+        d.listed = nil
+        if not c.browses then
+          c.listed = nil
+        end
+      end
+    end
+  end
+  man.migrate_from = nil
+  man.version = manifest.VERSION
+  manifest.save()
+  -- Buffers follow (in an order where each new name is free: `x.table` → `x` before
+  -- `x.table.table` → `x.table`).
+  local left = moves
+  while #left > 0 do
+    local next_left = {}
+    local froms = {}
+    for _, m in ipairs(left) do
+      froms[m[1]] = true
+    end
+    for _, m in ipairs(left) do
+      if froms[m[2]] then
+        next_left[#next_left + 1] = m
+      else
+        M.on_moved(m[1], m[2])
+      end
+    end
+    if #next_left == #left then
+      break
+    end
+    left = next_left
+  end
+end
+
+local function migrate()
+  local ok, err = pcall(M.migrate)
+  if not ok then
+    notify(tostring(err), vim.log.levels.ERROR)
+  end
+end
+
 -- MARK: Listings
 
 local function request(method, params, cb)
@@ -211,9 +324,6 @@ end
 
 --- Where each renamed connection folder was before (by id), until its buffers follow it.
 local moved = {}
-
---- Called with the old and new path of a folder that moved (its buffers follow it).
-M.on_moved = function(_, _) end
 
 --- Renames saved connection `id` (`connections.rename`: the store's name only). `old` is its name
 --- before, for the message. `cb(err, renamed)`.
@@ -290,6 +400,7 @@ end
 --- connection folder deleted from outside comes back (empty, listed again when entered). `cb(err)`.
 function M.root(opts, cb)
   opts = opts or {}
+  migrate()
   once("root", cb, function(done)
     local ok, renames = pcall(scan, manifest.get())
     rename_all(ok and renames or {}, function()
@@ -406,6 +517,7 @@ end
 --- Lists one database (`db` nil: a connection that doesn't browse databases, its own).
 function M.database(id, db, opts, cb)
   opts = opts or {}
+  migrate()
   local c = manifest.connection(id)
   if not c then
     return cb and cb("unknown connection " .. id)
@@ -469,20 +581,17 @@ function M.database(id, db, opts, cb)
         local list = {}
         for _, it in ipairs(items) do
           local s = it.s
-          local tables = vim.deepcopy(s.tables)
-          table.sort(tables, function(a, b) return a.name < b.name end)
           local titems = {}
-          for _, t in ipairs(tables) do
+          for _, t in ipairs(s.tables) do
             local cols = by_table[s.name .. "\0" .. t.name]
             titems[#titems + 1] = {
               name = t.name,
-              ext = "." .. t.kind,
               type = "file",
               content = file_content(c, d, database, s.name, t, cols, cols_err or (not cols and "not listed" or nil)),
               t = t,
             }
           end
-          names.assign(titems)
+          table_items(titems)
           reconcile(dir .. "/" .. it.file, titems, { fresh = opts.fresh })
           local entry = { name = s.name, dir = it.file, tables = {} }
           for _, ti in ipairs(titems) do
@@ -513,6 +622,7 @@ end
 --- `opts.deep`: then lists every database too (`"listed"`: those listed before).
 function M.connection(id, opts, cb)
   opts = opts or {}
+  migrate()
   local c = manifest.connection(id)
   if not c then
     return cb and cb("unknown connection " .. id)

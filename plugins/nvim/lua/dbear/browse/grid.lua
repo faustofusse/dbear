@@ -921,6 +921,10 @@ function M.open(buf, spec)
   M.states[buf] = st
   vim.bo[buf].buftype = "acwrite"
   vim.bo[buf].swapfile = false
+  -- Rows aren't a file's text: no modelines from them, and no .editorconfig (it runs again when
+  -- the buffer is renamed, e.g. a mirror folder that moved, by the name: `Makefile`, `x.py`…).
+  vim.bo[buf].modeline = false
+  vim.b[buf].editorconfig = false
   vim.bo[buf].filetype = "dbear_table"
   vim.bo[buf].expandtab = true
   without_undo(buf, function() vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "Loading…" }) end)

@@ -112,7 +112,7 @@ end
 
 local function ls(rel)
   local out = {}
-  for name in fs.list(mirror .. (rel ~= "" and "/" .. rel or "")) do
+  for name in fs.list(fs.root() .. (rel ~= "" and "/" .. rel or "")) do
     out[#out + 1] = name
   end
   table.sort(out)
@@ -120,15 +120,15 @@ local function ls(rel)
 end
 
 local function exists(rel)
-  return uv.fs_lstat(mirror .. "/" .. rel) ~= nil
+  return uv.fs_lstat(fs.root() .. "/" .. rel) ~= nil
 end
 
 local function mode(rel)
-  return string.format("%o", bit.band(uv.fs_lstat(mirror .. "/" .. rel).mode, tonumber("777", 8)))
+  return string.format("%o", bit.band(uv.fs_lstat(fs.root() .. (rel ~= "" and "/" .. rel or "")).mode, tonumber("777", 8)))
 end
 
 local function read(rel)
-  return fs.read(mirror .. "/" .. rel)
+  return fs.read(fs.root() .. "/" .. rel)
 end
 
 local function run(conn, sql)
@@ -144,7 +144,7 @@ end
 
 --- Enters a mirror folder like a user (`:edit <dir>`) and waits for the listing it starts.
 local function enter(rel)
-  vim.cmd.edit(vim.fn.fnameescape(mirror .. (rel ~= "" and "/" .. rel or "")))
+  vim.cmd.edit(vim.fn.fnameescape(fs.root() .. (rel ~= "" and "/" .. rel or "")))
   wait("listing " .. rel, idle)
 end
 
@@ -168,7 +168,7 @@ local function state()
 end
 
 local function rows_buffer(rel)
-  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/" .. rel))
+  vim.cmd.edit(vim.fn.fnameescape(fs.root() .. "/" .. rel))
   wait("rows of " .. rel, function()
     local st = state()
     return st and st.ready and not st.loading
@@ -219,8 +219,8 @@ test("entering a connection folder lists it (and nothing else)", function()
   end
   eq({ "shop.db" }, ls("Shop"), "the SQLite file's name as its database folder")
   eq({ "main" }, ls("Shop/shop.db"), "schema")
-  eq({ "big.table", "named.view", "orders.table", "users.table" }, ls("Shop/shop.db/main"), "tables and views")
-  eq("444", mode("Shop/shop.db/main/users.table"), "file read-only")
+  eq({ "big", "named", "orders", "users" }, ls("Shop/shop.db/main"), "tables and views")
+  eq("444", mode("Shop/shop.db/main/users"), "file read-only")
   eq("555", mode("Shop/shop.db/main"), "folder read-only")
   -- Entering it again in the same session doesn't list again.
   calls = {}
@@ -230,13 +230,13 @@ test("entering a connection folder lists it (and nothing else)", function()
 end)
 
 test("table files hold the target and the column list", function()
-  local text = read("Shop/shop.db/main/users.table")
+  local text = read("Shop/shop.db/main/users")
   local lines = vim.split(text, "\n", { plain = true })
   local h = require("dbear.tree.sync").parse_header(lines[1])
   eq({ connection = "shop", database = os.getenv("DBEAR_TEST_SHOP"), browses = false, schema = "main", table = "users", kind = "table" }, h, "header")
   assert(text:find("\nid     integer  PK  NOT NULL\n", 1, true), text)
   assert(text:find("\nemail  text         NULL\n", 1, true), text)
-  local view = read("Shop/shop.db/main/named.view")
+  local view = read("Shop/shop.db/main/named")
   assert(view:find("\nid ", 1, true) and view:find("\nname ", 1, true), "a view's columns: " .. view)
   eq(nil, text:find("secret", 1, true), "no secrets")
 end)
@@ -252,9 +252,9 @@ test("a browsing connection: databases first, then each database when entered", 
   eq({ "schemas.list staging-pg", "columns.list staging-pg" }, methods(), "the database")
   eq("app_test", calls[1].database, "that database")
   eq({ "analytics", "billing", "public" }, ls("Staging/app_test"), "schemas")
-  assert(vim.tbl_contains(ls("Staging/app_test/public"), "users.table"), vim.inspect(ls("Staging/app_test/public")))
+  assert(vim.tbl_contains(ls("Staging/app_test/public"), "users"), vim.inspect(ls("Staging/app_test/public")))
   eq({}, ls("Staging/app"), "other databases still not listed")
-  local h = require("dbear.tree.sync").parse_header(read("Staging/app_test/public/users.table"):match("^[^\n]*"))
+  local h = require("dbear.tree.sync").parse_header(read("Staging/app_test/public/users"):match("^[^\n]*"))
   eq({ "staging-pg", "app_test", true }, { h.connection, h.database, h.browses }, "header")
 end)
 
@@ -439,7 +439,7 @@ test("a failed listing keeps the previous tree", function()
   local err = sync("shop")
   assert(err, "fails")
   eq(before, ls("Shop/shop.db/main"), "files kept")
-  assert(read("Shop/shop.db/main/users.table"):find("email", 1, true), "content kept")
+  assert(read("Shop/shop.db/main/users"):find("email", 1, true), "content kept")
   eq(1, #notified(vim.log.levels.ERROR, "(:DbearSync Shop retries)"), "error once: " .. vim.inspect(messages))
   messages = {}
   enter("Shop/shop.db/main")
@@ -457,15 +457,15 @@ end)
 test("sync adds and removes tables, renames and removes connections, on read-only folders", function()
   run("shop", "create table added (id integer primary key, flavour text)")
   eq(nil, sync(), "sync")
-  assert(exists("Shop/shop.db/main/added.table"), "added")
-  assert(read("Shop/shop.db/main/added.table"):find("flavour", 1, true), "columns")
-  eq("444", mode("Shop/shop.db/main/added.table"), "read-only")
+  assert(exists("Shop/shop.db/main/added"), "added")
+  assert(read("Shop/shop.db/main/added"):find("flavour", 1, true), "columns")
+  eq("444", mode("Shop/shop.db/main/added"), "read-only")
   eq("555", mode("Shop/shop.db/main"), "still read-only")
   -- Not listed before: :DbearSync doesn't connect to it.
   eq({}, ls("Staging/app"), "unlisted databases stay unlisted")
   run("shop", "drop table added")
   sync()
-  eq(false, exists("Shop/shop.db/main/added.table"), "stale file removed")
+  eq(false, exists("Shop/shop.db/main/added"), "stale file removed")
   -- A renamed connection keeps its folder's contents (moved, not listed again).
   store("update connections set name = 'Shop Renamed' where id = 'shop'")
   calls = {}
@@ -473,11 +473,11 @@ test("sync adds and removes tables, renames and removes connections, on read-onl
   eq(false, vim.tbl_contains(ls(""), "Shop"), "old name gone")
   -- "shop" takes the plain name now (and moves back to shop%~2 below).
   assert(vim.tbl_contains(ls(""), "shop"), vim.inspect(ls("")))
-  assert(exists("Shop Renamed/shop.db/main/users.table"), "moved: " .. vim.inspect(ls("")))
+  assert(exists("Shop Renamed/shop.db/main/users"), "moved: " .. vim.inspect(ls("")))
   -- A connection named like another one's old name.
   store("update connections set name = 'Shop' where id = 'shop'")
   sync("")
-  assert(exists("Shop/shop.db/main/users.table"), "renamed back")
+  assert(exists("Shop/shop.db/main/users"), "renamed back")
   eq({ "%2Ehidden", ".dbear-mirror.json", "Replica", "Shop", "Staging", "a%2Fb%3A c", "shop%~2" }, ls(""), "names swapped back")
   eq("other", manifest.lookup("shop%~2").conn.id, "mapped")
   -- A removed connection's folder goes.
@@ -512,14 +512,14 @@ test("case-colliding, odd and long names map to their exact tables", function()
   end
   eq(9, #files, "one file each: " .. vim.inspect(files))
   assert(by_table["Étude"] and by_table["étude"] and by_table[nfd], "all three: " .. vim.inspect(by_table))
-  eq("a%2Fb%3Ac.table", by_table["a/b:c"], "slash and colon")
-  eq("%2Ehid.table", by_table[".hid"], "leading dot")
-  eq("%-.table", by_table[""], "empty")
-  eq("100%25.table", by_table["100%"], "percent")
-  eq("tab%09name.table", by_table["tab\tname"], "control character")
+  eq("a%2Fb%3Ac", by_table["a/b:c"], "slash and colon")
+  eq("%2Ehid", by_table[".hid"], "leading dot")
+  eq("%-", by_table[""], "empty")
+  eq("100%25", by_table["100%"], "percent")
+  eq("tab%09name", by_table["tab\tname"], "control character")
   assert(by_table[long]:find("%+", 1, true), "cut, marked: " .. by_table[long])
   for name, f in pairs(by_table) do
-    local back = names.unescape(f:gsub("%.table$", ""))
+    local back = names.unescape(f)
     if name ~= long then
       -- Case collisions are numbered; the name itself still decodes.
       eq(name, back, "unescape " .. f)
@@ -530,8 +530,8 @@ test("case-colliding, odd and long names map to their exact tables", function()
   -- The second of two case-colliding names is numbered; which one is first is byte order.
   -- In byte order the decomposed one comes first and keeps its name; "étude" collides with
   -- "Étude" by case; "Étude" with the decomposed one where normalization doesn't count (macOS).
-  eq(nfd .. ".table", by_table[nfd], "first keeps its name")
-  assert(by_table["étude"]:match("^étude%%~%d%.table$"), "case collision numbered: " .. by_table["étude"])
+  eq(nfd, by_table[nfd], "first keeps its name")
+  assert(by_table["étude"]:match("^étude%%~%d$"), "case collision numbered: " .. by_table["étude"])
   assert(by_table["Étude"]:match("^Étude"), by_table["Étude"])
   -- Opening each one gives its own table.
   local st = rows_buffer("shop%~2/other.db/main/" .. by_table["étude"])
@@ -543,10 +543,111 @@ test("case-colliding, odd and long names map to their exact tables", function()
   eq("h", st.columns[1].name, "the long one")
 end)
 
+test("names with dots and extensions are file names as they are; each opens as its rows, whatever the name", function()
+  vim.cmd("filetype on") -- detection by name would turn these into sql, markdown, json, make…
+  local odd = { "users.sql", "README.md", "data.json", "Makefile", "a.tar.gz", "x.table", "y.view", "trail.", "trail ", ".dbear-mirror.json", "init.vim" }
+  local sql = {}
+  for _, n in ipairs(odd) do
+    sql[#sql + 1] = string.format([[create table "%s" (id integer primary key, v text); insert into "%s" values (1, 'vim: set ts=3 ft=lua :')]], n, n)
+  end
+  run("other", table.concat(sql, "; "))
+  eq(nil, sync("other"), "sync")
+  local dir = "shop%~2/other.db/main/"
+  local want = {
+    ["users.sql"] = "users.sql", ["README.md"] = "README.md", ["data.json"] = "data.json", Makefile = "Makefile",
+    ["a.tar.gz"] = "a.tar.gz", ["x.table"] = "x.table", ["y.view"] = "y.view", ["trail."] = "trail%2E",
+    ["trail "] = "trail%20", [".dbear-mirror.json"] = "%2Edbear-mirror.json", ["init.vim"] = "init.vim",
+  }
+  for _, n in ipairs(odd) do
+    local f = want[n]
+    assert(exists(dir .. f), n .. " as " .. f .. ": " .. vim.inspect(ls(dir)))
+    eq("444", mode(dir .. f), "read-only")
+    eq(n, manifest.lookup(dir .. f).table.name, "manifest maps " .. f)
+    eq(n, require("dbear.tree.sync").parse_header(read(dir .. f):match("^[^\n]*")).table, "header of " .. f)
+    local st = rows_buffer(dir .. f)
+    eq(n, st.spec.table, "opens " .. n)
+    eq("dbear_table", vim.bo.filetype, "no filetype from the name " .. f)
+    eq("acwrite", vim.bo.buftype, "rows buffer " .. f)
+    eq(false, vim.bo.swapfile, "no swap file " .. f)
+    eq(false, vim.bo.modeline, "no modelines " .. f)
+    assert(shown()[1]:find("vim: set", 1, true), vim.inspect(shown()))
+    eq(8, vim.bo.tabstop, "the row's modeline isn't applied")
+    vim.cmd("edit!")
+    wait("reloaded", function() return state() and state().ready and not state().loading end)
+    eq("dbear_table", vim.bo.filetype, ":e! keeps it a rows buffer " .. f)
+    eq(8, vim.bo.tabstop, "still no modeline")
+  end
+  eq({}, notified(vim.log.levels.ERROR), "no errors")
+  -- `x.table` is the table named so, not "x" with the old suffix.
+  eq(nil, manifest.lookup(dir .. "x"), "no table x")
+  run("other", table.concat(vim.tbl_map(function(n) return 'drop table "' .. n .. '"' end, odd), "; "))
+  eq(nil, sync("other"), "sync")
+  for _, f in pairs(want) do
+    eq(false, exists(dir .. f), "removed " .. f)
+  end
+end)
+
+test("only table files are caught: the manifest and anything else open as plain files", function()
+  vim.cmd("filetype on")
+  -- The manifest: a normal JSON buffer.
+  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/" .. fs.MANIFEST))
+  eq("", vim.bo.buftype, "a file buffer")
+  eq("json", vim.bo.filetype, "detected as JSON")
+  eq(nil, state(), "no rows buffer")
+  assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:find('"version"', 1, true), "its text")
+  vim.cmd("bwipeout!")
+  -- Something four levels down that isn't a table file (no header), and deeper: read as usual.
+  local main = mirror .. "/Shop/shop.db/main"
+  fs.with_writable(main, function()
+    local f = assert(io.open(main .. "/notes.json", "w"))
+    f:write('{"a": 1}\n')
+    f:close()
+  end)
+  vim.cmd.edit(vim.fn.fnameescape(main .. "/notes.json"))
+  eq(nil, state(), "no rows buffer")
+  eq("", vim.bo.buftype, "a file buffer")
+  eq("json", vim.bo.filetype, "filetype detected")
+  eq({ '{"a": 1}' }, vim.api.nvim_buf_get_lines(0, 0, -1, false), "its text, once")
+  eq(false, vim.bo.modified, "not modified")
+  eq(mirror .. "/Shop/shop.db/main/notes.json", bufname(), "its name")
+  eq(0, vim.fn.undotree().seq_last, "reading it is nothing to undo")
+  vim.cmd("bwipeout!")
+  vim.cmd.edit(vim.fn.fnameescape(main .. "/missing/deeper.txt"))
+  eq(nil, state(), "no rows buffer")
+  eq({ "" }, vim.api.nvim_buf_get_lines(0, 0, -1, false), "a new file")
+  vim.cmd("bwipeout!")
+  -- A symlink to a table file isn't one (the mirror never makes links; sync removes it).
+  fs.with_writable(main, function() assert(uv.fs_symlink(main .. "/users", main .. "/alias")) end)
+  vim.cmd.edit(vim.fn.fnameescape(main .. "/alias"))
+  eq(nil, state(), "a link isn't opened as rows")
+  vim.cmd("bwipeout!")
+  eq(nil, sync("shop"), "sync")
+  eq({ "big", "named", "orders", "users" }, ls("Shop/shop.db/main"), "junk removed")
+end)
+
+test("a view opens read-only, with the reason; its kind is in its file", function()
+  local text = read("Shop/shop.db/main/named")
+  eq("view", require("dbear.tree.sync").parse_header(text:match("^[^\n]*")).kind, "header")
+  assert(text:find("\n-- named: view in Shop / shop.db / main\n", 1, true), text)
+  local st = rows_buffer("Shop/shop.db/main/named")
+  assert(st.read_only and st.read_only ~= "", "read-only")
+  eq(false, vim.bo.modifiable, "not modifiable")
+  local virt = vim.api.nvim_buf_get_extmarks(0, -1, 0, -1, { details = true })
+  local said_it = false
+  for _, m in ipairs(virt) do
+    for _, chunks in ipairs(m[4].virt_lines or {}) do
+      for _, c in ipairs(chunks) do
+        said_it = said_it or c[1]:find("read-only: ", 1, true) ~= nil
+      end
+    end
+  end
+  assert(said_it, "the reason is shown: " .. st.read_only)
+end)
+
 test("opening a table file gives the editable rows buffer; :w changes the database, not the file", function()
-  local file = mirror .. "/Shop/shop.db/main/users.table"
-  local before = read("Shop/shop.db/main/users.table")
-  local st = rows_buffer("Shop/shop.db/main/users.table")
+  local file = mirror .. "/Shop/shop.db/main/users"
+  local before = read("Shop/shop.db/main/users")
+  local st = rows_buffer("Shop/shop.db/main/users")
   eq(file, bufname(), "the file's name")
   eq("dbear_table", vim.bo.filetype, "rows buffer")
   eq("acwrite", vim.bo.buftype, "acwrite")
@@ -561,22 +662,22 @@ test("opening a table file gives the editable rows buffer; :w changes the databa
   keys("y")
   wait("saved", function() return not st.saving and not st.loading end)
   eq({ { "Annie" } }, run("shop", "select name from users where id = 1"), "in the database")
-  eq(before, read("Shop/shop.db/main/users.table"), "the file is untouched")
+  eq(before, read("Shop/shop.db/main/users"), "the file is untouched")
   eq(false, vim.bo.modified, "clean")
   -- Writable while its buffer is loaded (Vim refuses :w otherwise), read-only again after.
-  eq("644", mode("Shop/shop.db/main/users.table"), "writable while open")
+  eq("644", mode("Shop/shop.db/main/users"), "writable while open")
   eq("555", mode("Shop/shop.db/main"), "its folder stays read-only")
   sync("shop")
-  eq("644", mode("Shop/shop.db/main/users.table"), "a sync keeps it so")
+  eq("644", mode("Shop/shop.db/main/users"), "a sync keeps it so")
   vim.cmd("bwipeout!")
-  eq("444", mode("Shop/shop.db/main/users.table"), "read-only once closed")
+  eq("444", mode("Shop/shop.db/main/users"), "read-only once closed")
 end)
 
 test("- goes to the table's folder; gf's filtered view goes back there too", function()
-  rows_buffer("Shop/shop.db/main/orders.table")
+  rows_buffer("Shop/shop.db/main/orders")
   keys("-")
   eq(mirror .. "/Shop/shop.db/main", bufname(), "the folder")
-  rows_buffer("Shop/shop.db/main/orders.table")
+  rows_buffer("Shop/shop.db/main/orders")
   local line = vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]
   local cells = require("dbear.browse.cells")
   local p = cells.parse(line, #state().columns)
@@ -610,14 +711,14 @@ test("the old dbear:// tree still works (:DbearOpen!)", function()
 end)
 
 test("read-only on disk: files and folders can't be changed, removed or added", function()
-  local file = mirror .. "/Shop/shop.db/main/users.table"
+  local file = mirror .. "/Shop/shop.db/main/users"
   eq(nil, io.open(file, "w"), "can't write")
   eq(nil, (os.remove(file)), "can't delete")
   eq(nil, (os.rename(file, file .. ".x")), "can't rename")
-  eq(nil, io.open(mirror .. "/Shop/shop.db/main/new.table", "w"), "can't add")
+  eq(nil, io.open(mirror .. "/Shop/shop.db/main/new", "w"), "can't add")
   eq(nil, (os.remove(mirror .. "/Shop/shop.db/main")), "can't remove a folder")
   eq(nil, (uv.fs_mkdir(mirror .. "/new", 448)), "can't add at the root")
-  assert(exists("Shop/shop.db/main/users.table"), "intact")
+  assert(exists("Shop/shop.db/main/users"), "intact")
 end)
 
 test("the root guard: nothing outside the root is touched", function()
@@ -639,7 +740,7 @@ test("the root guard: nothing outside the root is touched", function()
   local main = mirror .. "/Shop/shop.db/main"
   fs.with_writable(main, function()
     assert(uv.fs_symlink(outside, main .. "/link"))
-    assert(uv.fs_symlink(victim, main .. "/evil.table"))
+    assert(uv.fs_symlink(victim, main .. "/evil"))
   end)
   local ok, err = pcall(fs.remove, main .. "/link/victim.txt")
   assert(not ok and tostring(err):find("refusing", 1, true), "through a link: " .. tostring(err))
@@ -647,7 +748,7 @@ test("the root guard: nothing outside the root is touched", function()
   assert(not ok, "no write through a link")
   sync("shop", true)
   eq(false, exists("Shop/shop.db/main/link"), "the link is removed")
-  eq(false, exists("Shop/shop.db/main/evil.table"), "the file link is removed")
+  eq(false, exists("Shop/shop.db/main/evil"), "the file link is removed")
   eq("keep", fs.read(victim), "the target is untouched")
   eq("644", string.format("%o", bit.band(uv.fs_stat(victim).mode, tonumber("777", 8))), "its mode too")
   eq("keep", fs.read(victim), "")
@@ -665,17 +766,17 @@ test("the root guard: nothing outside the root is touched", function()
 end)
 
 test(":DbearSync! rebuilds: rewrites files and resets permissions", function()
-  local f = mirror .. "/Shop/shop.db/main/users.table"
+  local f = mirror .. "/Shop/shop.db/main/users"
   uv.fs_chmod(mirror .. "/Shop/shop.db/main", tonumber("755", 8))
   uv.fs_chmod(f, tonumber("644", 8))
   local h = assert(io.open(f, "a"))
   h:write("garbage\n")
   h:close()
   eq(nil, sync("", true), "rebuild")
-  eq("444", mode("Shop/shop.db/main/users.table"), "file mode")
+  eq("444", mode("Shop/shop.db/main/users"), "file mode")
   eq("555", mode("Shop/shop.db/main"), "folder mode")
-  eq(nil, read("Shop/shop.db/main/users.table"):find("garbage", 1, true), "rewritten")
-  assert(exists("Staging/app_test/public/users.table"), "listed databases relisted")
+  eq(nil, read("Shop/shop.db/main/users"):find("garbage", 1, true), "rewritten")
+  assert(exists("Staging/app_test/public/users"), "listed databases relisted")
   eq({}, ls("Staging/app"), "unlisted ones still not listed")
 end)
 
@@ -696,22 +797,56 @@ test(":DbearFind and :DbearGrep without telescope", function()
   local picked
   vim.ui.select = function(items, _, cb)
     picked = items
-    cb("Shop/shop.db/main/users.table")
+    cb("Shop/shop.db/main/users")
   end
   vim.cmd("DbearFind")
-  assert(vim.tbl_contains(picked, "Staging/app_test/public/users.table"), vim.inspect(picked))
+  assert(vim.tbl_contains(picked, "Staging/app_test/public/users"), vim.inspect(picked))
   wait("rows", function() return state() and state().ready end)
-  eq(mirror .. "/Shop/shop.db/main/users.table", bufname(), "opened")
+  eq(mirror .. "/Shop/shop.db/main/users", bufname(), "opened")
   vim.cmd("DbearGrep email")
   local qf = vim.fn.getqflist()
   assert(#qf >= 2, "matches: " .. #qf)
   local found = false
   for _, item in ipairs(qf) do
-    if bufname(item.bufnr) == mirror .. "/Shop/shop.db/main/users.table" then
+    if bufname(item.bufnr) == mirror .. "/Shop/shop.db/main/users" then
       found = true
     end
   end
-  assert(found, "users.table in the quickfix list")
+  assert(found, "users in the quickfix list")
+  -- Only table files: never the manifest (\"ident\" is only there), with rg or with grep.
+  local function grep_files(pattern)
+    messages = {}
+    vim.cmd("cclose")
+    vim.cmd("DbearGrep " .. pattern)
+    local files = {}
+    for _, item in ipairs(vim.fn.getqflist()) do
+      local rel = fs.rel(bufname(item.bufnr))
+      files[rel] = true
+      eq(3, select(2, rel:gsub("/", "")), "a table file: " .. rel)
+    end
+    return files
+  end
+  local executable = vim.fn.executable
+  for _, tool in ipairs({ "rg", "grep" }) do
+    if tool == "grep" then
+      vim.fn.executable = function(x) return x ~= "rg" and executable(x) or 0 end
+    end
+    local ok, err = pcall(function()
+      eq({}, grep_files("ident"), tool .. ": nothing from the manifest")
+      eq(1, #notified(vim.log.levels.INFO, "no column matches ident"), tool .. ": said so")
+      local views = grep_files("view in")
+      assert(views["Shop/shop.db/main/named"], tool .. ": a view by its kind: " .. vim.inspect(views))
+      eq(nil, views["Shop/shop.db/main/users"], tool .. ": not tables")
+      assert(grep_files("browses")["Shop/shop.db/main/users"], tool .. ": headers are searched")
+      eq(nil, grep_files("browses")[fs.MANIFEST], tool .. ": the manifest isn't")
+    end)
+    vim.fn.executable = executable
+    assert(ok, err)
+  end
+  for _, f in ipairs(picked) do
+    eq(3, select(2, f:gsub("/", "")), "only table files to pick: " .. f)
+    assert(not f:find(fs.MANIFEST, 1, true), f)
+  end
 end)
 
 test("relist = never: a folder listed before isn't listed again in a new session", function()
@@ -772,7 +907,7 @@ test("a plain mv at the root is refused; a forced one is understood as a rename"
   eq(nil, ok, "plain mv: permission denied")
   eq("Shop", saved().shop, "store unchanged")
   -- A table buffer of Shop with a pending edit.
-  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/Shop/shop.db/main/users.table"))
+  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/Shop/shop.db/main/users"))
   wait("rows", function() return state() and state().ready end)
   local rows = vim.api.nvim_get_current_buf()
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
@@ -785,10 +920,10 @@ test("a plain mv at the root is refused; a forced one is understood as a rename"
   assert(said("renamed “Shop” to “Moved”"), vim.inspect(messages))
   eq(ident, fs.identity(mirror .. "/Moved"), "the same folder")
   eq("shop", manifest.lookup("Moved").conn.id, "manifest")
-  assert(exists("Moved/shop.db/main/users.table"), "contents kept")
+  assert(exists("Moved/shop.db/main/users"), "contents kept")
   eq(false, vim.tbl_contains(ls(""), "Shop"), "no Shop folder")
-  eq(mirror .. "/Moved/shop.db/main/users.table", bufname(rows), "the rows buffer moved with it")
-  eq("644", mode("Moved/shop.db/main/users.table"), "still writable while loaded")
+  eq(mirror .. "/Moved/shop.db/main/users", bufname(rows), "the rows buffer moved with it")
+  eq("644", mode("Moved/shop.db/main/users"), "still writable while loaded")
   -- With the collision gone, "shop" (id other) lost its number.
   eq("other", manifest.lookup("shop").conn.id, "shop un-numbered")
   -- Listing again changes nothing.
@@ -799,16 +934,16 @@ test("a plain mv at the root is refused; a forced one is understood as a rename"
   eq(1, #messages, "nothing else said: " .. vim.inspect(messages))
   assert(messages[1].msg:find("^dbear: synced"), messages[1].msg)
   vim.cmd("bwipeout! " .. rows)
-  eq("444", mode("Moved/shop.db/main/users.table"), "read-only once closed")
+  eq("444", mode("Moved/shop.db/main/users"), "read-only once closed")
 end)
 
 test(":DbearRename renames from a folder or a table buffer; names the store refuses are put back", function()
   -- From a table buffer, with a name.
-  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/Moved/shop.db/main/users.table"))
+  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/Moved/shop.db/main/users"))
   wait("rows", function() return state() and state().ready end)
   vim.cmd("DbearRename Shop")
   wait("renamed", function() return saved().shop == "Shop" and idle() and exists("Shop") end)
-  eq(mirror .. "/Shop/shop.db/main/users.table", bufname(), "the buffer followed")
+  eq(mirror .. "/Shop/shop.db/main/users", bufname(), "the buffer followed")
   assert(said("renamed “Moved” to “Shop”"), vim.inspect(messages))
   eq("other", manifest.lookup("shop%~2").conn.id, "shop numbered again")
   -- From a folder, asked for (vim.ui.input).
@@ -880,6 +1015,181 @@ test("tree.rename = false: a renamed folder goes back", function()
   eq("Staging", saved()["staging-pg"], "store unchanged")
   assert(exists("Staging") and not exists("Stage"), "put back")
   assert(said("tree.rename = false"), vim.inspect(messages))
+end)
+
+-- MARK: migration from the old layout
+
+test("a mirror written with suffixes (manifest v1) is renamed in place at the next listing, offline", function()
+  local sync_ = require("dbear.tree.sync")
+  local old_root = mirror .. "-v1"
+  dbear.config.tree.root = old_root
+  tree.attach()
+  eq(old_root, fs.root(), "switched")
+  sync_.listed = {}
+  -- `x` and `x.table` were `x.table` and `x.table.table`: the names chain.
+  run("other", [[create table "x" (a int); create table "x.table" (b int); create view "v" as select 1 as one]])
+  eq(nil, sync("shop"), "Shop")
+  eq(nil, sync("other"), "other")
+  enter("Staging")
+  enter("Staging/app_test")
+  eq({}, ls("Staging/app"), "never listed")
+  -- Back to version 1: every table file renamed `<file>.<kind>`, the manifest says so.
+  local man = manifest.get()
+  local W = tonumber("755", 8)
+  local old_files = {}
+  for _, c in ipairs(man.connections) do
+    for _, d in ipairs(c.databases) do
+      for _, s in ipairs(d.schemas) do
+        local dir = manifest.path(c, d, s)
+        uv.fs_chmod(dir, W)
+        for _, t in ipairs(s.tables) do -- in two steps: `x` → `x.table` would replace `x.table`
+          assert(os.rename(dir .. "/" .. t.file, dir .. "/" .. t.file .. ".tmp~"))
+        end
+        for _, t in ipairs(s.tables) do
+          assert(os.rename(dir .. "/" .. t.file .. ".tmp~", dir .. "/" .. t.file .. "." .. t.kind))
+          t.file = t.file .. "." .. t.kind
+          old_files[#old_files + 1] = fs.rel(dir .. "/" .. t.file)
+        end
+        uv.fs_chmod(dir, tonumber("555", 8))
+      end
+    end
+  end
+  man.version = 1
+  uv.fs_chmod(old_root, W)
+  os.remove(old_root .. "/" .. fs.MANIFEST)
+  local f = assert(io.open(old_root .. "/" .. fs.MANIFEST, "w"))
+  f:write(vim.json.encode(man))
+  f:close()
+  uv.fs_chmod(old_root, tonumber("555", 8))
+  manifest.reset()
+  sync_.listed = {}
+  local dir = "shop%~2/other.db/main/"
+  eq(true, exists(dir .. "x.table") and exists(dir .. "x.table.table") and exists(dir .. "v.view"), "the old layout")
+  eq(true, exists("Shop/shop.db/main/named.view"), "a view")
+  -- An old name opened directly (harpoon, oldfiles) before anything is listed: its header says
+  -- which table it is, so it's `x`, not a table named `x.table`.
+  calls = {}
+  local st = rows_buffer(dir .. "x.table")
+  eq("x", st.spec.table, "the old file's table")
+  eq("a", st.columns[1].name, "its column")
+  local rows = vim.api.nvim_get_current_buf()
+  eq("644", mode(dir .. "x.table"), "writable while loaded")
+  vim.cmd("enew")
+  -- The next listing (entering the root) renames everything in place, without connecting.
+  calls = {}
+  messages = {}
+  enter("")
+  eq({ "connections.list" }, methods(), "offline: only the root's own listing")
+  eq({}, messages, "nothing to say")
+  local on_disk = vim.json.decode(fs.read(old_root .. "/" .. fs.MANIFEST))
+  eq(2, on_disk.version, "manifest v2 on disk")
+  eq(nil, on_disk.migrate_from, "no marker saved")
+  eq({ "big", "named", "orders", "users" }, ls("Shop/shop.db/main"), "Shop")
+  for _, rel in ipairs(old_files) do
+    if not vim.endswith(rel, "/x.table") then -- now the table named so
+      eq(false, exists(rel), "old name gone: " .. rel)
+    end
+  end
+  eq("x", sync_.parse_header(read(dir .. "x"):match("^[^\n]*")).table, "x")
+  eq("x.table", sync_.parse_header(read(dir .. "x.table"):match("^[^\n]*")).table, "x.table")
+  eq("view", sync_.parse_header(read(dir .. "v"):match("^[^\n]*")).kind, "v")
+  assert(read("Shop/shop.db/main/users"):find("email", 1, true), "content kept")
+  assert(vim.tbl_contains(ls("Staging/app_test/public"), "users"), vim.inspect(ls("Staging/app_test/public")))
+  eq({}, ls("Staging/app"), "never-listed databases untouched")
+  eq(nil, manifest.database(manifest.connection("staging-pg"), "app").listed, "and still not listed")
+  -- The manifest and the disk agree, read-only.
+  manifest.reset()
+  local count = 0
+  for _, c in ipairs(manifest.get().connections) do
+    for _, d in ipairs(c.databases) do
+      for _, s in ipairs(d.schemas) do
+        local sdir = manifest.path(c, d, s)
+        local listed_files = {}
+        for _, t in ipairs(s.tables) do
+          listed_files[t.file] = true
+          count = count + 1
+          local rel = fs.rel(sdir .. "/" .. t.file)
+          eq(t.name, sync_.parse_header(read(rel):match("^[^\n]*")).table, "header of " .. rel)
+          eq(t.name, manifest.lookup(rel).table.name, "lookup " .. rel)
+          if rel ~= dir .. "x" then
+            eq("444", mode(rel), "read-only " .. rel)
+          end
+        end
+        for name in fs.list(sdir) do
+          assert(listed_files[name], "on disk but not in the manifest: " .. sdir .. "/" .. name)
+        end
+        eq("555", mode(fs.rel(sdir)), "folder read-only")
+      end
+    end
+  end
+  eq(#old_files, count, "every table kept")
+  -- The open buffer followed its file.
+  eq(old_root .. "/" .. dir .. "x", bufname(rows), "renamed with its file")
+  eq("644", mode(dir .. "x"), "still writable while loaded")
+  vim.api.nvim_set_current_buf(rows)
+  eq("x", state().spec.table, "the same rows")
+  keys("-")
+  eq(old_root .. "/shop%~2/other.db/main", bufname(), "- to its folder")
+  vim.cmd("bwipeout! " .. rows)
+  eq("444", mode(dir .. "x"), "read-only once closed")
+  -- A second listing changes nothing; a sync of the databases agrees with the migration.
+  local before = ls(dir)
+  eq(nil, sync(""), "sync")
+  eq(before, ls(dir), "same files")
+  run("other", [[drop table "x"; drop table "x.table"; drop view "v"]])
+  dbear.config.tree.root = mirror
+  tree.attach()
+  manifest.reset()
+  sync_.listed = {}
+  eq(mirror, fs.root(), "back")
+end)
+
+test("a v1 manifest whose files are gone or damaged: those databases are listed again", function()
+  local sync_ = require("dbear.tree.sync")
+  local root = mirror .. "-v1b"
+  dbear.config.tree.root = root
+  tree.attach()
+  sync_.listed = {}
+  eq(nil, sync("shop"), "Shop")
+  local man = manifest.get()
+  local W, R = tonumber("755", 8), tonumber("555", 8)
+  local c = manifest.connection("shop")
+  local d = c.databases[1]
+  local s = d.schemas[1]
+  local sdir = manifest.path(c, d, s)
+  uv.fs_chmod(sdir, W)
+  for _, t in ipairs(s.tables) do
+    assert(os.rename(sdir .. "/" .. t.file, sdir .. "/" .. t.file .. "." .. t.kind))
+    t.file = t.file .. "." .. t.kind
+  end
+  os.remove(sdir .. "/orders.table") -- gone
+  uv.fs_chmod(sdir .. "/users.table", W)
+  local f = assert(io.open(sdir .. "/users.table", "w")) -- no header
+  f:write("garbage\n")
+  f:close()
+  uv.fs_chmod(sdir, R)
+  man.version = 1
+  uv.fs_chmod(root, W)
+  os.remove(root .. "/" .. fs.MANIFEST)
+  f = assert(io.open(root .. "/" .. fs.MANIFEST, "w"))
+  f:write(vim.json.encode(man))
+  f:close()
+  uv.fs_chmod(root, R)
+  manifest.reset()
+  sync_.listed = {}
+  calls = {}
+  enter("")
+  eq({}, vim.tbl_filter(function(m) return m ~= "connections.list" end, methods()), "offline")
+  eq({ "big", "named" }, ls("Shop/shop.db/main"), "what could be kept")
+  eq(nil, manifest.connection("shop").listed, "to be listed again")
+  calls = {}
+  enter("Shop")
+  assert(vim.tbl_contains(methods(), "schemas.list shop"), vim.inspect(methods()))
+  eq({ "big", "named", "orders", "users" }, ls("Shop/shop.db/main"), "listed again")
+  dbear.config.tree.root = mirror
+  tree.attach()
+  manifest.reset()
+  sync_.listed = {}
 end)
 
 print(string.format("\n%d passed, %d failed", passed, failures))

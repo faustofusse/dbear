@@ -319,13 +319,31 @@ function M.identity(path)
   return st.ino .. "/" .. born
 end
 
---- Table files open in rows buffers below folder `from` are now below `to` (renamed with it).
+--- Table files open in rows buffers at `from` or below folder `from` are now at `to` (renamed
+--- with it).
 function M.moved(from, to)
   for _, path in ipairs(vim.tbl_keys(unlocked)) do
-    if path:sub(1, #from + 1) == from .. "/" then
+    if path == from or path:sub(1, #from + 1) == from .. "/" then
       unlocked[path] = nil
       unlocked[to .. path:sub(#from + 1)] = true
     end
+  end
+end
+
+--- Table files `{ { from, to } }` are about to be renamed all at once (names may swap): those open
+--- in rows buffers stay writable under their new names.
+function M.remap(moves)
+  local open = {}
+  for _, m in ipairs(moves) do
+    if unlocked[m[1]] then
+      open[#open + 1] = m[2]
+    end
+  end
+  for _, m in ipairs(moves) do
+    unlocked[m[1]] = nil
+  end
+  for _, path in ipairs(open) do
+    unlocked[path] = true
   end
 end
 
