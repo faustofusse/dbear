@@ -14,8 +14,10 @@ local M = {}
 M.MANIFEST = ".dbear-mirror.json"
 
 M.DIR_MODE = tonumber("555", 8) -- r-x: oil (or anything) can't add, delete or rename entries
+-- (the root included: only `tree.oil_pre` lifts it, for a batch of connection folder renames)
 M.FILE_MODE = tonumber("444", 8)
 local WRITABLE_DIR = tonumber("755", 8)
+M.WRITABLE_DIR = WRITABLE_DIR
 local WRITABLE_FILE = tonumber("644", 8)
 
 --- Table files open in a rows buffer → true. They stay writable while open: Vim refuses `:w`
@@ -303,6 +305,28 @@ end
 function M.inode(path)
   local st = uv.fs_lstat(path)
   return st and st.ino or nil
+end
+
+--- What identifies folder `path` across renames: its inode and, where the file system keeps one,
+--- its creation time (so a reused inode isn't taken for the same folder). nil when it isn't a folder.
+function M.identity(path)
+  local st = uv.fs_lstat(path)
+  if not st or st.type ~= "directory" then
+    return nil
+  end
+  local born = st.birthtime and (st.birthtime.sec ~= 0 or st.birthtime.nsec ~= 0)
+    and string.format("%d.%09d", st.birthtime.sec, st.birthtime.nsec) or ""
+  return st.ino .. "/" .. born
+end
+
+--- Table files open in rows buffers below folder `from` are now below `to` (renamed with it).
+function M.moved(from, to)
+  for _, path in ipairs(vim.tbl_keys(unlocked)) do
+    if path:sub(1, #from + 1) == from .. "/" then
+      unlocked[path] = nil
+      unlocked[to .. path:sub(#from + 1)] = true
+    end
+  end
 end
 
 --- Makes sure folder `path` (the root or below) exists, creating it and its parents read-only.

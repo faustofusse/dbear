@@ -20,7 +20,7 @@ export DBEAR_CONNECTIONS_FILE="$tmp/dbear.db" DBEAR_SOCKET="$tmp/serve.sock" DBE
 export HOME="$tmp" XDG_CONFIG_HOME="$tmp" NO_COLOR=1
 
 seed() { "$bin" --no-server "$@" > /dev/null 2> "$tmp/err" || { cat "$tmp/err"; exit 1; }; }
-# The CLI never writes the store, so seed it as a plain SQLite file through the CLI's sqlite: URLs.
+# The CLI doesn't add connections, so seed the store as a plain SQLite file through the CLI's sqlite: URLs.
 seed ls
 : > "$tmp/app.db"
 seed query "sqlite:$tmp/dbear.db" \

@@ -23,6 +23,7 @@ M.config = {
     enabled = true, -- false: no mirror; :DbearOpen opens the dbear:// list
     root = nil, -- default: stdpath("cache") .. "/dbear/tree"
     relist = "session", -- list a folder again the first time it's entered in a session; "never": only once
+    rename = true, -- renaming a connection's folder at the root (oil, mv) renames the connection; false: read-only
   },
 }
 

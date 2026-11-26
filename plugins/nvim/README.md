@@ -37,6 +37,7 @@ require("dbear").setup({
     enabled = true,
     root = nil,                   -- default: stdpath("cache") .. "/dbear/tree"
     relist = "session",           -- list a folder again the first time it's entered in a session; "never": only once
+    rename = true,                -- renaming a connection's folder (oil, mv) renames the connection; false: read-only
   },
 })
 ```
@@ -54,6 +55,7 @@ require("dbear").setup({
 | `:DbearHistory` | Pick a query from the connection's history and insert it below the cursor. |
 | `:DbearOpen[!] [path]` | Browse. Without `!` and with the mirror on (the default): no `path` opens the [mirror](#the-mirror-oilnvim-telescope-and-other-file-tools)'s root, a connection's name or id its folder. Otherwise the `dbear://` browser (below): `path` is `conn`, `conn/db/`, `conn/schema.table`, a `dbear://` name or a connection URL; without one, the buffer's connection, else the list of connections. |
 | `:DbearSync[!] [conn]` | List the mirror again: without `conn`, the connection folders and everything listed before; with `conn`, all its databases and tables. `!` rebuilds what it lists. |
+| `:DbearRename [name]` | Rename the current connection in dbear's store: the one of the mirror folder you're in (at the root in oil, the folder under the cursor), of a table buffer, or the SQL buffer's. Without `name`, asks for it. Same as renaming its folder in oil (below). |
 | `:DbearFind` | Pick a table of the mirror: telescope's `find_files` when it's installed, else `vim.ui.select`. |
 | `:DbearGrep [pattern]` | Search the mirror's column lists: telescope's `live_grep` when it's installed, else ripgrep (or grep) into the quickfix list. |
 | `:DbearSort [col [desc], …]` | In a table buffer: sort (no argument: the table's natural order). |
@@ -200,12 +202,51 @@ connection's folder is renamed with its contents.
 
 **Read-only.** The mirror's folders are read-only (mode 555) and its files too (444), so oil (even
 with `skip_confirm_for_simple_edits`) shows them as not modifiable, and a forced delete or rename
-fails with "permission denied" instead of looking like a dropped table. A table file is writable
+fails with "permission denied" instead of looking like a dropped table. The one exception is
+renaming a connection's folder at the root (next paragraph). A table file is writable
 while its rows buffer is loaded, because Vim refuses `:w` on a file it can't write even when `:w`
 saves rows; its folder stays read-only. Only the plugin lifts and restores the permissions, and
 every change it makes on disk is checked against the root: nothing outside it is ever written,
 chmod-ed, renamed or deleted, symlinks are never followed (one found in the mirror is unlinked),
 and a root that isn't empty and holds no `.dbear-mirror.json` is refused.
+
+**Renaming a connection.** At the root, oil lets you edit the connection folders' names: change
+one and `:w` (with `skip_confirm_for_simple_edits` there's no confirmation; a rename is easy to undo
+the same way), and the saved connection is renamed in dbear's store (`dbear: renamed “Shop” to
+“Store”`). `:DbearRename [name]` does the same without oil. What happens:
+
+- Only the name changes in the store, with a targeted update: settings another app changed
+  meanwhile, the database the connection last browsed, its place in the list, its password
+  (keychain entries are keyed by id) and its history all stay. The folder keeps what was listed in
+  it, and open table buffers below it follow it (renamed, with their pending edits; `:w` still
+  saves the rows, `-` goes to the new folder).
+- The folder name is read back as a name: `%XX` escapes are decoded (type `a%2Fb` for `a/b`; any
+  other `%` is kept as typed), a `%~N` you left at the end is dropped, and the store trims the
+  name (an empty one, `%-`, becomes the connection's default name: its file's name, database or
+  host, as when an app saves a connection without a name). Two connections may have the same name,
+  or names that only differ by case: the folder that comes later in your connection order gets
+  `%~2`, so the folders may be renumbered after a rename. A name the mirror cut (`…%+<hash>`) can't
+  be read back and is refused.
+- If the store can't be renamed (locked by another app for more than 5 s, the connection deleted
+  meanwhile…), the error is shown and the folder goes back to its name.
+- Nothing else is possible at the root. The root stays read-only on disk: deleting, creating,
+  copying or moving a folder into another one fails with "permission denied" (and
+  `dbear: the mirror is read-only…`), and so does a batch that mixes a rename with anything else in
+  the mirror. Only while oil applies a batch of plain renames are the root and those folders
+  writable, and they're read-only again right after. A `mv` in a shell is refused too (the root is
+  read-only). If something changes the root anyway (made writable by hand), the next listing
+  sorts it out: a connection folder is recognized by its identity (inode and creation time) under
+  any name, so a renamed one renames the connection; a deleted one comes back (the connection is
+  never deleted from the mirror); anything else is removed, with a message.
+- How oil is involved: the plugin makes oil's buffer of the root modifiable (through oil's adapter
+  `is_modifiable`) and listens to oil's `User OilActionsPre`/`OilActionsPost`. Without oil, use
+  `:DbearRename`. `tree = { rename = false }` turns it all off (the root's oil buffer is
+  read-only again, and a renamed folder is put back).
+- Other Neovims and a running `dbear-cli serve --socket` see the new name within 2 s (they re-read
+  the store; sessions and caches are kept). **The GUI apps don't watch the store:** a running app
+  shows the old name until it reloads its list, which happens at launch and right after the app
+  itself saves (also Duplicate and Import) or deletes a connection. Until then, saving that
+  connection from the app's editor writes the name it shows, i.e. puts the old name back.
 
 **Names.** A file name is the database name, escaped where it has to be: `%` → `%25`;
 `/ \ : * ? " < > |`, control characters and bytes that aren't UTF-8 → `%XX`; a leading or trailing
@@ -227,7 +268,7 @@ vim.keymap.set("n", "<leader>dg", "<cmd>DbearGrep<cr>", { desc = "dbear: find a 
 vim.keymap.set("n", "<leader>ds", "<cmd>DbearSync<cr>", { desc = "dbear: sync the mirror" })
 ```
 
-From Lua: `require("dbear.tree").find()`, `.grep(pattern)`, `.sync(conn, rebuild)`, `.root()`.
+From Lua: `require("dbear.tree").find()`, `.grep(pattern)`, `.sync(conn, rebuild)`, `.rename(name)`, `.root()`.
 
 ## From Lua
 

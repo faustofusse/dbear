@@ -3,6 +3,8 @@
 --- `columns.list`). A listing that fails records its error in the manifest and changes nothing
 --- else on disk. Folders are reconciled: entries are renamed when their name changed (so a
 --- renamed connection keeps what was listed), stale ones removed, new ones created read-only.
+--- A connection folder renamed by hand (oil, `mv`) is recognized by its identity and renames the
+--- connection in the store (`connections.rename`) before the root is reconciled (see `scan`).
 
 local fs = require("dbear.tree.fs")
 local manifest = require("dbear.tree.manifest")
@@ -192,42 +194,184 @@ local function request(method, params, cb)
   dbear().rpc():request(method, params, cb)
 end
 
---- Connection folders from the store. `cb(err)`.
+-- MARK: Connection folders and renames
+
+--- Where each renamed connection folder was before (by id), until its buffers follow it.
+local moved = {}
+
+--- Called with the old and new path of a folder that moved (its buffers follow it).
+M.on_moved = function(_, _) end
+
+--- Renames saved connection `id` (`connections.rename`: the store's name only). `old` is its name
+--- before, for the message. `cb(err, renamed)`.
+function M.rename(id, old, name, cb)
+  request("connections.rename", { connection = id, name = name }, function(err, res)
+    if err then
+      notify(string.format("can't rename “%s” to “%s”: %s", old, name, message(err)), vim.log.levels.ERROR)
+      return cb and cb(err)
+    end
+    if res.previous_name ~= res.name then -- another Neovim may have renamed it already
+      notify(string.format("renamed “%s” to “%s”", res.previous_name, res.name))
+    end
+    if cb then
+      cb(nil, res)
+    end
+  end)
+end
+
+--- Looks at the root for connection folders renamed outside the mirror's own code (oil, `mv`):
+--- a folder is the connection whose identity (inode + creation time, recorded at each listing) it
+--- has, whatever its name now; nothing is ever read as a delete plus a create. Each one found gets
+--- its manifest `dir` set to where it is now. Returns those whose folder name now stands for
+--- another name (`{ c, name }`: the store must be renamed) and the connections whose folder is
+--- gone (deleted from outside: they're re-created empty, the store is left alone).
+local function scan(man)
+  local root = fs.root()
+  local at = {}
+  for name in fs.list(root) do
+    local id = fs.identity(root .. "/" .. name)
+    if id then
+      at[id] = name
+    end
+  end
+  local renames, lost = {}, {}
+  for _, c in ipairs(man.connections) do
+    local now = c.ident and at[c.ident]
+    if now and now ~= c.dir then
+      moved[c.id] = moved[c.id] or c.dir
+      c.dir = now
+      local name, why = names.parse(now)
+      if dbear().config.tree.rename == false then
+        if name ~= c.name then
+          notify("renaming connections from the mirror is off (tree.rename = false): “" .. now .. "” goes back to “" .. c.name .. "”", vim.log.levels.WARN)
+        end
+      elseif not name then
+        notify(string.format("can't rename “%s” to “%s”: %s", c.name, now, why), vim.log.levels.ERROR)
+      elseif name ~= c.name then
+        renames[#renames + 1] = { c = c, name = name }
+      end
+    elseif not now and c.dir and not (c.ident == nil and fs.kind(root .. "/" .. c.dir) == "directory") then
+      lost[#lost + 1] = c
+    end
+  end
+  return renames, lost
+end
+
+--- Renames the store for each of `renames`, one after the other, then `cb()`. A failure is shown
+--- and leaves the store as it was: the next reconcile moves the folder back.
+local function rename_all(renames, cb)
+  local i = 0
+  local function step()
+    i = i + 1
+    local r = renames[i]
+    if not r then
+      return cb()
+    end
+    M.rename(r.c.id, r.c.name, r.name, function() step() end)
+  end
+  step()
+end
+
+--- Connection folders from the store. Folders renamed by hand are renamed in the store first
+--- (see `scan`); anything else at the root that isn't a connection's folder is removed, and a
+--- connection folder deleted from outside comes back (empty, listed again when entered). `cb(err)`.
 function M.root(opts, cb)
   opts = opts or {}
   once("root", cb, function(done)
-    request("connections.list", nil, function(err, res)
-      if err then
-        manifest.get().error = message(err)
-        pcall(manifest.save)
-        notify("can't list the connections: " .. message(err), vim.log.levels.ERROR)
-        return done(err)
-      end
-      apply(done, function()
-        local man = manifest.get()
-        local old = {}
-        for _, c in ipairs(man.connections) do
-          old[c.id] = c
+    local ok, renames = pcall(scan, manifest.get())
+    rename_all(ok and renames or {}, function()
+      request("connections.list", nil, function(err, res)
+        if err then
+          manifest.get().error = message(err)
+          pcall(manifest.save)
+          notify("can't list the connections: " .. message(err), vim.log.levels.ERROR)
+          return done(err)
         end
-        local list, items = {}, {}
-        for _, l in ipairs(res.connections) do
-          if not vim.startswith(l.id, "url:") then -- URLs are never mirrored
-            local c = old[l.id] or { id = l.id, databases = {} }
-            c.name, c.kind, c.browses = l.name, l.kind, l.browses_databases and true or false
-            list[#list + 1] = c
-            items[#items + 1] = { name = c.name, type = "dir", old = c.dir, c = c }
+        local again = false
+        apply(done, function()
+          local man = manifest.get()
+          -- Renamed again while the store was being renamed or listed: don't move it back, list again.
+          local more, lost = scan(man)
+          if #more > 0 then
+            again = true
+            return manifest.save()
           end
+          local old, known = {}, {}
+          for _, c in ipairs(man.connections) do
+            old[c.id] = c
+          end
+          for _, c in ipairs(lost) do
+            notify(string.format("“%s” is still saved: connections can't be deleted from the mirror, its folder is back", c.name), vim.log.levels.WARN)
+            local there = fs.root() .. "/" .. c.dir
+            local taken = false
+            for _, x in ipairs(man.connections) do
+              taken = taken or (x ~= c and x.dir == c.dir)
+            end
+            if fs.kind(there) and not taken then -- something else took its name: not its folder
+              fs.with_writable(fs.root(), function() fs.remove(there) end)
+            end
+            c.databases, c.listed, c.error, c.dir, c.ident = {}, nil, nil, nil, nil
+            for key in pairs(M.listed) do
+              if key == M.conn_key(c.id) or vim.startswith(key, "d:" .. c.id .. "\0") then
+                M.listed[key] = nil
+              end
+            end
+          end
+          for _, c in ipairs(man.connections) do
+            if c.dir then
+              known[c.dir] = true
+            end
+          end
+          local list, items = {}, {}
+          for _, l in ipairs(res.connections) do
+            if not vim.startswith(l.id, "url:") then -- URLs are never mirrored
+              local c = old[l.id] or { id = l.id, databases = {} }
+              c.name, c.kind, c.browses = l.name, l.kind, l.browses_databases and true or false
+              list[#list + 1] = c
+              items[#items + 1] = { name = c.name, type = "dir", old = c.dir, c = c }
+            end
+          end
+          names.assign(items, { [names.fold(fs.MANIFEST)] = true })
+          local keep = { [fs.MANIFEST] = true, [fs.MANIFEST .. ".tmp"] = true }
+          local strays = {}
+          for name in fs.list(fs.root()) do
+            if not keep[name] and not known[name] and not name:find("%~tmp", 1, true) then
+              strays[#strays + 1] = name
+            end
+          end
+          reconcile(fs.root(), items, { keep = keep })
+          if #strays > 0 then
+            table.sort(strays)
+            notify("removed “" .. table.concat(strays, "”, “") .. "” from the mirror's root: only renaming connection folders works there", vim.log.levels.WARN)
+          end
+          for _, it in ipairs(items) do
+            local c = it.c
+            local was = moved[c.id] or it.old
+            moved[c.id] = nil
+            c.dir = it.file
+            c.ident = fs.identity(fs.root() .. "/" .. it.file)
+            if was and was ~= it.file then
+              M.on_moved(fs.root() .. "/" .. was, fs.root() .. "/" .. it.file)
+            end
+          end
+          man.connections, man.error = list, nil
+          manifest.save()
+        end)
+        if again then
+          vim.schedule(function() M.root_again(opts) end)
         end
-        names.assign(items, { [names.fold(fs.MANIFEST)] = true })
-        reconcile(fs.root(), items, { keep = { [fs.MANIFEST] = true, [fs.MANIFEST .. ".tmp"] = true } })
-        for _, it in ipairs(items) do
-          it.c.dir = it.file
-        end
-        man.connections, man.error = list, nil
-        manifest.save()
       end)
     end)
   end)
+end
+
+--- `M.root`, but after the listing in progress if there's one (whose result may predate a rename).
+function M.root_again(opts, cb)
+  if M.busy.root then
+    table.insert(waiters.root, function() M.root_again(opts, cb) end)
+    return
+  end
+  M.root(opts, cb)
 end
 
 local function db_items(c)

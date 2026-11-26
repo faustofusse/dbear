@@ -39,11 +39,14 @@ temp tables, `SET`, open transactions and `query.cancel` never cross clients. Th
 when the client goes away or calls `disconnect`.
 
 The store is re-read at most every 2 seconds, and immediately when a name isn't found, so
-connections the apps add or edit show up. A connection that was edited gets new sessions.
+connections the apps add or edit show up. A connection that was edited gets new sessions; one
+that was only renamed keeps them (and its caches).
 
-The server never writes the connection store and never creates or deletes keychain entries. The
-only exception is the token rotation of "Sign in with Cloudflare" connections. Passwords are never
-returned, except by `connections.url` with `with_password: true`.
+The server writes the connection store in one place only: `connections.rename`, which changes a
+saved connection's name and nothing else. It never adds, edits or deletes connections and never
+creates or deletes keychain entries; the only other write is the token rotation of "Sign in with
+Cloudflare" connections. Passwords are never returned, except by `connections.url` with
+`with_password: true`.
 
 ## Messages
 
@@ -160,6 +163,14 @@ A bare number is always an integer. Text that looks like a number (`"42"`) is st
 ### `connections.get`
 - Params: `{"connection"}`.
 - Result: a `Listed` plus `"target"`, the target it opens without a `database` param.
+
+### `connections.rename`
+- Params: `{"connection", "name"}`. `connection` is a saved connection's id or exact name.
+- Result: the renamed connection as stored (a `Listed`) plus `"previous_name"`.
+- Only the name changes, with a targeted update of the stored row: other fields another app changed meanwhile, the remembered database (`last_database`) and the position stay as they are on disk. Keychain entries and history are keyed by id, so nothing moves there.
+- The name is trimmed. An empty name becomes the connection's default name (its file's name for SQLite, else its database or host), as when an app saves a connection without one. Duplicate names, and names that only differ by case, are allowed (as in the apps); `connection` given as a name is then ambiguous, so use ids.
+- Errors (`invalid-config`): an unknown connection, a connection given as a URL (never saved), a sample connection. A store that can't be written (locked for more than 5 s, read-only) is a `storage` error, and nothing changes.
+- Other servers and clients see the new name on their next re-read of the store (within 2 s); the GUI apps when they next reload their list (see the Neovim plugin's README).
 
 ### `connections.url`
 - Params: `{"connection", "with_password"?: false}`.

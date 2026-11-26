@@ -107,12 +107,22 @@ impl Server {
             }
             let after = service.connections();
             for old in &before {
-                if after.iter().find(|c| c.id == old.id) != Some(old) {
+                // A rename alone keeps the sessions: they don't depend on the name.
+                if !after.iter().any(|c| same_but_name(c, old)) {
                     service.forget(&old.id);
                 }
             }
         })
         .await;
+    }
+
+    /// `connections.rename`: the one write this server makes to the connection store (besides
+    /// OAuth token rotation). Only saved connections, found by id or exact name.
+    async fn rename(&self, p: RenameParams) -> Result<Renamed, RpcError> {
+        let config = self.find(&p.connection).await?;
+        let service = self.service.clone();
+        let renamed = unblock(move || service.rename(&config.id, &p.name)).await?;
+        Ok(Renamed { listed: Listed::new(renamed), previous_name: config.name })
     }
 
     async fn find(&self, spec: &str) -> Result<ConnectionConfig, RpcError> {
@@ -219,7 +229,7 @@ impl Session {
         let current = self.server.service.target_config(target)?;
         let mut own = self.own.lock().await;
         if let Some((config, connection)) = own.get(target) {
-            if *config == current {
+            if same_but_name(config, &current) {
                 return Ok(connection.clone());
             }
         }
@@ -279,6 +289,7 @@ impl Session {
                 let target = server.resolve(&On::new(&config.id, None)).await?;
                 to_json(ConnectionDetail { listed: Listed::new(config), target })?.into()
             }
+            "connections.rename" => to_json(server.rename(params(p)?).await?)?.into(),
             "connections.url" => {
                 let p: UrlParams = params(p)?;
                 let config = server.find(&p.connection).await?;
@@ -564,6 +575,11 @@ impl Session {
             }
         });
     }
+}
+
+/// The same connection, settings and all, whatever its name.
+fn same_but_name(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
+    a.id == b.id && ConnectionConfig { name: String::new(), ..a.clone() } == ConnectionConfig { name: String::new(), ..b.clone() }
 }
 
 fn absolute(path: PathBuf) -> PathBuf {

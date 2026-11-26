@@ -80,5 +80,9 @@ command("DbearSync", function(o) tree().sync(o.args, o.bang) end, {
     return vim.tbl_filter(function(n) return vim.startswith(n:lower(), lead:lower()) end, dbear().connection_names())
   end,
 })
+command("DbearRename", function(o) tree().rename(o.args) end, {
+  nargs = "?",
+  desc = "Rename the current connection (mirror folder, table or SQL buffer) in dbear's store",
+})
 command("DbearFind", function() tree().find() end, { desc = "Find a table in the mirror (telescope when installed)" })
 command("DbearGrep", function(o) tree().grep(o.args) end, { nargs = "?", desc = "Search the mirror's column lists" })

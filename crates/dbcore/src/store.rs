@@ -190,6 +190,37 @@ impl ConnectionStore {
         Ok(stored)
     }
 
+    /// Renames connection `id`, changing nothing else: a targeted `update … set name` of the row on
+    /// disk, so other columns another process changed since this store last read them, its
+    /// `last_database` and its position all stay as they are. The name follows [`upsert`](Self::upsert)'s
+    /// rules: trimmed, and an empty one becomes the connection's default name (its database or
+    /// host, see `ConnectionConfig::default_name`). Duplicate names are allowed, as in `upsert`.
+    /// Returns the stored config; an unknown id is an `InvalidConfig` error and writes nothing.
+    pub fn rename(&mut self, id: &str, name: &str) -> Result<ConnectionConfig> {
+        let name = name.trim();
+        let mut found = false;
+        self.write(|tx| {
+            let row = tx
+                .query_row("select kind, host, database from connections where id = ?1", [id], |r| {
+                    Ok((parse_enum::<DatabaseKind>(0, r.get(0)?)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                })
+                .optional()?;
+            let Some((kind, host, database)) = row else { return Ok(()) };
+            found = true;
+            let name = if name.is_empty() {
+                ConnectionConfig { host, database, ..ConnectionConfig::new_empty(kind) }.default_name()
+            } else {
+                name.to_string()
+            };
+            tx.execute("update connections set name = ?2 where id = ?1", params![id, name])?;
+            Ok(())
+        })?;
+        match self.get(id) {
+            Some(config) if found => Ok(config.clone()),
+            _ => Err(Error::InvalidConfig(format!("No connection with id “{id}”."))),
+        }
+    }
+
     /// Removes a connection and saves. Returns whether it existed.
     pub fn remove(&mut self, id: &str) -> Result<bool> {
         let mut removed = false;
@@ -678,6 +709,58 @@ mod tests {
         let saved = store.upsert(ConnectionConfig { ssh: None, ..saved }).unwrap();
         assert_eq!(ConnectionStore::open(&path).unwrap().connections()[0].ssh, None);
         assert_eq!(saved.ssh, None);
+    }
+
+    #[test]
+    fn rename_changes_only_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbear.db");
+        let mut store = ConnectionStore::open(&path).unwrap();
+        let a = store.upsert(ConnectionConfig { port: Some(6543), ..sample("a") }).unwrap();
+        let b = store.upsert(sample("b")).unwrap();
+        store.set_last_database(&a.id, Some("billing")).unwrap();
+
+        let renamed = store.rename(&a.id, "  Shop  ").unwrap();
+        assert_eq!(renamed, ConnectionConfig { name: "Shop".into(), ..a.clone() });
+        assert_eq!(store.last_database(&a.id).as_deref(), Some("billing"), "last_database kept");
+        let names: Vec<_> = store.connections().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Shop", "b"], "position kept");
+        assert_eq!(ConnectionStore::open(&path).unwrap().connections(), [renamed.clone(), b.clone()]);
+
+        // Duplicate names (and names differing only by case) are allowed, as in upsert.
+        assert_eq!(store.rename(&b.id, "shop").unwrap().name, "shop");
+        assert_eq!(store.rename(&b.id, "Shop").unwrap().name, "Shop");
+        // An empty name becomes the default one, like upsert's.
+        assert_eq!(store.rename(&b.id, " ").unwrap().name, "app");
+
+        // Unknown ids write nothing.
+        let before = store.connections().to_vec();
+        let Err(Error::InvalidConfig(msg)) = store.rename("ghost", "x") else { panic!("expected an error") };
+        assert!(msg.contains("ghost"), "{msg}");
+        assert_eq!(store.connections(), before);
+    }
+
+    #[test]
+    fn rename_keeps_what_another_process_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dbear.db");
+        let mut mine = ConnectionStore::open(&path).unwrap();
+        let a = mine.upsert(sample("a")).unwrap();
+        // Another app edits the host, the port and the SSH tunnel, and browses a database, after
+        // `mine` last read the row.
+        let mut theirs = ConnectionStore::open(&path).unwrap();
+        let tunnel = SshTunnel { host: "bastion".into(), user: "me".into(), ..Default::default() };
+        let edited = theirs
+            .upsert(ConnectionConfig { host: "db2.internal".into(), port: Some(5433), ssh: Some(tunnel), ..a.clone() })
+            .unwrap();
+        theirs.set_last_database(&a.id, Some("reports")).unwrap();
+        assert_eq!(mine.get(&a.id).unwrap().host, a.host, "mine still has the old copy");
+
+        let renamed = mine.rename(&a.id, "Renamed").unwrap();
+        assert_eq!(renamed, ConnectionConfig { name: "Renamed".into(), ..edited });
+        assert_eq!(mine.last_database(&a.id).as_deref(), Some("reports"));
+        theirs.reload().unwrap();
+        assert_eq!(theirs.connections(), [renamed]);
     }
 
     #[test]

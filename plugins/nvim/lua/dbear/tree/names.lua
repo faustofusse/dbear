@@ -111,6 +111,22 @@ function M.unescape(s)
   return not bad and name or nil
 end
 
+--- The name a folder name typed by someone stands for (a connection folder renamed in oil or with
+--- `mv`): like `unescape`, but lenient with what people type. `%XX` escapes are reversed, any
+--- other `%` is kept as typed (`100%`, `50%off`), a trailing `%~N` (the mirror's collision
+--- marker, left in place) is dropped and `%-` is the empty name. Returns nil and why for a name
+--- the mirror cut (`%+<hash>`): it can't tell what the rest was.
+function M.parse(file)
+  local s = file:gsub("%%~%d+$", "")
+  if s == "%-" then
+    return ""
+  end
+  if s:find("%%%+%x+$") then
+    return nil, "the folder's name was cut to fit (it ends in %+…): type the whole name"
+  end
+  return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
 --- The key two names collide under on a case-insensitive file system.
 function M.fold(s)
   return vim.fn.tolower(s)

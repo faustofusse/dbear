@@ -528,6 +528,162 @@ test("relist = never: a folder listed before isn't listed again in a new session
   eq({ "schemas.list shop", "columns.list shop" }, methods(), "listed in a new session")
 end)
 
+-- MARK: renaming connections (without oil: mv, :DbearRename)
+
+local function saved()
+  local err, res = dbear.rpc():request_sync("connections.list", nil, 10000)
+  assert(not err, vim.inspect(err))
+  local out = {}
+  for _, c in ipairs(res.connections) do
+    out[c.id] = c.name
+  end
+  return out
+end
+
+local function said(text)
+  for _, m in ipairs(messages) do
+    if m.msg:find(text, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
+local W, R = tonumber("755", 8), tonumber("555", 8)
+
+--- `mv` at the root by someone who made it writable first (a plain `mv` is refused).
+local function forced(fn)
+  uv.fs_chmod(mirror, W)
+  local ok, err = pcall(fn)
+  uv.fs_chmod(mirror, R)
+  assert(ok, err)
+end
+
+local function forced_mv(from, to)
+  forced(function()
+    uv.fs_chmod(mirror .. "/" .. from, W)
+    assert(os.rename(mirror .. "/" .. from, mirror .. "/" .. to))
+    uv.fs_chmod(mirror .. "/" .. to, R)
+  end)
+end
+
+test("a plain mv at the root is refused; a forced one is understood as a rename", function()
+  sync("")
+  local ident = fs.identity(mirror .. "/Shop")
+  local ok = os.rename(mirror .. "/Shop", mirror .. "/Moved")
+  eq(nil, ok, "plain mv: permission denied")
+  eq("Shop", saved().shop, "store unchanged")
+  -- A table buffer of Shop with a pending edit.
+  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/Shop/shop.db/main/users.table"))
+  wait("rows", function() return state() and state().ready end)
+  local rows = vim.api.nvim_get_current_buf()
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  vim.cmd("normal! $")
+  vim.cmd("enew")
+  forced_mv("Shop", "Moved")
+  messages = {}
+  sync("")
+  eq("Moved", saved().shop, "store renamed")
+  assert(said("renamed “Shop” to “Moved”"), vim.inspect(messages))
+  eq(ident, fs.identity(mirror .. "/Moved"), "the same folder")
+  eq("shop", manifest.lookup("Moved").conn.id, "manifest")
+  assert(exists("Moved/shop.db/main/users.table"), "contents kept")
+  eq(false, vim.tbl_contains(ls(""), "Shop"), "no Shop folder")
+  eq(mirror .. "/Moved/shop.db/main/users.table", bufname(rows), "the rows buffer moved with it")
+  eq("644", mode("Moved/shop.db/main/users.table"), "still writable while loaded")
+  -- With the collision gone, "shop" (id other) lost its number.
+  eq("other", manifest.lookup("shop").conn.id, "shop un-numbered")
+  -- Listing again changes nothing.
+  local before = ls("")
+  messages = {}
+  sync("")
+  eq(before, ls(""), "no-op")
+  eq(1, #messages, "nothing else said: " .. vim.inspect(messages))
+  assert(messages[1].msg:find("^dbear: synced"), messages[1].msg)
+  vim.cmd("bwipeout! " .. rows)
+  eq("444", mode("Moved/shop.db/main/users.table"), "read-only once closed")
+end)
+
+test(":DbearRename renames from a folder or a table buffer; names the store refuses are put back", function()
+  -- From a table buffer, with a name.
+  vim.cmd.edit(vim.fn.fnameescape(mirror .. "/Moved/shop.db/main/users.table"))
+  wait("rows", function() return state() and state().ready end)
+  vim.cmd("DbearRename Shop")
+  wait("renamed", function() return saved().shop == "Shop" and idle() and exists("Shop") end)
+  eq(mirror .. "/Shop/shop.db/main/users.table", bufname(), "the buffer followed")
+  assert(said("renamed “Moved” to “Shop”"), vim.inspect(messages))
+  eq("other", manifest.lookup("shop%~2").conn.id, "shop numbered again")
+  -- From a folder, asked for (vim.ui.input).
+  enter("shop%~2")
+  local input = vim.ui.input
+  local asked
+  vim.ui.input = function(opts, cb)
+    asked = opts
+    cb("Other shop")
+  end
+  vim.cmd("DbearRename")
+  wait("asked", function() return asked ~= nil end)
+  vim.ui.input = input
+  eq("shop", asked.default, "asks with the current name")
+  wait("renamed", function() return saved().other == "Other shop" and idle() and exists("Other shop") end)
+  -- `%-` (the empty name) gets the store's default name (the file's), as when saving.
+  forced_mv("Other shop", "%-")
+  sync("")
+  eq("other.db", saved().other, "the default name")
+  assert(exists("other.db"), "its folder")
+  -- A cut name can't be read back: put back.
+  forced_mv("other.db", "x%+0123456789")
+  messages = {}
+  sync("")
+  eq("other.db", saved().other, "unchanged")
+  assert(exists("other.db") and not exists("x%+0123456789"), "put back")
+  assert(said("was cut"), vim.inspect(messages))
+  -- A connection the store lost meanwhile (deleted by another app): the rename fails, the folder
+  -- goes with the connection.
+  forced_mv("other.db", "Gone")
+  store("delete from connections where id = 'other'")
+  messages = {}
+  sync("")
+  assert(said("can't rename “other.db” to “Gone”"), vim.inspect(messages))
+  eq(nil, saved().other, "not re-created")
+  eq(false, exists("Gone") or exists("other.db"), "its folder goes")
+  eq(nil, manifest.connection("other"), "and its manifest entry")
+  -- Put it back as it was (tree_plugins_spec.lua uses the same store).
+  store("insert into connections (id, position, name, kind, database, ssl_mode) values ('other', 2, 'shop', 'sqlite', '"
+    .. vim.fs.dirname(os.getenv("DBEAR_TEST_SHOP")) .. "/other.db', 'prefer')")
+  sync("")
+  eq("other", manifest.lookup("shop%~2").conn.id, "back")
+end)
+
+test("a connection folder deleted, and junk created, from outside: put back, store untouched", function()
+  local before_store = saved()
+  forced(function()
+    assert(uv.fs_rmdir(mirror .. "/Replica")) -- empty: its listing failed
+    assert(uv.fs_mkdir(mirror .. "/junk", W))
+    local f = assert(io.open(mirror .. "/note.txt", "w"))
+    f:close()
+  end)
+  messages = {}
+  sync("")
+  eq(before_store, saved(), "store unchanged")
+  assert(exists("Replica"), "Replica's folder is back")
+  eq(false, exists("junk") or exists("note.txt"), "junk removed")
+  assert(said("“Replica” is still saved"), vim.inspect(messages))
+  assert(said("removed “junk”, “note.txt”"), vim.inspect(messages))
+  eq("555", mode(""), "root read-only")
+end)
+
+test("tree.rename = false: a renamed folder goes back", function()
+  dbear.config.tree.rename = false
+  forced_mv("Staging", "Stage")
+  messages = {}
+  sync("")
+  dbear.config.tree.rename = true
+  eq("Staging", saved()["staging-pg"], "store unchanged")
+  assert(exists("Staging") and not exists("Stage"), "put back")
+  assert(said("tree.rename = false"), vim.inspect(messages))
+end)
+
 print(string.format("\n%d passed, %d failed", passed, failures))
 dbear.rpc():stop()
 os.exit(failures == 0 and 0 or 1)

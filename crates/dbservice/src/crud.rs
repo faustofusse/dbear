@@ -152,6 +152,28 @@ impl Service {
         Ok(Saved { config: saved, problems })
     }
 
+    /// Renames saved connection `id` (**blocking**): only its name changes in the store (see
+    /// `ConnectionStore::rename`: trimmed, empty → its default name, duplicates allowed), so what
+    /// another process changed meanwhile and its `last_database` stay. Keychain entries and history
+    /// are keyed by id: nothing moves there, and nothing cached is dropped (sessions don't depend
+    /// on the name). Connections opened from a URL and the samples aren't saved: refused.
+    pub fn rename(&self, id: &str, name: &str) -> Result<ConnectionConfig> {
+        if id.starts_with(crate::URL_ID_PREFIX) {
+            return Err(Error::InvalidConfig("Connections opened from a URL aren’t saved, so they can’t be renamed.".into()));
+        }
+        let mut store = self.store()?;
+        if store.get(id).is_none() {
+            // Saved by another process since the last read?
+            store.reload()?;
+            if store.get(id).is_none() && self.config(id).is_some() {
+                return Err(Error::InvalidConfig("Sample connections aren’t saved, so they can’t be renamed.".into()));
+            }
+        }
+        let renamed = store.rename(id, name);
+        self.publish(&store);
+        renamed
+    }
+
     /// Deletes connection `id` (**blocking**): from the store, then both keychain entries and its
     /// history (best effort), and forgets its caches. Returns whether it existed.
     pub fn delete(&self, id: &str) -> Result<bool> {

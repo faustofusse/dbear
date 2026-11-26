@@ -110,6 +110,55 @@ fn columns_list() {
 }
 
 #[test]
+fn connections_rename() {
+    let fx = Fixture::new();
+    let mut peer = Peer::stdio(&fx);
+    // A second server on the same store (another editor), with its metadata session open.
+    let mut other = Peer::stdio(&fx);
+    other.call(1, "schemas.list", json!({"connection": "App"}));
+    other.call(2, "query.run", json!({"connection": "App", "sql": "create temp table mine (x int)"}));
+    peer.call(1, "query.run", json!({"connection": "Staging", "sql": "select 1"}));
+    let mut store = dbcore::ConnectionStore::open(fx.path("dbear.db")).unwrap();
+    store.set_last_database("staging-pg", Some("app_test")).unwrap();
+
+    let renamed = peer.call(2, "connections.rename", json!({"connection": "App", "name": "  Shop "}));
+    assert_eq!(renamed["id"], fx.app.as_str());
+    assert_eq!(renamed["name"], "Shop");
+    assert_eq!(renamed["previous_name"], "App");
+    let names = |peer: &mut Peer, id: u64| -> Vec<String> {
+        let list = peer.call(id, "connections.list", Json::Null);
+        list["connections"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(names(&mut peer, 3), ["Shop", "Staging"]);
+    assert_eq!(peer.call(4, "connections.get", json!({"connection": "shop"}))["id"], fx.app.as_str());
+    // By id, keeping the remembered database; a case-only change and a duplicate name are fine.
+    let staging = peer.call(5, "connections.rename", json!({"connection": "staging-pg", "name": "SHOP"}));
+    assert_eq!(staging["previous_name"], "Staging");
+    assert_eq!(store.last_database("staging-pg").as_deref(), Some("app_test"));
+    let ambiguous = peer.error(6, "connections.get", json!({"connection": "shop"}));
+    assert!(ambiguous["message"].as_str().unwrap().contains("matches 2 connections"), "{ambiguous}");
+    peer.call(7, "connections.rename", json!({"connection": "staging-pg", "name": "Staging"}));
+    // An empty name becomes the default one (the file's name), as when saving.
+    assert_eq!(peer.call(8, "connections.rename", json!({"connection": fx.app, "name": ""}))["name"], "app.db");
+    peer.call(9, "connections.rename", json!({"connection": fx.app, "name": "Shop"}));
+
+    let unknown = peer.error(10, "connections.rename", json!({"connection": "ghost", "name": "x"}));
+    assert_eq!(unknown["data"]["kind"], "invalid-config");
+    let url = format!("sqlite:{}", fx.path("copy.db").display());
+    let refused = peer.error(11, "connections.rename", json!({"connection": url, "name": "x"}));
+    assert!(refused["message"].as_str().unwrap().contains("URL"), "{refused}");
+    let missing = peer.error(12, "connections.rename", json!({"connection": "Shop"}));
+    assert_eq!(missing["code"], -32602);
+
+    // The other server sees the new name, and its client's session (temp table) survived.
+    assert_eq!(names(&mut other, 3), ["Shop", "Staging"]);
+    let mine = other.call(4, "query.run", json!({"connection": "Shop", "sql": "select count(*) from mine"}));
+    assert_eq!(mine["result"]["ok"]["rows"], json!([[0]]), "{mine}");
+    // So does a one-shot command.
+    assert!(fx.ok(&["ls"]).contains("Shop"));
+}
+
+#[test]
 fn stdio_errors() {
     let fx = Fixture::new();
     let mut peer = Peer::stdio(&fx);

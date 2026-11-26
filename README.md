@@ -144,8 +144,9 @@ rows read. D1 runs each script as one batch, all or nothing, and has no `BEGIN`/
 
 ## Command line and Neovim
 
-`dbear-cli` uses the connections, saved passwords and query history of the apps. It never changes
-your saved connections. Build it from source with `cargo install --path apps/cli`.
+`dbear-cli` uses the connections, saved passwords and query history of the apps. It never adds,
+edits or deletes your saved connections; the one change it makes is renaming one when asked (the
+Neovim plugin does, see below). Build it from source with `cargo install --path apps/cli`.
 
 ```sh
 dbear-cli ls                                    # saved connections
@@ -166,7 +167,9 @@ The [Neovim plugin](plugins/nvim/README.md) runs the buffer or a selection on a 
 Your connections, databases and tables are mirrored as folders and files (listed lazily, when you
 enter them), so [oil.nvim](https://github.com/stevearc/oil.nvim), netrw or telescope browse them and
 find a table or a column (`:DbearOpen`, `:DbearFind`, `:DbearGrep`). Opening a table shows its rows
-as a buffer you edit with Vim commands, and `:w` shows the SQL before it runs.
+as a buffer you edit with Vim commands, and `:w` shows the SQL before it runs. Renaming a
+connection's folder in oil (or `:DbearRename`) renames the connection; a running app shows the new
+name once it reloads its list.
 
 ## Building from source
 

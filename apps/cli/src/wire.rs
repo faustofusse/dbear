@@ -37,6 +37,13 @@ pub struct ConnectionParams {
     pub connection: String,
 }
 
+/// `connections.rename`: a saved connection (id or exact name) and its new name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RenameParams {
+    pub connection: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UrlParams {
     pub connection: String,
@@ -233,6 +240,14 @@ pub struct ConnectionDetail {
     pub listed: Listed,
     /// Where it opens without a `database` param (the remembered database, else its own).
     pub target: Target,
+}
+
+/// `connections.rename`: the connection as stored now, and its name before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Renamed {
+    #[serde(flatten)]
+    pub listed: Listed,
+    pub previous_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -134,6 +134,43 @@ fn deletes_everything_about_a_connection() {
 }
 
 #[test]
+fn renames_only_the_name() {
+    let fx = Fixture::new();
+    let mut config = postgres("Shop");
+    config.show_all_databases = true;
+    let saved = fx.service.save(SaveRequest { config, password: Some("pw".into()), ssh_secret: None }).unwrap().config;
+    let other = fx.sqlite("other", "other.db");
+    fx.service.set_last_database(&saved.id, "billing").unwrap();
+    let target = Target::default_for(&other);
+    block_on(fx.service.run(&target, "select 1".into(), RunOptions { record_history: true, ..RunOptions::default() })).unwrap();
+    // Another process edits the port and the user meanwhile: the rename must not put the old ones back.
+    let mut theirs = dbcore::ConnectionStore::open(fx.path("dbear.db")).unwrap();
+    theirs.upsert(ConnectionConfig { port: Some(6543), user: Some("admin".into()), ..saved.clone() }).unwrap();
+
+    let renamed = fx.service.rename(&saved.id, " Store ").unwrap();
+    assert_eq!(renamed.name, "Store");
+    assert_eq!((renamed.port, renamed.user.as_deref()), (Some(6543), Some("admin")), "another process's edit is kept");
+    assert_eq!(fx.service.config(&saved.id).unwrap(), renamed, "published");
+    assert_eq!(fx.service.find("store").unwrap().id, saved.id);
+    assert!(fx.service.find("Shop").is_err());
+    assert_eq!(fx.secrets.password(&saved.id).unwrap().as_deref(), Some("pw"), "keychain untouched");
+    assert_eq!(fx.service.remembered_database(&renamed).as_deref(), Some("billing"));
+    assert_eq!(fx.service.rename(&other.id, "Other").unwrap().name, "Other");
+    assert_eq!(fx.service.history(&other.id, 10).unwrap().len(), 1, "history is by id");
+    assert!(fx.service.cached(&target).is_some(), "sessions stay");
+
+    let unknown = fx.service.rename("ghost", "x").unwrap_err();
+    assert!(matches!(unknown, Error::InvalidConfig(_)), "{unknown:?}");
+    let url = fx.service.find(&format!("sqlite:{}", fx.path("other.db").display())).unwrap();
+    assert!(fx.service.rename(&url.id, "x").unwrap_err().to_string().contains("URL"));
+    let names: Vec<String> = fx.service.connections().into_iter().map(|c| c.name).collect();
+    assert_eq!(names, ["Store", "Other"]);
+
+    let samples = Fixture::with(|o| o.samples = true);
+    assert!(samples.service.rename("staging-pg", "x").unwrap_err().to_string().contains("Sample"));
+}
+
+#[test]
 fn imports_with_secrets_and_problems() {
     let fx = Fixture::new();
     let mut good = postgres("imported");

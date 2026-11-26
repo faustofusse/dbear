@@ -109,6 +109,10 @@ local function reload(buf, is_oil)
   end
   local wins = vim.fn.win_findbuf(buf)
   if is_oil then
+    local busy, mutator = pcall(require, "oil.mutator")
+    if busy and mutator.is_mutating() then
+      return -- oil redraws its buffers itself when it's done
+    end
     local ok, view = pcall(require, "oil.view")
     if ok and view.render_buffer_async then
       if #wins > 0 then
@@ -149,6 +153,257 @@ end
 
 sync.on_change = function(changed)
   vim.schedule(function() refresh_all(changed) end)
+end
+
+-- MARK: Renamed folders
+
+--- `name` (a buffer name: a path, maybe `oil://`, under the root or its realpath) with folder
+--- `from` (a path under the configured root) replaced by `to`, or nil when it isn't below `from`.
+local function swap(name, from, to)
+  local rel_from, rel_to = fs.rel(from), fs.rel(to)
+  for _, base in ipairs({ fs.root(), fs.real_root() }) do
+    for _, prefix in ipairs({ "", "oil://" }) do
+      local head = prefix .. base .. "/" .. rel_from
+      local rest = name:sub(#head + 1)
+      if name:sub(1, #head) == head and (rest == "" or rest:sub(1, 1) == "/") then
+        return prefix .. base .. "/" .. rel_to .. rest
+      end
+    end
+  end
+end
+
+--- A connection folder moved from `from` to `to` (both under the configured root): buffers below
+--- it follow. Rows buffers (table files) are renamed, keeping their rows and pending edits, and
+--- their `-` goes to the new folder; hidden folder buffers (oil) are dropped, shown ones renamed.
+function M.moved(from, to)
+  fs.moved(from, to)
+  local grid = package.loaded["dbear.browse.grid"]
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local name = vim.api.nvim_buf_get_name(buf)
+    local new = name ~= "" and swap(name, from, to)
+    if new then
+      local is_oil = vim.startswith(name, "oil://")
+      if is_oil and #vim.fn.win_findbuf(buf) == 0 and not vim.bo[buf].modified then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      else
+        local ok = pcall(vim.api.nvim_buf_set_name, buf, new)
+        if ok then
+          -- Renaming leaves an unlisted, unloaded buffer with the old name behind.
+          local stale = vim.fn.bufnr("^" .. vim.fn.escape(name, "\\^$.*~[]") .. "$")
+          if stale > 0 and stale ~= buf and not vim.api.nvim_buf_is_loaded(stale) then
+            pcall(vim.api.nvim_buf_delete, stale, { force = true })
+          end
+          local file = vim.b[buf].dbear_tree_file
+          if file then
+            vim.b[buf].dbear_tree_file = swap(file, from, to) or file
+          end
+          local st = grid and grid.states[buf]
+          if st and st.spec.dir then
+            st.spec.dir = swap(st.spec.dir, from, to) or st.spec.dir
+          end
+          if is_oil then
+            reload(buf, true)
+          end
+        end
+      end
+    end
+  end
+end
+
+sync.on_moved = function(from, to)
+  M.moved(from, to)
+end
+
+-- MARK: oil
+
+--- oil makes the buffer of a folder it can't write nomodifiable. The root stays read-only (r-x) on
+--- disk, so nothing can be created, deleted or copied there, but its oil buffer is made
+--- modifiable so a connection folder's name can be edited: `OilActionsPre` then lets exactly
+--- those renames through (see `oil_pre`). Done through oil's adapter interface (`is_modifiable`).
+local patched_oil = false
+local function patch_oil()
+  if patched_oil or config().rename == false then
+    return
+  end
+  local ok, files = pcall(require, "oil.adapters.files")
+  if not ok or type(files) ~= "table" or type(files.is_modifiable) ~= "function" then
+    return
+  end
+  patched_oil = true
+  local original = files.is_modifiable
+  files.is_modifiable = function(bufnr)
+    local oil = vim.api.nvim_buf_get_name(bufnr):match("^oil://(.*)$")
+    if oil and M.enabled() and config().rename ~= false and fs.rel(oil) == "" and manifest.exists() then
+      return true
+    end
+    return original(bufnr)
+  end
+end
+
+local function root_buffer_modifiable(buf)
+  local oil = vim.api.nvim_buf_get_name(buf):match("^oil://(.*)$")
+  if not (oil and patched_oil and fs.rel(oil) == "" and manifest.exists()) then
+    return
+  end
+  local ok, mutator = pcall(require, "oil.mutator")
+  if not vim.b[buf].oil_rendering and not (ok and mutator.is_mutating()) then
+    vim.bo[buf].modifiable = true
+  end
+end
+
+local function oil_path(url)
+  local p = type(url) == "string" and url:match("^oil://(.*)$")
+  return p and fs.inside(p) or nil
+end
+
+--- The renames being let through: `{ { src, dest } }`, with a timer that ends them anyway.
+local granted
+
+local function revoke()
+  if not granted then
+    return
+  end
+  local g = granted
+  granted = nil
+  if g.timer then
+    pcall(function() g.timer:stop() g.timer:close() end)
+  end
+  pcall(fs.chmod, fs.root(), fs.DIR_MODE)
+  for _, pair in ipairs(g) do
+    for _, path in ipairs(pair) do
+      if fs.kind(path) == "directory" then
+        pcall(fs.chmod, path, fs.DIR_MODE)
+      end
+    end
+  end
+end
+
+--- `User OilActionsPre`: when every action of the batch that touches the mirror renames a
+--- connection folder in place (at the root, to a name nothing has), the root and those folders
+--- are made writable until `OilActionsPost`, so the renames succeed; anything else in the mirror
+--- (delete, create, copy, a move into a folder, a change below the root) keeps failing on the
+--- read-only folders, and nothing at all is let through for that batch.
+function M.oil_pre(actions)
+  revoke()
+  local touched, pairs_ok, refused = false, {}, false
+  for _, a in ipairs(actions or {}) do
+    local src, dest = oil_path(a.src_url), oil_path(a.dest_url)
+    local url = oil_path(a.url)
+    if src or dest or url then
+      touched = true
+      local rs, rd = src and fs.rel(src), dest and fs.rel(dest)
+      local hit = rs and rs ~= "" and not rs:find("/", 1, true) and manifest.lookup(rs)
+      local ok = a.type == "move" and a.entry_type == "directory" and hit and hit.level == "conn"
+        and rd and rd ~= "" and not rd:find("/", 1, true)
+      -- Never onto something that exists (rename would replace an empty folder); a case-only
+      -- rename on a case-insensitive file system is the same folder.
+      if ok and fs.kind(dest) and fs.identity(dest) ~= fs.identity(src) then
+        ok = false
+      end
+      if ok then
+        pairs_ok[#pairs_ok + 1] = { src, dest }
+      else
+        refused = true
+      end
+    end
+  end
+  if not touched then
+    return
+  end
+  M.oil_batch = true
+  if refused or #pairs_ok == 0 then
+    notify("the mirror is read-only: only renaming a connection folder (at the root) is possible", vim.log.levels.WARN)
+    return
+  end
+  granted = pairs_ok
+  local ok, err = pcall(function()
+    fs.chmod(fs.root(), fs.WRITABLE_DIR)
+    for _, pair in ipairs(pairs_ok) do
+      fs.chmod(pair[1], fs.WRITABLE_DIR)
+    end
+  end)
+  if not ok then
+    revoke()
+    return notify(tostring(err), vim.log.levels.ERROR)
+  end
+  -- oil always sends OilActionsPost; this is in case it doesn't.
+  granted.timer = vim.defer_fn(revoke, 30000)
+end
+
+--- `User OilActionsPost`: the mirror is read-only again, and the root is listed: renamed folders
+--- are renamed in the store, anything else is undone.
+function M.oil_post()
+  revoke()
+  if not M.oil_batch then
+    return
+  end
+  M.oil_batch = nil
+  -- After oil is done (it redraws its buffers then): renames go to the store, the rest is undone.
+  local ok, mutator = pcall(require, "oil.mutator")
+  local tries = 0
+  local function later()
+    tries = tries + 1
+    if ok and mutator.is_mutating() and tries < 100 then
+      return vim.defer_fn(later, 50)
+    end
+    sync.root_again()
+  end
+  vim.schedule(later)
+end
+
+-- MARK: :DbearRename
+
+--- The saved connection the current buffer is about: a mirror folder (at the root, the entry
+--- under oil's cursor), a table file or rows buffer, or a SQL buffer's `b:dbear_connection`.
+local function current_connection(buf)
+  local path, is_oil = folder_of(buf)
+  local rel = path and fs.rel(path)
+  if rel == "" and is_oil then
+    local ok, oil = pcall(require, "oil")
+    local entry = ok and oil.get_cursor_entry()
+    rel = entry and entry.name or nil
+  end
+  local hit = rel and rel ~= "" and manifest.exists() and manifest.lookup(vim.split(rel, "/", { plain = true })[1])
+  if hit and hit.conn then
+    return hit.conn.id
+  end
+  local grid = package.loaded["dbear.browse.grid"]
+  local st = grid and grid.states[buf]
+  if st and st.spec.conn then
+    return st.spec.conn
+  end
+  return vim.b[buf].dbear_connection
+end
+
+--- `:DbearRename [name]`: renames the current connection (see `current_connection`) in the store,
+--- then its mirror folder follows. Without a name, asks for one.
+function M.rename(name)
+  local spec = current_connection(vim.api.nvim_get_current_buf())
+  if not spec then
+    return notify("no connection here: use it in a mirror folder, a table buffer or a SQL buffer with a connection", vim.log.levels.WARN)
+  end
+  dbear().rpc():request("connections.get", { connection = spec }, function(err, res)
+    if err then
+      return notify(err.message or vim.inspect(err), vim.log.levels.ERROR)
+    end
+    if vim.startswith(res.id, "url:") then
+      return notify("connections given as URLs aren't saved, so they can't be renamed", vim.log.levels.WARN)
+    end
+    local function go(new)
+      if not new then
+        return
+      end
+      sync.rename(res.id, res.name, new, function(e)
+        if not e and M.enabled() and manifest.exists() then
+          sync.root_again()
+        end
+      end)
+    end
+    if name and name ~= "" then
+      return go(name)
+    end
+    vim.ui.input({ prompt = "Rename “" .. res.name .. "” to: ", default = res.name }, go)
+  end)
 end
 
 -- MARK: Lazy listing
@@ -225,7 +480,8 @@ function M.read_file(buf, path)
         group = files_group,
         buffer = buf,
         once = true,
-        callback = function() pcall(fs.unlock, file, false) end,
+        -- The file may have moved with its connection's folder since (see `M.moved`).
+        callback = function(ev) pcall(fs.unlock, vim.b[ev.buf].dbear_tree_file or file, false) end,
       })
     end
   end
@@ -467,13 +723,44 @@ function M.attach()
   vim.api.nvim_create_autocmd("BufEnter", {
     group = group,
     callback = function(ev)
-      local path = folder_of(ev.buf)
+      local path, is_oil = folder_of(ev.buf)
       if path then
+        if is_oil then
+          patch_oil()
+          root_buffer_modifiable(ev.buf)
+        end
         M.entered(path)
         show_status(ev.buf)
       end
     end,
   })
+  -- oil: renaming connection folders at the root (see `patch_oil` and `oil_pre`).
+  if config().rename ~= false then
+    if package.loaded["oil"] then
+      patch_oil()
+    end
+    vim.api.nvim_create_autocmd("User", {
+      group = group,
+      pattern = "OilEnter",
+      callback = function(ev)
+        local buf = type(ev.data) == "table" and ev.data.buf or ev.buf
+        if buf and vim.api.nvim_buf_is_valid(buf) and folder_of(buf) then
+          patch_oil()
+          root_buffer_modifiable(buf)
+        end
+      end,
+    })
+    vim.api.nvim_create_autocmd("User", {
+      group = group,
+      pattern = "OilActionsPre",
+      callback = function(ev) M.oil_pre(type(ev.data) == "table" and ev.data.actions or {}) end,
+    })
+    vim.api.nvim_create_autocmd("User", {
+      group = group,
+      pattern = "OilActionsPost",
+      callback = function() M.oil_post() end,
+    })
+  end
 end
 
 return M

@@ -4,7 +4,9 @@
 - The glue around it that every Rust client needs (stores + keychain → `Connection`, targets, caches, scripts with
   history, connection CRUD orderings, dump/restore options) belongs in `crates/dbservice`. GPUI and `dbear-cli` use
   it; the macOS app and `dbcore-ffi` don't (yet).
-- `dbear-cli` never writes the connection store or the keychain (only OAuth token rotation). Plugins talk to
+- `dbear-cli` writes the connection store in exactly one way: `connections.rename` (`Service::rename` →
+  `ConnectionStore::rename`, a targeted `update … set name` of one saved connection; nothing else in the row, no
+  adds, edits or deletes). It never writes the keychain (only OAuth token rotation). Plugins talk to
   `dbear-cli serve` and nothing else; `apps/cli/PROTOCOL.md` is their contract: keep it in step with `wire.rs`.
 - `crates/dbcore-ffi` is the only FFI surface. Only `apps/macos/Sources/DBKit/RustDriver.swift` imports `DBCoreFFI`.
 - Rows cross the FFI boundary in pages (`QueryResult`), never one cell at a time.
@@ -224,6 +226,9 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   duration, `schema_changed`, sources): 10 000-row cap, history as the apps record it (rows affected or rows
   returned; cancelled runs aren't recorded). `save` writes the store, then the keychain (the SSH secret is deleted
   without a tunnel or with Agent auth); `delete` also removes both keychain entries, the history and the caches.
+  `rename` changes only the name (`ConnectionStore::rename`: trimmed, empty → `default_name()`, duplicates allowed;
+  `last_database`, position and columns another process changed stay); URL and sample connections are refused,
+  nothing cached is dropped.
   `table_editing` / `preview_table_changes` / `apply_table_changes` (`editing.rs`): what a client may edit in a
   table (`TableEditing`: read-only reason, key, binary/read-only columns, links by column name), checked before any
   SQL, applied in one transaction, optionally only if the SQL is what the user reviewed.
@@ -243,7 +248,8 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   transactions and cancel never cross clients, and a socket client that hangs up has its work cancelled. Requests
   run concurrently. A failing statement is a successful `query.run` with `{"error": …}`; RPC errors carry the
   serialized `dbcore::Error` in `data`. Dumps and restores are jobs (`*.start` answers with a job id, then
-  `*.progress` / `*.finished` notifications; `job.cancel`). The store is re-read at most every 2 s. Everything is in
+  `*.progress` / `*.finished` notifications; `job.cancel`). The store is re-read at most every 2 s (a connection
+  only renamed keeps its sessions and caches); `connections.rename` is the server's only store write. Everything is in
   `apps/cli/PROTOCOL.md` (protocol version 1: new methods and fields don't bump it).
 - Neovim plugin (`plugins/nvim`, Neovim 0.10+, no deps): `dbear.rpc` is the JSON-RPC client (no UI code; starts
   `dbear-cli serve` on the first request and again after it exits), `dbear.render` turns results into lines and
@@ -277,3 +283,14 @@ stays off). `scripts/test-update.sh` runs a full update against a local feed.
   555 and files 444 (a file is 644 while its rows buffer is loaded: Vim refuses `:w` otherwise); every disk
   change goes through `tree.fs`, which refuses anything outside the root (symlinks resolved, never followed)
   and a non-empty root without a manifest. URL connections aren't mirrored.
+  Renaming a connection folder at the root renames the connection (`tree.rename`, default on): the manifest records
+  each connection folder's identity (`ident`: inode + birth time), so the root listing (`sync.root`) finds a folder
+  under a new name, maps the name back (`names.parse`: `%XX` reversed, a trailing `%~N` dropped) and calls
+  `connections.rename` before it reconciles; a failure leaves the store alone and the reconcile moves the folder
+  back. Anything else at the root is undone there (strays removed, a deleted connection folder re-created; the store
+  is never touched). The root stays 555: oil's root buffer is made modifiable by wrapping
+  `oil.adapters.files.is_modifiable`, and `User OilActionsPre` makes the root and the renamed folders writable
+  (macOS needs a folder writable to rename it) only when every mirror action of the batch is an in-place rename of
+  a connection folder to a free name; `OilActionsPost` (or a 30 s timer) makes them read-only again and lists the
+  root. Buffers below a renamed folder follow it (`tree.moved`: rows buffers keep pending edits; hidden oil buffers
+  are dropped). `:DbearRename [name]` goes through the same `connections.rename` + root listing.
